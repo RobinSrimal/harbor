@@ -1,0 +1,14 @@
+[package]
+name = "harbor-stream"
+version = "0.1.0"
+edition = "2024"
+description = "Real-time streaming for Harbor - audio/video calls per topic"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/harbor-protocol/harbor"
+
+[dependencies]
+harbor-core = { version = "0.1.0", path = "../core" }
+
+# Streaming dependencies (to be added when implementing)
+# Potential: iroh-live, webrtc, etc.
+

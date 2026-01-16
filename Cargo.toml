@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "sync",
+    "stream",
+    "test-app/src-tauri",
+]
+
+# Shared workspace settings
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/harbor-protocol/harbor"
+
+# Shared workspace dependencies
+[workspace.dependencies]
+tokio = { version = "1.47", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"

@@ -1,0 +1,206 @@
+#!/bin/bash
+#
+# Harbor Simulation Test
+#
+# Tests DHT behavior, Harbor node message storage, and membership flows:
+# 1. Starting node-1 as bootstrap (no external bootstrap needed)
+# 2. Other nodes bootstrap from node-1
+# 3. Creating topics and having nodes join
+# 4. Sending messages
+# 5. Taking nodes offline
+# 6. Verifying message delivery via Harbor
+#
+# Usage:
+#   ./simulate.sh                              # Run full simulation
+#   ./simulate.sh --nodes 5                    # Use 5 nodes
+#   ./simulate.sh --scenario offline           # Run specific scenario
+#
+# Available scenarios (run with ./simulate.sh <scenario>):
+#
+#   Basic:
+#     basic            - Basic topic creation and messaging
+#     offline          - Offline node message retrieval via Harbor
+#     dht-churn        - DHT churn test (nodes joining/leaving)
+#
+#   Membership:
+#     member-join      - Member join flow verification
+#     member-leave     - Member leave flow verification
+#     new-to-offline   - New member to offline member delivery
+#     offline-sync     - Offline sync with membership changes
+#     deduplication    - Duplicate message prevention test
+#
+#   Advanced:
+#     multi-topic      - Multi-topic isolation test
+#     concurrent       - Concurrent senders stress test
+#     large-message    - Large message delivery test (1KB-100KB)
+#     scale-members    - Scale test with max 10 members
+#     harbor-sync      - Harbor delivery for offline members
+#     harbor-churn     - Harbor node churn resilience test
+#     race-join        - Message during join race condition
+#     flap             - Rapid join/leave (flapping) test
+#     dht-pool         - DHT connection pool verification
+#
+#   Suites:
+#     membership       - Run all membership scenarios
+#     advanced         - Run all advanced scenarios
+#     full             - Run all scenarios (default)
+
+set -e
+
+# Get the script directory
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ============================================================================
+# SOURCE LIBRARIES AND SCENARIOS
+# ============================================================================
+
+source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/node_mgmt.sh"
+
+# Source all scenario files
+source "$SCRIPT_DIR/scenarios/basic.sh"
+source "$SCRIPT_DIR/scenarios/offline.sh"
+source "$SCRIPT_DIR/scenarios/dht_churn.sh"
+source "$SCRIPT_DIR/scenarios/member_join.sh"
+source "$SCRIPT_DIR/scenarios/member_leave.sh"
+source "$SCRIPT_DIR/scenarios/new_to_offline.sh"
+source "$SCRIPT_DIR/scenarios/offline_sync.sh"
+source "$SCRIPT_DIR/scenarios/deduplication.sh"
+source "$SCRIPT_DIR/scenarios/multi_topic.sh"
+source "$SCRIPT_DIR/scenarios/concurrent.sh"
+source "$SCRIPT_DIR/scenarios/large_message.sh"
+source "$SCRIPT_DIR/scenarios/scale_members.sh"
+source "$SCRIPT_DIR/scenarios/harbor_sync.sh"
+# forward_secrecy.sh archived - requires MLS Tier 3 (not Tier 1)
+# source "$SCRIPT_DIR/scenarios/forward_secrecy.sh"
+# wildcard_catchup.sh archived - catch-up mode removed
+# source "$SCRIPT_DIR/scenarios/wildcard_catchup.sh"
+source "$SCRIPT_DIR/scenarios/harbor_churn.sh"
+source "$SCRIPT_DIR/scenarios/race_join.sh"
+source "$SCRIPT_DIR/scenarios/flap.sh"
+source "$SCRIPT_DIR/scenarios/dht_pool.sh"
+source "$SCRIPT_DIR/scenarios/suites.sh"
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Find the harbor binary
+find_harbor_binary
+
+# Set up cleanup trap
+trap cleanup EXIT
+
+# Default scenario
+SCENARIO="full"
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --nodes) NODE_COUNT="$2"; shift 2 ;;
+        --scenario) SCENARIO="$2"; shift 2 ;;
+        -*) shift ;;  # Skip unknown flags
+        *) SCENARIO="$1"; shift ;;  # Positional arg = scenario
+    esac
+done
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+echo ""
+echo "╔════════════════════════════════════════╗"
+echo "║     Harbor Network Simulation          ║"
+echo "╚════════════════════════════════════════╝"
+echo ""
+
+clear_data
+
+case $SCENARIO in
+    basic)
+        scenario_basic
+        ;;
+    offline)
+        scenario_offline
+        ;;
+    dht-churn)
+        scenario_dht_churn
+        ;;
+    # Membership scenarios
+    member-join)
+        scenario_member_join
+        ;;
+    member-leave)
+        scenario_member_leave
+        ;;
+    new-to-offline)
+        scenario_new_to_offline
+        ;;
+    offline-sync)
+        scenario_offline_sync
+        ;;
+    deduplication)
+        scenario_deduplication
+        ;;
+    membership)
+        run_membership_suite
+        ;;
+    # Advanced scenarios
+    multi-topic)
+        scenario_multi_topic
+        ;;
+    concurrent)
+        scenario_concurrent
+        ;;
+    large-message)
+        scenario_large_message
+        ;;
+    scale-members)
+        scenario_scale_members
+        ;;
+    harbor-sync)
+        scenario_harbor_sync
+        ;;
+    forward-secrecy|fs)
+        echo "forward-secrecy scenario archived - requires Tier 3 MLS"
+        exit 1
+        ;;
+    wildcard-catchup|wildcard|catchup)
+        echo "wildcard-catchup scenario archived - catch-up mode removed"
+        exit 1
+        ;;
+    harbor-churn)
+        scenario_harbor_churn
+        ;;
+    race-join)
+        scenario_race_join
+        ;;
+    flap)
+        scenario_flap
+        ;;
+    dht-pool)
+        scenario_dht_pool
+        ;;
+    advanced)
+        run_advanced_suite
+        ;;
+    full)
+        run_full_suite
+        ;;
+    *)
+        echo ""
+        echo "Unknown scenario: '$SCENARIO'"
+        echo ""
+        echo "Available scenarios:"
+        echo "  Basic:      basic, offline, dht-churn"
+        echo "  Membership: member-join, member-leave, new-to-offline, offline-sync, deduplication"
+        echo "  Advanced:   multi-topic, concurrent, large-message, scale-members,"
+        echo "              harbor-sync, harbor-churn, race-join, flap, dht-pool"
+        echo "  Suites:     membership, advanced, full"
+        echo ""
+        exit 1
+        ;;
+esac
+
+echo ""
+log "All scenarios complete!"

@@ -1,0 +1,14 @@
+[package]
+name = "harbor-sync"
+version = "0.1.0"
+edition = "2024"
+description = "CRDT synchronization for Harbor - collaborative data structures per topic"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/harbor-protocol/harbor"
+
+[dependencies]
+harbor-core = { version = "0.1.0", path = "../core" }
+
+# CRDT library (to be added when implementing)
+# loro = "..."
+

@@ -1,0 +1,305 @@
+.dashboard {
+  padding: 1.5rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.dashboard-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 300px;
+  color: #666;
+  font-size: 1.1rem;
+}
+
+.dashboard-error {
+  background: #ff4444;
+  color: white;
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  margin-bottom: 1rem;
+}
+
+.last-update {
+  text-align: right;
+  color: #888;
+  font-size: 0.85rem;
+  margin-bottom: 1rem;
+}
+
+/* Stats Grid */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+
+.stat-card {
+  background: #1a1a2e;
+  border-radius: 12px;
+  padding: 1.25rem;
+  border: 1px solid #2a2a4a;
+}
+
+.stat-card h3 {
+  margin: 0 0 1rem 0;
+  font-size: 1rem;
+  color: #fff;
+  border-bottom: 1px solid #2a2a4a;
+  padding-bottom: 0.5rem;
+}
+
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.4rem 0;
+}
+
+.stat-row label {
+  color: #888;
+  font-size: 0.9rem;
+}
+
+.stat-row .number {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #4fc3f7;
+}
+
+.stat-row code {
+  font-size: 0.85rem;
+  background: #0d0d1a;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  color: #81d4fa;
+}
+
+.stat-row.small {
+  padding-top: 0;
+}
+
+.stat-row.small code {
+  font-size: 0.75rem;
+  word-break: break-all;
+}
+
+.stat-row .connected {
+  color: #4caf50;
+}
+
+.stat-row .disconnected {
+  color: #ff9800;
+}
+
+.stat-row .online {
+  color: #4caf50;
+}
+
+.stat-row .offline {
+  color: #f44336;
+}
+
+/* Sections */
+.section {
+  background: #1a1a2e;
+  border-radius: 12px;
+  padding: 1.25rem;
+  border: 1px solid #2a2a4a;
+  margin-bottom: 1.5rem;
+}
+
+.section h2 {
+  margin: 0 0 1rem 0;
+  font-size: 1.1rem;
+  color: #fff;
+}
+
+.section .empty {
+  color: #666;
+  text-align: center;
+  padding: 1rem;
+}
+
+/* Buckets */
+.buckets-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.bucket {
+  background: #0d0d1a;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.bucket-header {
+  display: flex;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.bucket-header:hover {
+  background: #1a1a2e;
+}
+
+.bucket-index {
+  font-weight: 600;
+  color: #81d4fa;
+  flex: 1;
+}
+
+.bucket-count {
+  color: #888;
+  font-size: 0.9rem;
+  margin-right: 0.75rem;
+}
+
+.expand-icon {
+  color: #666;
+  font-size: 0.8rem;
+}
+
+.bucket-nodes {
+  padding: 0.5rem 1rem 1rem;
+  border-top: 1px solid #1a1a2e;
+}
+
+.node {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.4rem 0;
+  font-size: 0.9rem;
+}
+
+.node-id {
+  font-family: monospace;
+  color: #aaa;
+}
+
+.freshness {
+  font-size: 0.75rem;
+}
+
+.node-addr {
+  color: #666;
+  font-size: 0.85rem;
+}
+
+/* Topics List */
+.topics-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.topic-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #0d0d1a;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  border: 2px solid transparent;
+}
+
+.topic-item:hover {
+  background: #1a1a2e;
+}
+
+.topic-item.selected {
+  border-color: #4fc3f7;
+}
+
+.topic-item .topic-id {
+  font-family: monospace;
+  color: #81d4fa;
+}
+
+.topic-item .member-count {
+  color: #888;
+  font-size: 0.9rem;
+}
+
+/* Topic Details */
+.topic-details {
+  background: #0d0d1a;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-top: 1rem;
+}
+
+.topic-details h3 {
+  margin: 0 0 1rem 0;
+  font-size: 1rem;
+  color: #4fc3f7;
+}
+
+.detail-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.detail-row label {
+  color: #888;
+  min-width: 80px;
+  font-size: 0.9rem;
+}
+
+.detail-row code {
+  font-size: 0.8rem;
+  background: #1a1a2e;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  color: #81d4fa;
+  word-break: break-all;
+}
+
+.members-list {
+  margin-top: 1rem;
+}
+
+.members-list label {
+  display: block;
+  color: #888;
+  margin-bottom: 0.5rem;
+  font-size: 0.9rem;
+}
+
+.member-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0;
+}
+
+.member-item code {
+  font-size: 0.85rem;
+  color: #aaa;
+}
+
+.self-badge {
+  background: #4caf50;
+  color: #000;
+  font-size: 0.7rem;
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.relay-badge {
+  font-size: 0.9rem;
+  cursor: help;
+}
+

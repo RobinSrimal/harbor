@@ -1,0 +1,58 @@
+[package]
+name = "harbor-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core messaging protocol for Harbor - peer-to-peer encrypted messaging"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/harbor-protocol/harbor"
+
+[lib]
+name = "harbor_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "harbor-cli"
+path = "src/main.rs"
+
+[dependencies]
+arrayvec = "0.7.6"
+blake3 = "1.8.2"
+chacha20poly1305 = "0.10.1"
+ed25519-dalek = "2.2.0"
+futures-buffered = "0.2.12"
+hex = "0.4.3"
+indexmap = "2.10.0"
+iroh = "0.93"
+iroh-base = "0.93"
+iroh-blobs = { version = "0.95.0", default-features = false }
+irpc = "0.9.0"
+irpc-iroh = "0.9.0"
+n0-future = "0.2.0"
+postcard = { version = "1.0", features = ["alloc"] }
+rand = "0.8.5"
+rusqlite = { version = "0.38.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+serde = { version = "1", features = ["derive"] }
+serde-big-array = "0.5.1"
+snafu = "0.8.6"
+textplots = "0.8.7"
+tokio = { version = "1.47.1", features = ["full"] }
+subtle = "2.6"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+zeroize = { version = "1.8.2", features = ["derive"] }
+
+# MLS (Messaging Layer Security) for Tier 3 group encryption (forward secrecy + PCS)
+# Uncomment when implementing Tier 3 - see MEMBERSHIP-MANAGEMENT-TIERS.md
+# mls-rs = "0.51"
+# mls-rs-crypto-rustcrypto = "0.19"
+
+# Async utilities
+futures = "0.3"
+
+[dev-dependencies]
+criterion = "0.7.0"
+gif = "0.13.3"
+plotters = { version = "0.3.7", features = ["bitmap_backend", "bitmap_encoder"] }
+testresult = "0.4.1"
+tracing-subscriber = "0.3.19"
+
