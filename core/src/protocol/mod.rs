@@ -7,9 +7,13 @@
 //!
 //! - `core.rs`: Protocol struct, start/stop, lifecycle
 //! - `config.rs`: ProtocolConfig builder
-//! - `types.rs`: Public types (errors, stats, TopicInvite)
-//! - `topics.rs`: Topic operations (create, join, leave, send)
-//! - `stats.rs`: Stats and monitoring
+//! - `error.rs`: ProtocolError
+//! - `events.rs`: Protocol events (messages, file events)
+//! - `types.rs`: Public types (TopicInvite, MemberInfo)
+//! - `topics.rs`: Topic operations (create, join, leave)
+//! - `send.rs`: Message sending (send)
+//! - `stats/`: Stats and monitoring
+//! - `share.rs`: File sharing operations
 //!
 //! # Example
 //!
@@ -31,21 +35,39 @@
 
 pub(crate) mod core;
 mod config;
+mod error;
+mod events;
 mod types;
 mod topics;
+mod send;
 mod stats;
 mod share;
+pub mod sync;
 
+// Core protocol
 pub use core::Protocol;
 pub use config::ProtocolConfig;
-pub use types::{
-    IncomingMessage, TopicInvite, MemberInfo, ProtocolError,
-    // Protocol events (for app event bus)
-    ProtocolEvent, FileAnnouncedEvent, FileProgressEvent, FileCompleteEvent,
-    // Stats types
-    ProtocolStats, IdentityStats, NetworkStats, DhtStats, TopicsStats,
-    OutgoingStats, HarborStats, DhtBucketInfo, DhtNodeInfo, TopicDetails,
-    TopicMemberInfo, TopicSummary,
+
+// Error type
+pub use error::ProtocolError;
+
+// Events (for app layer)
+pub use events::{
+    FileAnnouncedEvent, FileCompleteEvent, FileProgressEvent, IncomingMessage, ProtocolEvent,
+    SyncUpdatedEvent, SyncInitializedEvent,
 };
+
+// Domain types
+pub use types::{MemberInfo, TopicInvite, SyncStatus};
+
+// Stats types
+pub use stats::{
+    DhtBucketInfo, DhtNodeInfo, DhtStats, HarborStats, IdentityStats, NetworkStats, OutgoingStats,
+    ProtocolStats, TopicDetails, TopicMemberInfo, TopicSummary, TopicsStats,
+};
+
+// Share types
 pub use share::ShareStatus;
 
+// Sync types
+pub use sync::{SyncManager, SyncError};

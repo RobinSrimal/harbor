@@ -75,6 +75,21 @@ pub struct FileCompleteEventFE {
     total_size: u64,
 }
 
+/// Sync updated event for frontend
+#[derive(Serialize, Clone)]
+pub struct SyncUpdatedEventFE {
+    topic_id: String,
+    sender_id: String,
+    update_size: usize,
+}
+
+/// Sync initialized event for frontend
+#[derive(Serialize, Clone)]
+pub struct SyncInitializedEventFE {
+    topic_id: String,
+    snapshot_size: usize,
+}
+
 /// Combined event type for frontend
 #[derive(Serialize, Clone)]
 #[serde(tag = "type")]
@@ -83,6 +98,8 @@ pub enum AppEvent {
     FileAnnounced(FileAnnouncedEventFE),
     FileProgress(FileProgressEventFE),
     FileComplete(FileCompleteEventFE),
+    SyncUpdated(SyncUpdatedEventFE),
+    SyncInitialized(SyncInitializedEventFE),
 }
 
 /// Fixed database key for persistent identity (32 bytes)
@@ -361,6 +378,19 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                             hash: hex::encode(ev.hash),
                             display_name: ev.display_name,
                             total_size: ev.total_size,
+                        })
+                    }
+                    ProtocolEvent::SyncUpdated(ev) => {
+                        AppEvent::SyncUpdated(SyncUpdatedEventFE {
+                            topic_id: hex::encode(ev.topic_id),
+                            sender_id: hex::encode(ev.sender_id),
+                            update_size: ev.update_size,
+                        })
+                    }
+                    ProtocolEvent::SyncInitialized(ev) => {
+                        AppEvent::SyncInitialized(SyncInitializedEventFE {
+                            topic_id: hex::encode(ev.topic_id),
+                            snapshot_size: ev.snapshot_size,
                         })
                     }
                 };

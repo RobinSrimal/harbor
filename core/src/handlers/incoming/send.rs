@@ -5,11 +5,14 @@
 //! - Receipt acknowledgements
 //! - PacketWithPoW (spam-protected delivery)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use rusqlite::Connection;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, trace, warn};
+
+use crate::protocol::sync::SyncManager;
 
 use crate::data::{
     current_timestamp, get_topics_for_member, add_topic_member_with_relay,
@@ -34,6 +37,8 @@ impl Protocol {
         event_tx: mpsc::Sender<ProtocolEvent>,
         sender_id: [u8; 32],
         our_id: [u8; 32],
+        sync_managers: Arc<RwLock<HashMap<[u8; 32], SyncManager>>>,
+        sync_enabled: bool,
     ) -> Result<(), ProtocolError> {
         // Maximum message size (512KB + overhead)
         const MAX_READ_SIZE: usize = 600 * 1024;
@@ -77,13 +82,13 @@ impl Protocol {
 
             match message {
                 SendMessage::Packet(packet) => {
-                    Self::handle_packet(&conn, &db, &event_tx, sender_id, our_id, packet).await?;
+                    Self::handle_packet(&conn, &db, &event_tx, sender_id, our_id, packet, &sync_managers, sync_enabled).await?;
                 }
                 SendMessage::Receipt(receipt) => {
                     Self::handle_receipt(&db, receipt).await;
                 }
                 SendMessage::PacketWithPoW { packet, proof_of_work } => {
-                    Self::handle_packet_with_pow(&conn, &db, &event_tx, sender_id, our_id, packet, proof_of_work).await?;
+                    Self::handle_packet_with_pow(&conn, &db, &event_tx, sender_id, our_id, packet, proof_of_work, &sync_managers, sync_enabled).await?;
                 }
             }
         }
@@ -99,6 +104,8 @@ impl Protocol {
         sender_id: [u8; 32],
         our_id: [u8; 32],
         packet: crate::security::SendPacket,
+        sync_managers: &Arc<RwLock<HashMap<[u8; 32], SyncManager>>>,
+        sync_enabled: bool,
     ) -> Result<(), ProtocolError> {
         trace!(harbor_id = %hex::encode(packet.harbor_id), "processing packet");
         
@@ -130,6 +137,71 @@ impl Protocol {
                 Ok(plaintext) => {
                     // Parse topic message
                     let topic_msg = TopicMessage::decode(&plaintext).ok();
+
+                    // Handle SyncUpdate separately (doesn't need db lock, uses sync_managers)
+                    if let Some(TopicMessage::SyncUpdate(ref sync_msg)) = topic_msg {
+                        if sync_enabled {
+                            info!(
+                                topic = %hex::encode(&topic_id[..8]),
+                                sender = %hex::encode(&sender_id[..8]),
+                                size = sync_msg.data.len(),
+                                "SYNC: received update from peer"
+                            );
+                            
+                            // Apply to sync manager
+                            let mut managers = sync_managers.write().await;
+                            if let Some(manager) = managers.get_mut(&topic_id) {
+                                let update = crate::network::sync::protocol::SyncUpdate {
+                                    data: sync_msg.data.clone(),
+                                };
+                                if let Err(e) = manager.apply_update(&update) {
+                                    warn!(error = %e, "SYNC: failed to apply update");
+                                } else {
+                                    info!(
+                                        topic = %hex::encode(&topic_id[..8]),
+                                        sender = %hex::encode(&sender_id[..8]),
+                                        size = sync_msg.data.len(),
+                                        "SYNC: applied update from peer"
+                                    );
+                                    
+                                    // Emit event
+                                    let event = ProtocolEvent::SyncUpdated(crate::protocol::SyncUpdatedEvent {
+                                        topic_id,
+                                        sender_id,
+                                        update_size: sync_msg.data.len(),
+                                    });
+                                    let _ = event_tx.send(event).await;
+                                }
+                            } else {
+                                warn!(
+                                    topic = %hex::encode(&topic_id[..8]),
+                                    "SYNC: no manager for topic"
+                                );
+                            }
+                        } else {
+                            debug!(
+                                topic = %hex::encode(&topic_id[..8]),
+                                "SYNC: sync not enabled, ignoring update"
+                            );
+                        }
+                        
+                        // Mark packet as seen (dedup)
+                        {
+                            let db_lock = db.lock().await;
+                            let _ = mark_pulled(&db_lock, &topic_id, &packet.packet_id);
+                        }
+                        
+                        // Send receipt back
+                        let receipt = Receipt::new(packet.packet_id, our_id);
+                        let reply = SendMessage::Receipt(receipt);
+                        if let Ok(mut send) = conn.open_uni().await {
+                            let _ = tokio::io::AsyncWriteExt::write_all(&mut send, &reply.encode()).await;
+                            let _ = send.finish();
+                        }
+                        
+                        processed = true;
+                        break;
+                    }
 
                     // Handle control messages
                     if let Some(ref msg) = topic_msg {
@@ -282,11 +354,12 @@ impl Protocol {
                                 }
                             }
                             TopicMessage::Content(_) => {}
+                            TopicMessage::SyncUpdate(_) => {} // Handled above, before db lock
                         }
                     }
 
                     // Only forward Content messages to the app
-                    // Control messages (Join/Leave/FileAnnouncement/CanSeed) are internal
+                    // Control messages (Join/Leave/FileAnnouncement/CanSeed/SyncUpdate) are internal
                     if let Some(TopicMessage::Content(data)) = topic_msg {
                         let event = ProtocolEvent::Message(IncomingMessage {
                             topic_id,
@@ -372,6 +445,8 @@ impl Protocol {
         our_id: [u8; 32],
         packet: crate::security::SendPacket,
         proof_of_work: crate::resilience::ProofOfWork,
+        sync_managers: &Arc<RwLock<HashMap<[u8; 32], SyncManager>>>,
+        sync_enabled: bool,
     ) -> Result<(), ProtocolError> {
         trace!(harbor_id = %hex::encode(packet.harbor_id), "processing packet with PoW");
         
@@ -428,6 +503,71 @@ impl Protocol {
                 Ok(plaintext) => {
                     // Parse topic message
                     let topic_msg = TopicMessage::decode(&plaintext).ok();
+
+                    // Handle SyncUpdate separately (doesn't need db lock, uses sync_managers)
+                    if let Some(TopicMessage::SyncUpdate(ref sync_msg)) = topic_msg {
+                        if sync_enabled {
+                            info!(
+                                topic = %hex::encode(&topic_id[..8]),
+                                sender = %hex::encode(&sender_id[..8]),
+                                size = sync_msg.data.len(),
+                                "SYNC: received update from peer (with PoW)"
+                            );
+                            
+                            // Apply to sync manager
+                            let mut managers = sync_managers.write().await;
+                            if let Some(manager) = managers.get_mut(&topic_id) {
+                                let update = crate::network::sync::protocol::SyncUpdate {
+                                    data: sync_msg.data.clone(),
+                                };
+                                if let Err(e) = manager.apply_update(&update) {
+                                    warn!(error = %e, "SYNC: failed to apply update (with PoW)");
+                                } else {
+                                    info!(
+                                        topic = %hex::encode(&topic_id[..8]),
+                                        sender = %hex::encode(&sender_id[..8]),
+                                        size = sync_msg.data.len(),
+                                        "SYNC: applied update from peer (with PoW)"
+                                    );
+                                    
+                                    // Emit event
+                                    let event = ProtocolEvent::SyncUpdated(crate::protocol::SyncUpdatedEvent {
+                                        topic_id,
+                                        sender_id,
+                                        update_size: sync_msg.data.len(),
+                                    });
+                                    let _ = event_tx.send(event).await;
+                                }
+                            } else {
+                                warn!(
+                                    topic = %hex::encode(&topic_id[..8]),
+                                    "SYNC: no manager for topic (with PoW)"
+                                );
+                            }
+                        } else {
+                            debug!(
+                                topic = %hex::encode(&topic_id[..8]),
+                                "SYNC: sync not enabled, ignoring update (with PoW)"
+                            );
+                        }
+                        
+                        // Mark packet as seen (dedup)
+                        {
+                            let db_lock = db.lock().await;
+                            let _ = mark_pulled(&db_lock, &topic_id, &packet.packet_id);
+                        }
+                        
+                        // Send receipt back
+                        let receipt = Receipt::new(packet.packet_id, our_id);
+                        let reply = SendMessage::Receipt(receipt);
+                        if let Ok(mut send) = conn.open_uni().await {
+                            let _ = tokio::io::AsyncWriteExt::write_all(&mut send, &reply.encode()).await;
+                            let _ = send.finish();
+                        }
+                        
+                        processed = true;
+                        break;
+                    }
 
                     // Handle control messages
                     if let Some(ref msg) = topic_msg {
@@ -571,11 +711,12 @@ impl Protocol {
                                 }
                             }
                             TopicMessage::Content(_) => {}
+                            TopicMessage::SyncUpdate(_) => {} // Handled above, before db lock
                         }
                     }
 
                     // Only forward Content messages to the app
-                    // Control messages (Join/Leave/FileAnnouncement/CanSeed) are internal
+                    // Control messages (Join/Leave/FileAnnouncement/CanSeed/SyncUpdate) are internal
                     if let Some(TopicMessage::Content(data)) = topic_msg {
                         let event = ProtocolEvent::Message(IncomingMessage {
                             topic_id,

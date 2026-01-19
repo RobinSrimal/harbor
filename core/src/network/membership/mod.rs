@@ -38,6 +38,8 @@ pub use messages::{
     LeaveMessage, MessageType, TopicMessage,
     // Share-related control messages
     FileAnnouncementMessage, CanSeedMessage,
+    // Sync-related control messages
+    SyncUpdateMessage,
 };
 
 // Wildcard recipient for Join/Leave messages stored on Harbor

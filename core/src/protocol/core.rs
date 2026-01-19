@@ -6,6 +6,8 @@
 //! - `handlers/`: Connection handling (incoming/outgoing)
 //! - `tasks/`: Background automation
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,9 +23,13 @@ use crate::network::dht::{
 };
 use crate::network::harbor::protocol::HARBOR_ALPN;
 use crate::network::send::protocol::SEND_ALPN;
+use crate::network::sync::protocol::SYNC_ALPN;
+use crate::protocol::sync::SyncManager;
 
 use super::config::ProtocolConfig;
-use super::types::{ProtocolError, ProtocolEvent};
+use super::error::ProtocolError;
+use super::events::ProtocolEvent;
+use super::types::SyncStatus;
 
 /// Maximum message size (512 KB)
 pub const MAX_MESSAGE_SIZE: usize = 512 * 1024;
@@ -65,6 +71,8 @@ pub struct Protocol {
     pub(crate) tasks: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
     /// Shutdown signal sender
     shutdown_tx: mpsc::Sender<()>,
+    /// CRDT sync managers (one per topic, only if sync_enabled)
+    pub(crate) sync_managers: Arc<RwLock<HashMap<[u8; 32], SyncManager>>>,
 }
 
 impl Protocol {
@@ -106,14 +114,19 @@ impl Protocol {
 
         // Create Iroh endpoint with our identity's secret key
         let secret_key = iroh::SecretKey::from_bytes(&identity.private_key);
+        let mut alpns = vec![
+            SEND_ALPN.to_vec(),
+            HARBOR_ALPN.to_vec(),
+            DHT_ALPN.to_vec(),
+            crate::network::share::SHARE_ALPN.to_vec(),
+        ];
+        // Add SYNC_ALPN if sync is enabled
+        if config.sync_enabled {
+            alpns.push(SYNC_ALPN.to_vec());
+        }
         let endpoint = Endpoint::builder()
             .secret_key(secret_key)
-            .alpns(vec![
-                SEND_ALPN.to_vec(),
-                HARBOR_ALPN.to_vec(),
-                DHT_ALPN.to_vec(),
-                crate::network::share::SHARE_ALPN.to_vec(),
-            ])
+            .alpns(alpns)
             .bind()
             .await
             .map_err(|e| ProtocolError::StartFailed(format!("failed to create endpoint: {}", e)))?;
@@ -270,6 +283,7 @@ impl Protocol {
             running: Arc::new(RwLock::new(true)),
             tasks: Arc::new(RwLock::new(Vec::new())),
             shutdown_tx,
+            sync_managers: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Start background tasks
@@ -339,18 +353,179 @@ impl Protocol {
     /// 
     /// Returns the configured blob path, or derives one from the db path,
     /// or falls back to the system default.
-    pub fn blob_path(&self) -> std::path::PathBuf {
+    pub fn blob_path(&self) -> PathBuf {
         if let Some(ref path) = self.config.blob_path {
             path.clone()
         } else if let Some(ref db_path) = self.config.db_path {
             // Derive from db_path: .harbor_blobs/ next to database
             db_path.parent()
                 .map(|p| p.join(".harbor_blobs"))
-                .unwrap_or_else(|| std::path::PathBuf::from(".harbor_blobs"))
+                .unwrap_or_else(|| PathBuf::from(".harbor_blobs"))
         } else {
             // Fall back to system default
-            crate::data::default_blob_path().unwrap_or_else(|_| std::path::PathBuf::from(".harbor_blobs"))
+            crate::data::default_blob_path().unwrap_or_else(|_| PathBuf::from(".harbor_blobs"))
         }
+    }
+    
+    /// Get the sync storage path
+    /// 
+    /// Returns the configured sync path, or derives one from the db path,
+    /// or falls back to the system default.
+    pub fn sync_path(&self) -> PathBuf {
+        if let Some(ref path) = self.config.sync_path {
+            path.clone()
+        } else if let Some(ref db_path) = self.config.db_path {
+            // Derive from db_path: .harbor_sync/ next to database
+            db_path.parent()
+                .map(|p| p.join(".harbor_sync"))
+                .unwrap_or_else(|| PathBuf::from(".harbor_sync"))
+        } else {
+            // Fall back to system default
+            crate::data::sync::default_sync_path().unwrap_or_else(|_| PathBuf::from(".harbor_sync"))
+        }
+    }
+    
+    /// Check if sync is enabled
+    pub fn sync_enabled(&self) -> bool {
+        self.config.sync_enabled
+    }
+    
+    /// Get or create a sync manager for a topic
+    /// 
+    /// Returns None if sync is not enabled.
+    pub async fn get_sync_manager(&self, topic_id: &[u8; 32]) -> Option<Result<(), ProtocolError>> {
+        if !self.config.sync_enabled {
+            return None;
+        }
+        
+        let mut managers = self.sync_managers.write().await;
+        if managers.contains_key(topic_id) {
+            return Some(Ok(()));
+        }
+        
+        // Create new manager
+        let sync_path = self.sync_path();
+        match SyncManager::new(&sync_path, *topic_id) {
+            Ok(manager) => {
+                managers.insert(*topic_id, manager);
+                Some(Ok(()))
+            }
+            Err(e) => Some(Err(ProtocolError::Sync(e.to_string()))),
+        }
+    }
+    
+    // ========== Public Sync API ==========
+    
+    /// Enable sync for a topic
+    ///
+    /// Creates a SyncManager for the topic if sync is enabled.
+    /// Returns error if sync is not enabled in config.
+    pub async fn sync_enable(&self, topic_id: &[u8; 32]) -> Result<(), ProtocolError> {
+        if !self.config.sync_enabled {
+            return Err(ProtocolError::Sync("sync not enabled in config".to_string()));
+        }
+        
+        match self.get_sync_manager(topic_id).await {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => Err(e),
+            None => Err(ProtocolError::Sync("sync not enabled".to_string())),
+        }
+    }
+    
+    /// Insert text into a sync document's text container
+    ///
+    /// Container names are used to have multiple "documents" per topic.
+    pub async fn sync_text_insert(
+        &self,
+        topic_id: &[u8; 32],
+        container: &str,
+        index: usize,
+        text: &str,
+    ) -> Result<(), ProtocolError> {
+        if !self.config.sync_enabled {
+            return Err(ProtocolError::Sync("sync not enabled in config".to_string()));
+        }
+        
+        // Ensure manager exists
+        self.sync_enable(topic_id).await?;
+        
+        let mut managers = self.sync_managers.write().await;
+        let manager = managers.get_mut(topic_id)
+            .ok_or_else(|| ProtocolError::Sync("sync manager not found".to_string()))?;
+        
+        // Get or create the text container
+        let text_container = manager.doc_mut().get_text(container);
+        text_container.insert(index, text)
+            .map_err(|e| ProtocolError::Sync(format!("text insert failed: {}", e)))?;
+        
+        // Persist and mark for broadcast
+        manager.on_local_change()
+            .map_err(|e| ProtocolError::Sync(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    /// Delete text from a sync document's text container
+    pub async fn sync_text_delete(
+        &self,
+        topic_id: &[u8; 32],
+        container: &str,
+        index: usize,
+        len: usize,
+    ) -> Result<(), ProtocolError> {
+        if !self.config.sync_enabled {
+            return Err(ProtocolError::Sync("sync not enabled in config".to_string()));
+        }
+        
+        self.sync_enable(topic_id).await?;
+        
+        let mut managers = self.sync_managers.write().await;
+        let manager = managers.get_mut(topic_id)
+            .ok_or_else(|| ProtocolError::Sync("sync manager not found".to_string()))?;
+        
+        let text_container = manager.doc_mut().get_text(container);
+        text_container.delete(index, len)
+            .map_err(|e| ProtocolError::Sync(format!("text delete failed: {}", e)))?;
+        
+        manager.on_local_change()
+            .map_err(|e| ProtocolError::Sync(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    /// Get the current text value from a sync document container
+    pub async fn sync_get_text(
+        &self,
+        topic_id: &[u8; 32],
+        container: &str,
+    ) -> Result<String, ProtocolError> {
+        if !self.config.sync_enabled {
+            return Err(ProtocolError::Sync("sync not enabled in config".to_string()));
+        }
+        
+        let managers = self.sync_managers.read().await;
+        let manager = managers.get(topic_id)
+            .ok_or_else(|| ProtocolError::Sync("sync not enabled for this topic".to_string()))?;
+        
+        let text_container = manager.doc().get_text(container);
+        Ok(text_container.to_string())
+    }
+    
+    /// Get sync status for a topic
+    pub async fn sync_get_status(&self, topic_id: &[u8; 32]) -> Result<SyncStatus, ProtocolError> {
+        if !self.config.sync_enabled {
+            return Err(ProtocolError::Sync("sync not enabled in config".to_string()));
+        }
+        
+        let managers = self.sync_managers.read().await;
+        let manager = managers.get(topic_id)
+            .ok_or_else(|| ProtocolError::Sync("sync not enabled for this topic".to_string()))?;
+        
+        Ok(SyncStatus {
+            enabled: true,
+            dirty: manager.is_dirty(),
+            version: hex::encode(manager.doc().oplog_vv().encode()),
+        })
     }
 
     /// Check if the protocol is running

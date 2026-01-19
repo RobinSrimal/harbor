@@ -6,7 +6,6 @@
 //! - leave_topic: Leave a topic
 //! - list_topics: List all subscribed topics
 //! - get_invite: Get an invite for a topic
-//! - send: Send a message to a topic
 
 use tracing::{debug, info, trace};
 
@@ -17,8 +16,9 @@ use crate::data::{
 use crate::network::harbor::protocol::HarborPacketType;
 use crate::network::membership::messages::{JoinMessage, LeaveMessage, TopicMessage};
 
-use super::core::{Protocol, MAX_MESSAGE_SIZE};
-use super::types::{MemberInfo, ProtocolError, TopicInvite};
+use super::core::Protocol;
+use super::error::ProtocolError;
+use super::types::{MemberInfo, TopicInvite};
 
 impl Protocol {
     /// Create a new topic
@@ -148,7 +148,8 @@ impl Protocol {
         let payload = TopicMessage::Leave(leave_msg).encode();
 
         use crate::network::membership::WILDCARD_RECIPIENT;
-        let mut remaining_members: Vec<[u8; 32]> = members.into_iter().filter(|m| *m != our_id).collect();
+        let mut remaining_members: Vec<[u8; 32]> =
+            members.into_iter().filter(|m| *m != our_id).collect();
         remaining_members.push(WILDCARD_RECIPIENT);
 
         let send_result = self
@@ -185,8 +186,7 @@ impl Protocol {
         self.check_running().await?;
 
         let db = self.db.lock().await;
-        let topics =
-            get_all_topics(&db).map_err(|e| ProtocolError::Database(e.to_string()))?;
+        let topics = get_all_topics(&db).map_err(|e| ProtocolError::Database(e.to_string()))?;
 
         Ok(topics.into_iter().map(|t| t.topic_id).collect())
     }
@@ -232,88 +232,5 @@ impl Protocol {
             .collect();
 
         Ok(TopicInvite::new_with_info(*topic_id, member_info))
-    }
-
-    /// Send a message to a topic
-    ///
-    /// The payload is opaque bytes - the app defines the format.
-    /// Messages are sent to all known topic members (from the local member list).
-    pub async fn send(&self, topic_id: &[u8; 32], payload: &[u8]) -> Result<(), ProtocolError> {
-        self.check_running().await?;
-
-        // Check message size
-        if payload.len() > MAX_MESSAGE_SIZE {
-            return Err(ProtocolError::MessageTooLarge);
-        }
-
-        // Get topic members with relay info for connectivity
-        let members_with_info = {
-            let db = self.db.lock().await;
-            get_topic_members_with_info(&db, topic_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?
-        };
-
-        trace!(
-            topic = %hex::encode(topic_id),
-            member_count = members_with_info.len(),
-            "sending message"
-        );
-
-        if members_with_info.is_empty() {
-            return Err(ProtocolError::TopicNotFound);
-        }
-
-        let our_id = self.endpoint_id();
-        if !members_with_info.iter().any(|m| m.endpoint_id == our_id) {
-            return Err(ProtocolError::NotMember);
-        }
-
-        // Get recipients (all members except us) with their relay info
-        let recipients: Vec<MemberInfo> = members_with_info
-            .into_iter()
-            .filter(|m| m.endpoint_id != our_id)
-            .map(|m| MemberInfo {
-                endpoint_id: m.endpoint_id,
-                relay_url: m.relay_url,
-            })
-            .collect();
-
-        trace!(recipient_count = recipients.len(), "recipients (excluding self)");
-
-        if recipients.is_empty() {
-            // No one else to send to
-            trace!("no recipients - only member is self");
-            return Ok(());
-        }
-
-        // Wrap payload as Content message
-        let content_msg = TopicMessage::Content(payload.to_vec());
-        let encoded_payload = content_msg.encode();
-
-        // Send to all recipients with relay info
-        self.send_raw_with_info(topic_id, &encoded_payload, &recipients, HarborPacketType::Content)
-            .await
-    }
-
-    /// Refresh member lists from Harbor Nodes
-    ///
-    /// Triggers a Harbor pull which will fetch any pending Join/Leave messages.
-    /// These messages update the local member list automatically.
-    ///
-    /// Returns the number of topics currently subscribed.
-    pub async fn refresh_members(&self) -> Result<usize, ProtocolError> {
-        self.check_running().await?;
-
-        info!("triggering manual Harbor pull for member sync");
-
-        // Get count of subscribed topics
-        let topics = self.list_topics().await?;
-        let topic_count = topics.len();
-
-        // Harbor pull happens automatically via background task
-        // For manual refresh, just return current topic count
-        info!(topics = topic_count, "member sync via Harbor pull (automatic)");
-
-        Ok(topic_count)
     }
 }

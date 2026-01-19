@@ -55,6 +55,9 @@ dirs = "5.0"
 # Async utilities
 futures = "0.3"
 
+# CRDT sync (Loro)
+loro = "1.10.3"
+
 [dev-dependencies]
 tempfile = "3.10"
 

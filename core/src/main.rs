@@ -39,7 +39,8 @@ fn print_usage() {
     println!("  --api-port <PORT>           Enable HTTP API on this port");
     println!("  --bootstrap <ID:RELAY>      Use this bootstrap node (replaces defaults)");
     println!("  --no-default-bootstrap      Don't use any bootstrap (for first node)");
-    println!("  --testing                   Use shorter intervals (5-10s) for testing");
+    println!("  --testing                   Use shorter intervals (5-10s) for testing, enables sync");
+    println!("  --sync                      Enable CRDT sync feature");
     println!("  --help, -h                  Show this help");
     println!();
     println!("API Endpoints (when --api-port is set):");
@@ -58,6 +59,13 @@ fn print_usage() {
     println!("  POST /api/share/export      Export blob to file (JSON: hash, dest_path)");
     println!("  GET  /api/share/status/:hash Get share progress");
     println!("  GET  /api/share/blobs/:topic List blobs for topic");
+    println!();
+    println!("Sync Endpoints (CRDT collaboration):");
+    println!("  POST /api/sync/enable       Enable sync for topic (JSON: topic)");
+    println!("  POST /api/sync/text/insert  Insert text (JSON: topic, container, index, text)");
+    println!("  POST /api/sync/text/delete  Delete text (JSON: topic, container, index, len)");
+    println!("  GET  /api/sync/text/:topic/:container  Get text value");
+    println!("  GET  /api/sync/status/:topic Get sync status");
     println!();
     println!("Environment:");
     println!("  RUST_LOG                    Set log level (e.g., info, debug)");
@@ -130,17 +138,25 @@ async fn main() {
     println!("Harbor Protocol Node v0.1.0");
     println!();
 
+    // Parse --sync flag
+    let sync_enabled = args.iter().any(|a| a == "--sync");
+    
     // Build config - use testing intervals if --testing flag is set
     let mut config = if testing_mode {
         ProtocolConfig::for_testing()
             .with_db_key(DB_KEY)
             .with_db_path(db_path.clone())
             .with_blob_path(blob_path.clone())
+            .with_sync_enabled(true)  // Enable sync in testing mode
     } else {
-        ProtocolConfig::default()
+        let mut cfg = ProtocolConfig::default()
             .with_db_key(DB_KEY)
             .with_db_path(db_path.clone())
-            .with_blob_path(blob_path.clone())
+            .with_blob_path(blob_path.clone());
+        if sync_enabled {
+            cfg = cfg.with_sync_enabled(true);
+        }
+        cfg
     };
 
     // Handle bootstrap configuration:
@@ -299,6 +315,21 @@ async fn main() {
                                 name = %ev.display_name,
                                 size = ev.total_size,
                                 "File complete"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::SyncUpdated(ev) => {
+                            debug!(
+                                topic = %hex::encode(&ev.topic_id[..8]),
+                                sender = %hex::encode(&ev.sender_id[..8]),
+                                size = ev.update_size,
+                                "Sync updated"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::SyncInitialized(ev) => {
+                            info!(
+                                topic = %hex::encode(&ev.topic_id[..8]),
+                                size = ev.snapshot_size,
+                                "Sync initialized"
                             );
                         }
                     }
@@ -509,6 +540,22 @@ async fn handle_request(protocol: &Protocol, bootstrap: &BootstrapInfo, request:
         let topic_hex = &path[17..]; // Strip "/api/share/blobs/"
         return handle_list_blobs(protocol, topic_hex).await;
     }
+    
+    // Handle /api/sync/text/:topic/:container path
+    if method == "GET" && path.starts_with("/api/sync/text/") {
+        let rest = &path[15..]; // Strip "/api/sync/text/"
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() == 2 {
+            return handle_sync_get_text(protocol, parts[0], parts[1]).await;
+        }
+        return http_response(400, "Expected /api/sync/text/:topic/:container");
+    }
+    
+    // Handle /api/sync/status/:topic path
+    if method == "GET" && path.starts_with("/api/sync/status/") {
+        let topic_hex = &path[17..]; // Strip "/api/sync/status/"
+        return handle_sync_status(protocol, topic_hex).await;
+    }
 
     match (method, path) {
         ("POST", "/api/topic") => handle_create_topic(protocol).await,
@@ -518,6 +565,10 @@ async fn handle_request(protocol: &Protocol, bootstrap: &BootstrapInfo, request:
         ("POST", "/api/share") => handle_share_file(protocol, body).await,
         ("POST", "/api/share/pull") => handle_share_pull(protocol, body).await,
         ("POST", "/api/share/export") => handle_share_export(protocol, body).await,
+        // Sync endpoints
+        ("POST", "/api/sync/enable") => handle_sync_enable(protocol, body).await,
+        ("POST", "/api/sync/text/insert") => handle_sync_text_insert(protocol, body).await,
+        ("POST", "/api/sync/text/delete") => handle_sync_text_delete(protocol, body).await,
         ("GET", "/api/stats") => handle_stats(protocol).await,
         ("GET", "/api/topics") => handle_list_topics(protocol).await,
         ("GET", "/api/bootstrap") => handle_bootstrap(bootstrap),
@@ -841,6 +892,166 @@ async fn handle_share_export(protocol: &Protocol, body: &str) -> String {
     }
 }
 
+// ============================================================================
+// Sync API Handlers
+// ============================================================================
+
+/// Enable sync for a topic
+/// POST /api/sync/enable
+/// Body: {"topic": "hex..."}
+async fn handle_sync_enable(protocol: &Protocol, body: &str) -> String {
+    let topic_hex = match extract_json_string(body, "topic") {
+        Some(t) => t,
+        None => return http_response(400, "Missing 'topic' field"),
+    };
+    
+    let topic_bytes = match hex::decode(&topic_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
+    };
+    
+    match protocol.sync_enable(&topic_bytes).await {
+        Ok(()) => http_response(200, "Sync enabled"),
+        Err(e) => http_response(500, &format!("Failed to enable sync: {}", e)),
+    }
+}
+
+/// Insert text into a sync document
+/// POST /api/sync/text/insert
+/// Body: {"topic": "hex...", "container": "name", "index": 0, "text": "hello"}
+async fn handle_sync_text_insert(protocol: &Protocol, body: &str) -> String {
+    let topic_hex = match extract_json_string(body, "topic") {
+        Some(t) => t,
+        None => return http_response(400, "Missing 'topic' field"),
+    };
+    
+    let container = match extract_json_string(body, "container") {
+        Some(c) => c,
+        None => return http_response(400, "Missing 'container' field"),
+    };
+    
+    let index = match extract_json_number(body, "index") {
+        Some(i) => i as usize,
+        None => return http_response(400, "Missing 'index' field"),
+    };
+    
+    let text = match extract_json_string(body, "text") {
+        Some(t) => t,
+        None => return http_response(400, "Missing 'text' field"),
+    };
+    
+    let topic_bytes = match hex::decode(&topic_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
+    };
+    
+    match protocol.sync_text_insert(&topic_bytes, &container, index, &text).await {
+        Ok(()) => http_response(200, "Text inserted"),
+        Err(e) => http_response(500, &format!("Failed to insert text: {}", e)),
+    }
+}
+
+/// Delete text from a sync document
+/// POST /api/sync/text/delete
+/// Body: {"topic": "hex...", "container": "name", "index": 0, "len": 5}
+async fn handle_sync_text_delete(protocol: &Protocol, body: &str) -> String {
+    let topic_hex = match extract_json_string(body, "topic") {
+        Some(t) => t,
+        None => return http_response(400, "Missing 'topic' field"),
+    };
+    
+    let container = match extract_json_string(body, "container") {
+        Some(c) => c,
+        None => return http_response(400, "Missing 'container' field"),
+    };
+    
+    let index = match extract_json_number(body, "index") {
+        Some(i) => i as usize,
+        None => return http_response(400, "Missing 'index' field"),
+    };
+    
+    let len = match extract_json_number(body, "len") {
+        Some(l) => l as usize,
+        None => return http_response(400, "Missing 'len' field"),
+    };
+    
+    let topic_bytes = match hex::decode(&topic_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
+    };
+    
+    match protocol.sync_text_delete(&topic_bytes, &container, index, len).await {
+        Ok(()) => http_response(200, "Text deleted"),
+        Err(e) => http_response(500, &format!("Failed to delete text: {}", e)),
+    }
+}
+
+/// Get text value from a sync document
+/// GET /api/sync/text/:topic/:container
+async fn handle_sync_get_text(protocol: &Protocol, topic_hex: &str, container: &str) -> String {
+    let topic_bytes = match hex::decode(topic_hex.trim()) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
+    };
+    
+    match protocol.sync_get_text(&topic_bytes, container).await {
+        Ok(text) => {
+            // Escape the text for JSON
+            let escaped = text
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            let json = format!(r#"{{"text":"{}"}}"#, escaped);
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(404, &format!("Sync not enabled or error: {}", e)),
+    }
+}
+
+/// Get sync status for a topic
+/// GET /api/sync/status/:topic
+async fn handle_sync_status(protocol: &Protocol, topic_hex: &str) -> String {
+    let topic_bytes = match hex::decode(topic_hex.trim()) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
+    };
+    
+    match protocol.sync_get_status(&topic_bytes).await {
+        Ok(status) => {
+            let json = format!(
+                r#"{{"enabled":{},"dirty":{},"version":"{}"}}"#,
+                status.enabled,
+                status.dirty,
+                status.version
+            );
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(404, &format!("Sync not enabled: {}", e)),
+    }
+}
+
 fn http_response(status: u16, body: &str) -> String {
     let status_text = match status {
         200 => "OK",
@@ -889,6 +1100,36 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
     
     if end < chars.len() {
         Some(after_quote[..end].to_string())
+    } else {
+        None
+    }
+}
+
+/// Simple JSON number extraction
+fn extract_json_number(json: &str, key: &str) -> Option<i64> {
+    let pattern = format!("\"{}\"", key);
+    let start = json.find(&pattern)?;
+    let after_key = &json[start + pattern.len()..];
+    
+    let colon_pos = after_key.find(':')?;
+    let after_colon = after_key[colon_pos + 1..].trim_start();
+    
+    // Find the end of the number (next non-digit, not including negative sign at start)
+    let mut end = 0;
+    let chars: Vec<char> = after_colon.chars().collect();
+    
+    // Handle negative sign
+    if !chars.is_empty() && chars[0] == '-' {
+        end = 1;
+    }
+    
+    while end < chars.len() && chars[end].is_ascii_digit() {
+        end += 1;
+    }
+    
+    if end > 0 {
+        let num_str: String = chars[..end].iter().collect();
+        num_str.parse().ok()
     } else {
         None
     }

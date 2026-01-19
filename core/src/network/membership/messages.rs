@@ -22,6 +22,8 @@ pub enum MessageType {
     FileAnnouncement = 0x03,
     /// Can seed announcement (peer has complete file)
     CanSeed = 0x04,
+    /// CRDT sync update
+    SyncUpdate = 0x05,
 }
 
 impl MessageType {
@@ -39,6 +41,7 @@ impl MessageType {
             MessageType::Leave => VerificationMode::Full,
             MessageType::FileAnnouncement => VerificationMode::Full,
             MessageType::CanSeed => VerificationMode::Full,
+            MessageType::SyncUpdate => VerificationMode::Full,
         }
     }
 
@@ -58,6 +61,7 @@ impl TryFrom<u8> for MessageType {
             0x02 => Ok(MessageType::Leave),
             0x03 => Ok(MessageType::FileAnnouncement),
             0x04 => Ok(MessageType::CanSeed),
+            0x05 => Ok(MessageType::SyncUpdate),
             _ => Err(()),
         }
     }
@@ -76,6 +80,15 @@ pub enum TopicMessage {
     FileAnnouncement(FileAnnouncementMessage),
     /// Can seed announcement (peer has complete file, can serve)
     CanSeed(CanSeedMessage),
+    /// CRDT sync update (Loro delta)
+    SyncUpdate(SyncUpdateMessage),
+}
+
+/// CRDT sync update message
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncUpdateMessage {
+    /// The Loro delta bytes
+    pub data: Vec<u8>,
 }
 
 impl TopicMessage {
@@ -118,6 +131,13 @@ impl TopicMessage {
                 bytes.extend_from_slice(&payload);
                 bytes
             }
+            TopicMessage::SyncUpdate(msg) => {
+                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
+                let mut bytes = Vec::with_capacity(1 + payload.len());
+                bytes.push(MessageType::SyncUpdate as u8);
+                bytes.extend_from_slice(&payload);
+                bytes
+            }
         }
     }
 
@@ -154,6 +174,11 @@ impl TopicMessage {
                     .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
                 Ok(TopicMessage::CanSeed(msg))
             }
+            MessageType::SyncUpdate => {
+                let msg: SyncUpdateMessage = postcard::from_bytes(&bytes[1..])
+                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                Ok(TopicMessage::SyncUpdate(msg))
+            }
         }
     }
 
@@ -184,6 +209,7 @@ impl TopicMessage {
             TopicMessage::Leave(_) => MessageType::Leave,
             TopicMessage::FileAnnouncement(_) => MessageType::FileAnnouncement,
             TopicMessage::CanSeed(_) => MessageType::CanSeed,
+            TopicMessage::SyncUpdate(_) => MessageType::SyncUpdate,
         }
     }
 
@@ -478,7 +504,8 @@ mod tests {
         assert_eq!(MessageType::try_from(0x02), Ok(MessageType::Leave));
         assert_eq!(MessageType::try_from(0x03), Ok(MessageType::FileAnnouncement));
         assert_eq!(MessageType::try_from(0x04), Ok(MessageType::CanSeed));
-        assert!(MessageType::try_from(0x05).is_err());
+        assert_eq!(MessageType::try_from(0x05), Ok(MessageType::SyncUpdate));
+        assert!(MessageType::try_from(0x06).is_err());
     }
 
     #[test]
@@ -488,6 +515,18 @@ mod tests {
         let decoded = TopicMessage::decode(&encoded).unwrap();
         
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_sync_update_roundtrip() {
+        let original = TopicMessage::SyncUpdate(SyncUpdateMessage {
+            data: vec![1, 2, 3, 4, 5],
+        });
+        let encoded = original.encode();
+        let decoded = TopicMessage::decode(&encoded).unwrap();
+        
+        assert_eq!(decoded, original);
+        assert_eq!(encoded[0], 0x05); // SyncUpdate type byte
     }
 
     #[test]

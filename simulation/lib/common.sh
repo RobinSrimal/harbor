@@ -286,3 +286,94 @@ verify_file_hash() {
     fi
 }
 
+# ============================================================================
+# SYNC API HELPERS (CRDT collaboration)
+# ============================================================================
+
+# Enable sync for a topic
+# Usage: api_sync_enable <node> <topic_hex>
+api_sync_enable() {
+    local n=$1
+    local topic=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/sync/enable" \
+        -H "Content-Type: application/json" \
+        -d "{\"topic\":\"$topic\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/sync/enable"
+    echo "$result"
+}
+
+# Insert text into a sync document
+# Usage: api_sync_text_insert <node> <topic_hex> <container> <index> <text>
+api_sync_text_insert() {
+    local n=$1
+    local topic=$2
+    local container=$3
+    local index=$4
+    local text=$5
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/sync/text/insert" \
+        -H "Content-Type: application/json" \
+        -d "{\"topic\":\"$topic\",\"container\":\"$container\",\"index\":$index,\"text\":\"$text\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/sync/text/insert"
+    echo "$result"
+}
+
+# Delete text from a sync document
+# Usage: api_sync_text_delete <node> <topic_hex> <container> <index> <len>
+api_sync_text_delete() {
+    local n=$1
+    local topic=$2
+    local container=$3
+    local index=$4
+    local len=$5
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/sync/text/delete" \
+        -H "Content-Type: application/json" \
+        -d "{\"topic\":\"$topic\",\"container\":\"$container\",\"index\":$index,\"len\":$len}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/sync/text/delete"
+    echo "$result"
+}
+
+# Get text from a sync document
+# Usage: api_sync_get_text <node> <topic_hex> <container>
+# Returns: JSON with text field
+api_sync_get_text() {
+    local n=$1
+    local topic=$2
+    local container=$3
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/api/sync/text/$topic/$container")
+    local exit_code=$?
+    log_api_error $exit_code $n "GET /api/sync/text"
+    echo "$result"
+}
+
+# Get sync status for a topic
+# Usage: api_sync_status <node> <topic_hex>
+# Returns: JSON with enabled, dirty, version
+api_sync_status() {
+    local n=$1
+    local topic=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/api/sync/status/$topic")
+    local exit_code=$?
+    log_api_error $exit_code $n "GET /api/sync/status"
+    echo "$result"
+}
+
+# Extract text value from sync API response
+# Usage: extract_sync_text <json_response>
+extract_sync_text() {
+    local json=$1
+    echo "$json" | grep -o '"text":"[^"]*"' | cut -d'"' -f4
+}
+

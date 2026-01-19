@@ -235,11 +235,16 @@ impl Protocol {
                                                     }
                                                 }
                                                 TopicMessage::Content(_) => {}
+                                                TopicMessage::SyncUpdate(_) => {
+                                                    // Sync updates pulled from Harbor are handled
+                                                    // by the sync manager, not here
+                                                    // TODO: Apply to sync manager when offline sync is needed
+                                                }
                                             }
                                         }
 
                                         // Only forward Content messages to the app
-                                        // Join/Leave are internal control messages, not user content
+                                        // Join/Leave/SyncUpdate are internal control messages, not user content
                                         if let Some(TopicMessage::Content(data)) = topic_msg {
                                             let event = ProtocolEvent::Message(IncomingMessage {
                                                 topic_id,

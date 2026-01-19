@@ -5,12 +5,15 @@
 //! - DHT_ALPN: DHT protocol (FindNode requests)
 //! - HARBOR_ALPN: Harbor protocol (store, pull, sync)
 //! - SHARE_ALPN: File sharing protocol (chunks, bitfields)
+//! - SYNC_ALPN: CRDT sync protocol (initial sync responses)
 
 mod dht;
 mod harbor;
 mod send;
 mod share;
+mod sync;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +27,8 @@ use crate::network::dht::{ApiClient as DhtApiClient, DHT_ALPN};
 use crate::network::harbor::protocol::HARBOR_ALPN;
 use crate::network::send::protocol::SEND_ALPN;
 use crate::network::share::protocol::SHARE_ALPN;
+use crate::network::sync::protocol::SYNC_ALPN;
+use crate::protocol::sync::SyncManager;
 
 use crate::protocol::{ProtocolEvent, Protocol};
 
@@ -39,6 +44,8 @@ impl Protocol {
         running: Arc<RwLock<bool>>,
         dht_client: Option<DhtApiClient>,
         blob_store: Option<Arc<BlobStore>>,
+        sync_managers: Arc<RwLock<HashMap<[u8; 32], SyncManager>>>,
+        sync_enabled: bool,
     ) {
         loop {
             // Check if we should stop
@@ -85,11 +92,12 @@ impl Protocol {
                 // Handle Send protocol
                 let db = db.clone();
                 let event_tx = event_tx.clone();
+                let sync_managers = sync_managers.clone();
 
                 tokio::spawn(async move {
                     trace!(sender = %hex::encode(sender_id), "starting Send connection handler");
                     if let Err(e) =
-                        Self::handle_send_connection(conn, db, event_tx, sender_id, our_id).await
+                        Self::handle_send_connection(conn, db, event_tx, sender_id, our_id, sync_managers, sync_enabled).await
                     {
                         debug!(error = %e, sender = %hex::encode(sender_id), "Send connection handler error");
                     }
@@ -136,6 +144,23 @@ impl Protocol {
                         debug!("Share connection received but blob store not initialized");
                     }
                 });
+            } else if alpn.as_deref() == Some(SYNC_ALPN) {
+                // Handle Sync protocol (CRDT initial sync responses)
+                if sync_enabled {
+                    let event_tx = event_tx.clone();
+                    let sync_managers = sync_managers.clone();
+
+                    tokio::spawn(async move {
+                        trace!(sender = %hex::encode(sender_id), "starting Sync connection handler");
+                        if let Err(e) =
+                            Self::handle_sync_connection(conn, event_tx, sync_managers, sender_id).await
+                        {
+                            debug!(error = %e, sender = %hex::encode(sender_id), "Sync connection handler error");
+                        }
+                    });
+                } else {
+                    debug!("Sync connection received but sync not enabled");
+                }
             } else {
                 debug!(alpn = ?alpn, "ignoring unknown ALPN");
                 continue;

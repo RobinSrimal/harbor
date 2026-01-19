@@ -7,12 +7,14 @@
 //! - DHT save loop (persists routing table)
 //! - DHT bootstrap/refresh loop (maintains routing table health)
 //! - Cleanup loop (removes expired/acknowledged data)
+//! - Sync flush loop (batches and sends CRDT updates)
 
 mod harbor_pull;
 mod harbor_sync;
 mod maintenance;
 mod replication;
 mod share_pull;
+pub mod sync_flush;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,13 +34,15 @@ impl Protocol {
     pub(crate) async fn start_background_tasks(&self, _shutdown_rx: mpsc::Receiver<()>) {
         let mut tasks = self.tasks.write().await;
 
-        // 1. Incoming message handler (handles Send, DHT, Harbor, Share protocols)
+        // 1. Incoming message handler (handles Send, DHT, Harbor, Share, Sync protocols)
         let endpoint = self.endpoint.clone();
         let db = self.db.clone();
         let event_tx = self.event_tx.clone();
         let our_id = self.identity.public_key;
         let running = self.running.clone();
         let dht_client = self.dht_client.clone();
+        let sync_managers = self.sync_managers.clone();
+        let sync_enabled = self.config.sync_enabled;
         
         // Initialize blob store for Share protocol
         let blob_path = self.blob_path();
@@ -51,7 +55,10 @@ impl Protocol {
         };
 
         let incoming_task = tokio::spawn(async move {
-            Self::run_incoming_handler(endpoint, db, event_tx, our_id, running, dht_client, blob_store).await;
+            Self::run_incoming_handler(
+                endpoint, db, event_tx, our_id, running, dht_client, blob_store,
+                sync_managers, sync_enabled,
+            ).await;
         });
         tasks.push(incoming_task);
 
@@ -187,6 +194,37 @@ impl Protocol {
             ).await;
         });
         tasks.push(share_pull_task);
+
+        // 9. Sync flush task (batches and sends CRDT updates, if enabled)
+        if self.config.sync_enabled {
+            let db = self.db.clone();
+            let endpoint = self.endpoint.clone();
+            let sync_managers = self.sync_managers.clone();
+            let our_private_key = self.identity.private_key;
+            let our_public_key = self.identity.public_key;
+            let running = self.running.clone();
+            let sync_flush_interval = Duration::from_secs(self.config.sync_flush_interval_secs);
+            let sync_snapshot_interval = Duration::from_secs(self.config.sync_snapshot_interval_secs);
+
+            let sync_flush_task = tokio::spawn(async move {
+                sync_flush::run_sync_flush_task(
+                    db,
+                    endpoint,
+                    sync_managers,
+                    our_private_key,
+                    our_public_key,
+                    running,
+                    sync_flush_interval,
+                    sync_snapshot_interval,
+                ).await;
+            });
+            tasks.push(sync_flush_task);
+            
+            info!("Sync flush task started (flush: {}s, snapshot: {}s)",
+                self.config.sync_flush_interval_secs,
+                self.config.sync_snapshot_interval_secs
+            );
+        }
 
         info!("Background tasks started");
     }
