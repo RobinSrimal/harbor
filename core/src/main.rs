@@ -11,7 +11,7 @@
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, warn, trace};
+use tracing::{debug, info, warn, trace};
 
 use harbor_core::{Protocol, ProtocolConfig, TopicInvite};
 
@@ -35,6 +35,7 @@ fn print_usage() {
     println!("Options:");
     println!("  --serve, -s                 Run in serve mode (required)");
     println!("  --db-path <PATH>            Database path (default: harbor.db)");
+    println!("  --blob-path <PATH>          Blob storage path (default: .harbor_blobs/ next to db)");
     println!("  --api-port <PORT>           Enable HTTP API on this port");
     println!("  --bootstrap <ID:RELAY>      Use this bootstrap node (replaces defaults)");
     println!("  --no-default-bootstrap      Don't use any bootstrap (for first node)");
@@ -50,6 +51,13 @@ fn print_usage() {
     println!("  GET  /api/topics            List all topics");
     println!("  GET  /api/invite/:topic     Get fresh invite for topic (all current members)");
     println!("  GET  /api/bootstrap         Get this node's bootstrap info");
+    println!();
+    println!("File Sharing Endpoints:");
+    println!("  POST /api/share             Share file (JSON: topic, file_path)");
+    println!("  POST /api/share/pull        Request blob download (JSON: hash)");
+    println!("  POST /api/share/export      Export blob to file (JSON: hash, dest_path)");
+    println!("  GET  /api/share/status/:hash Get share progress");
+    println!("  GET  /api/share/blobs/:topic List blobs for topic");
     println!();
     println!("Environment:");
     println!("  RUST_LOG                    Set log level (e.g., info, debug)");
@@ -76,6 +84,17 @@ async fn main() {
         .find(|w| w[0] == "--db-path")
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or_else(|| PathBuf::from("harbor.db"));
+    
+    // Parse --blob-path (default: hidden folder next to db)
+    let blob_path: PathBuf = args.windows(2)
+        .find(|w| w[0] == "--blob-path")
+        .map(|w| PathBuf::from(&w[1]))
+        .unwrap_or_else(|| {
+            // Default: .harbor_blobs/ in same directory as database
+            db_path.parent()
+                .map(|p| p.join(".harbor_blobs"))
+                .unwrap_or_else(|| PathBuf::from(".harbor_blobs"))
+        });
     
     // Parse --api-port
     let api_port: Option<u16> = args.windows(2)
@@ -116,10 +135,12 @@ async fn main() {
         ProtocolConfig::for_testing()
             .with_db_key(DB_KEY)
             .with_db_path(db_path.clone())
+            .with_blob_path(blob_path.clone())
     } else {
         ProtocolConfig::default()
             .with_db_key(DB_KEY)
             .with_db_path(db_path.clone())
+            .with_blob_path(blob_path.clone())
     };
 
     // Handle bootstrap configuration:
@@ -160,6 +181,7 @@ async fn main() {
     // Start the protocol
     println!("Starting Harbor Protocol...");
     println!("Database: {}", db_path.display());
+    println!("Blob storage: {}", blob_path.display());
     
     let protocol = match Protocol::start(config).await {
         Ok(p) => Arc::new(p),
@@ -241,16 +263,45 @@ async fn main() {
         }
         _ = async {
             if let Some(ref mut rx) = events {
-                while let Some(msg) = rx.recv().await {
-                    // Try to decode payload as UTF-8 for display
-                    let content = String::from_utf8_lossy(&msg.payload);
-                    info!(
-                        topic = %hex::encode(&msg.topic_id[..8]),
-                        sender = %hex::encode(&msg.sender_id[..8]),
-                        size = msg.payload.len(),
-                        content = %content,
-                        "Received message"
-                    );
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        harbor_core::ProtocolEvent::Message(msg) => {
+                            // Try to decode payload as UTF-8 for display
+                            let content = String::from_utf8_lossy(&msg.payload);
+                            info!(
+                                topic = %hex::encode(&msg.topic_id[..8]),
+                                sender = %hex::encode(&msg.sender_id[..8]),
+                                size = msg.payload.len(),
+                                content = %content,
+                                "Received message"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::FileAnnounced(ev) => {
+                            info!(
+                                topic = %hex::encode(&ev.topic_id[..8]),
+                                source = %hex::encode(&ev.source_id[..8]),
+                                hash = %hex::encode(&ev.hash[..8]),
+                                name = %ev.display_name,
+                                size = ev.total_size,
+                                "File announced"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::FileProgress(ev) => {
+                            debug!(
+                                hash = %hex::encode(&ev.hash[..8]),
+                                progress = %format!("{}/{}", ev.chunks_complete, ev.total_chunks),
+                                "File progress"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::FileComplete(ev) => {
+                            info!(
+                                hash = %hex::encode(&ev.hash[..8]),
+                                name = %ev.display_name,
+                                size = ev.total_size,
+                                "File complete"
+                            );
+                        }
+                    }
                 }
             } else {
                 std::future::pending::<()>().await
@@ -447,11 +498,26 @@ async fn handle_request(protocol: &Protocol, bootstrap: &BootstrapInfo, request:
         return handle_get_invite(protocol, topic_hex).await;
     }
 
+    // Handle /api/share/status/:hash path
+    if method == "GET" && path.starts_with("/api/share/status/") {
+        let hash_hex = &path[18..]; // Strip "/api/share/status/"
+        return handle_share_status(protocol, hash_hex).await;
+    }
+
+    // Handle /api/share/blobs/:topic path
+    if method == "GET" && path.starts_with("/api/share/blobs/") {
+        let topic_hex = &path[17..]; // Strip "/api/share/blobs/"
+        return handle_list_blobs(protocol, topic_hex).await;
+    }
+
     match (method, path) {
         ("POST", "/api/topic") => handle_create_topic(protocol).await,
         ("POST", "/api/join") => handle_join_topic(protocol, body).await,
         ("POST", "/api/send") => handle_send(protocol, body).await,
         ("POST", "/api/refresh_members") => handle_refresh_members(protocol).await,
+        ("POST", "/api/share") => handle_share_file(protocol, body).await,
+        ("POST", "/api/share/pull") => handle_share_pull(protocol, body).await,
+        ("POST", "/api/share/export") => handle_share_export(protocol, body).await,
         ("GET", "/api/stats") => handle_stats(protocol).await,
         ("GET", "/api/topics") => handle_list_topics(protocol).await,
         ("GET", "/api/bootstrap") => handle_bootstrap(bootstrap),
@@ -615,6 +681,164 @@ fn handle_bootstrap(bootstrap: &BootstrapInfo) -> String {
         relay
     );
     http_json_response(200, &json)
+}
+
+// ============================================================================
+// Share API Handlers
+// ============================================================================
+
+/// Share a file with a topic
+/// POST /api/share
+/// Body: {"topic": "hex...", "file_path": "/path/to/file"}
+async fn handle_share_file(protocol: &Protocol, body: &str) -> String {
+    let topic_hex = match extract_json_string(body, "topic") {
+        Some(t) => t,
+        None => return http_response(400, "Missing 'topic' field"),
+    };
+    
+    let file_path = match extract_json_string(body, "file_path") {
+        Some(f) => f,
+        None => return http_response(400, "Missing 'file_path' field"),
+    };
+
+    let topic_bytes = match hex::decode(&topic_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
+    };
+
+    match protocol.share_file(&topic_bytes, &file_path).await {
+        Ok(hash) => {
+            let json = format!(r#"{{"hash":"{}","status":"announced"}}"#, hex::encode(hash));
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(500, &format!("Failed to share file: {}", e)),
+    }
+}
+
+/// Get share status for a blob
+/// GET /api/share/status/:hash
+async fn handle_share_status(protocol: &Protocol, hash_hex: &str) -> String {
+    let hash_bytes = match hex::decode(hash_hex.trim()) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid hash (must be 64 hex chars)"),
+    };
+
+    match protocol.get_share_status(&hash_bytes).await {
+        Ok(status) => {
+            let state_str = match status.state {
+                harbor_core::data::BlobState::Partial => "partial",
+                harbor_core::data::BlobState::Complete => "complete",
+            };
+            let json = format!(
+                r#"{{"hash":"{}","display_name":"{}","total_size":{},"total_chunks":{},"chunks_complete":{},"state":"{}","section_count":{}}}"#,
+                hex::encode(status.hash),
+                status.display_name,
+                status.total_size,
+                status.total_chunks,
+                status.chunks_complete,
+                state_str,
+                status.num_sections
+            );
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(404, &format!("Blob not found: {}", e)),
+    }
+}
+
+/// List blobs for a topic
+/// GET /api/share/blobs/:topic
+async fn handle_list_blobs(protocol: &Protocol, topic_hex: &str) -> String {
+    let topic_bytes = match hex::decode(topic_hex.trim()) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
+    };
+
+    match protocol.list_topic_blobs(&topic_bytes).await {
+        Ok(blobs) => {
+            let blob_jsons: Vec<String> = blobs.iter().map(|b| {
+                let state_str = match b.state {
+                    harbor_core::data::BlobState::Partial => "partial",
+                    harbor_core::data::BlobState::Complete => "complete",
+                };
+                format!(
+                    r#"{{"hash":"{}","display_name":"{}","total_size":{},"total_chunks":{},"state":"{}"}}"#,
+                    hex::encode(b.hash),
+                    b.display_name,
+                    b.total_size,
+                    b.total_chunks,
+                    state_str
+                )
+            }).collect();
+            let json = format!(r#"{{"blobs":[{}]}}"#, blob_jsons.join(","));
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(500, &format!("Failed to list blobs: {}", e)),
+    }
+}
+
+/// Request to pull a blob
+/// POST /api/share/pull
+/// Body: {"hash": "hex..."}
+async fn handle_share_pull(protocol: &Protocol, body: &str) -> String {
+    let hash_hex = match extract_json_string(body, "hash") {
+        Some(h) => h,
+        None => return http_response(400, "Missing 'hash' field"),
+    };
+
+    let hash_bytes = match hex::decode(&hash_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid hash (must be 64 hex chars)"),
+    };
+
+    match protocol.request_blob(&hash_bytes).await {
+        Ok(()) => http_response(200, "Pull started"),
+        Err(e) => http_response(500, &format!("Failed to start pull: {}", e)),
+    }
+}
+
+/// Export a completed blob to a file
+/// POST /api/share/export
+/// Body: {"hash": "hex...", "dest_path": "/path/to/output"}
+async fn handle_share_export(protocol: &Protocol, body: &str) -> String {
+    let hash_hex = match extract_json_string(body, "hash") {
+        Some(h) => h,
+        None => return http_response(400, "Missing 'hash' field"),
+    };
+    
+    let dest_path = match extract_json_string(body, "dest_path") {
+        Some(p) => p,
+        None => return http_response(400, "Missing 'dest_path' field"),
+    };
+
+    let hash_bytes = match hex::decode(&hash_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid hash (must be 64 hex chars)"),
+    };
+
+    match protocol.export_blob(&hash_bytes, &dest_path).await {
+        Ok(()) => http_response(200, "Exported successfully"),
+        Err(e) => http_response(500, &format!("Failed to export: {}", e)),
+    }
 }
 
 fn http_response(status: u16, body: &str) -> String {

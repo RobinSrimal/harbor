@@ -12,6 +12,7 @@ mod harbor_pull;
 mod harbor_sync;
 mod maintenance;
 mod replication;
+mod share_pull;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,16 +32,26 @@ impl Protocol {
     pub(crate) async fn start_background_tasks(&self, _shutdown_rx: mpsc::Receiver<()>) {
         let mut tasks = self.tasks.write().await;
 
-        // 1. Incoming message handler (handles Send, DHT, Harbor protocols)
+        // 1. Incoming message handler (handles Send, DHT, Harbor, Share protocols)
         let endpoint = self.endpoint.clone();
         let db = self.db.clone();
         let event_tx = self.event_tx.clone();
         let our_id = self.identity.public_key;
         let running = self.running.clone();
         let dht_client = self.dht_client.clone();
+        
+        // Initialize blob store for Share protocol
+        let blob_path = self.blob_path();
+        let blob_store = match crate::data::BlobStore::new(&blob_path) {
+            Ok(store) => Some(std::sync::Arc::new(store)),
+            Err(e) => {
+                warn!(error = %e, path = %blob_path.display(), "failed to initialize blob store");
+                None
+            }
+        };
 
         let incoming_task = tokio::spawn(async move {
-            Self::run_incoming_handler(endpoint, db, event_tx, our_id, running, dht_client).await;
+            Self::run_incoming_handler(endpoint, db, event_tx, our_id, running, dht_client, blob_store).await;
         });
         tasks.push(incoming_task);
 
@@ -154,6 +165,28 @@ impl Protocol {
             Self::run_cleanup_loop(db, running, cleanup_interval).await;
         });
         tasks.push(cleanup_task);
+
+        // 8. Share pull task (retries incomplete blob downloads)
+        let db = self.db.clone();
+        let endpoint = self.endpoint.clone();
+        let running = self.running.clone();
+        let our_id = self.identity.public_key;
+        let share_pull_interval = Duration::from_secs(self.config.share_pull_interval_secs);
+        let share_blob_path = self.blob_path();
+        let share_event_tx = self.event_tx.clone();
+
+        let share_pull_task = tokio::spawn(async move {
+            share_pull::run_share_pull_task(
+                db,
+                endpoint,
+                our_id,
+                running,
+                share_pull_interval,
+                share_blob_path,
+                share_event_tx,
+            ).await;
+        });
+        tasks.push(share_pull_task);
 
         info!("Background tasks started");
     }

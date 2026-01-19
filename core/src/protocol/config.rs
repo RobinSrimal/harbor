@@ -10,6 +10,10 @@ pub struct ProtocolConfig {
     /// If None, uses a default path in the user's data directory
     pub db_path: Option<PathBuf>,
     
+    /// Path to blob storage directory
+    /// If None, uses .harbor_blobs/ next to the database
+    pub blob_path: Option<PathBuf>,
+    
     /// Database encryption key (32 bytes)
     /// If None, generates a random key (not recommended for production)
     pub db_key: Option<[u8; 32]>,
@@ -89,12 +93,17 @@ pub struct ProtocolConfig {
     /// PoW difficulty (leading zero bits)
     /// Default: 18 (~10-50ms)
     pub pow_difficulty: u8,
+    
+    /// How often to check for incomplete blobs and retry pulling (seconds)
+    /// Default: 30
+    pub share_pull_interval_secs: u64,
 }
 
 impl fmt::Debug for ProtocolConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProtocolConfig")
             .field("db_path", &self.db_path)
+            .field("blob_path", &self.blob_path)
             .field("db_key", &self.db_key.as_ref().map(|_| "[REDACTED]"))
             .field("bootstrap_nodes", &self.bootstrap_nodes)
             .field("max_storage_bytes", &self.max_storage_bytes)
@@ -115,6 +124,7 @@ impl fmt::Debug for ProtocolConfig {
             .field("cleanup_interval_secs", &self.cleanup_interval_secs)
             .field("enable_pow", &self.enable_pow)
             .field("pow_difficulty", &self.pow_difficulty)
+            .field("share_pull_interval_secs", &self.share_pull_interval_secs)
             .finish()
     }
 }
@@ -123,6 +133,7 @@ impl Default for ProtocolConfig {
     fn default() -> Self {
         Self {
             db_path: None,
+            blob_path: None,
             db_key: None,
             bootstrap_nodes: vec![
                 // Default bootstrap node (can be overridden)
@@ -146,6 +157,7 @@ impl Default for ProtocolConfig {
             cleanup_interval_secs: 3600,
             enable_pow: true,
             pow_difficulty: 18,
+            share_pull_interval_secs: 30,
         }
     }
 }
@@ -159,6 +171,12 @@ impl ProtocolConfig {
     /// Set the database path
     pub fn with_db_path(mut self, path: PathBuf) -> Self {
         self.db_path = Some(path);
+        self
+    }
+
+    /// Set the blob storage path
+    pub fn with_blob_path(mut self, path: PathBuf) -> Self {
+        self.blob_path = Some(path);
         self
     }
 
@@ -220,6 +238,7 @@ impl ProtocolConfig {
     pub fn for_testing() -> Self {
         Self {
             db_path: None,
+            blob_path: None,
             db_key: None,
             bootstrap_nodes: vec![],
             max_storage_bytes: 10 * 1024 * 1024, // 10 MB
@@ -240,6 +259,7 @@ impl ProtocolConfig {
             cleanup_interval_secs: 3600,     // Same as default
             enable_pow: false,
             pow_difficulty: 8,
+            share_pull_interval_secs: 10,    // Faster for testing
         }
     }
     
@@ -312,6 +332,12 @@ impl ProtocolConfig {
     /// Set cleanup interval
     pub fn with_cleanup_interval(mut self, secs: u64) -> Self {
         self.cleanup_interval_secs = secs;
+        self
+    }
+    
+    /// Set share pull retry interval
+    pub fn with_share_pull_interval(mut self, secs: u64) -> Self {
+        self.share_pull_interval_secs = secs;
         self
     }
 }

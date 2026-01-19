@@ -13,9 +13,10 @@ use tracing::{debug, info, trace, warn};
 
 use crate::data::{
     current_timestamp, get_topics_for_member, add_topic_member_with_relay,
-    remove_topic_member, mark_pulled,
+    remove_topic_member, mark_pulled, get_blob, insert_blob, init_blob_sections,
+    record_peer_can_seed,
 };
-use crate::data::outgoing::acknowledge_and_cleanup_if_complete;
+use crate::data::send::acknowledge_and_cleanup_if_complete;
 use crate::network::send::protocol::{SendMessage, Receipt};
 use crate::network::membership::messages::TopicMessage;
 use crate::security::{
@@ -23,14 +24,14 @@ use crate::security::{
     VerificationMode,
 };
 
-use crate::protocol::{Protocol, IncomingMessage, ProtocolError};
+use crate::protocol::{Protocol, IncomingMessage, ProtocolEvent, FileAnnouncedEvent, ProtocolError};
 
 impl Protocol {
     /// Handle a single incoming Send protocol connection
     pub(crate) async fn handle_send_connection(
         conn: iroh::endpoint::Connection,
         db: Arc<Mutex<Connection>>,
-        event_tx: mpsc::Sender<IncomingMessage>,
+        event_tx: mpsc::Sender<ProtocolEvent>,
         sender_id: [u8; 32],
         our_id: [u8; 32],
     ) -> Result<(), ProtocolError> {
@@ -94,7 +95,7 @@ impl Protocol {
     async fn handle_packet(
         conn: &iroh::endpoint::Connection,
         db: &Arc<Mutex<Connection>>,
-        event_tx: &mpsc::Sender<IncomingMessage>,
+        event_tx: &mpsc::Sender<ProtocolEvent>,
         sender_id: [u8; 32],
         our_id: [u8; 32],
         packet: crate::security::SendPacket,
@@ -182,19 +183,117 @@ impl Protocol {
                                     debug!(leaver = hex::encode(leave.leaver), "member left");
                                 }
                             }
+                            TopicMessage::FileAnnouncement(ann) => {
+                                // Validate source matches packet sender
+                                if ann.source_id != sender_id {
+                                    warn!(
+                                        source = %hex::encode(ann.source_id),
+                                        sender = %hex::encode(sender_id),
+                                        "file announcement source doesn't match packet sender - ignoring"
+                                    );
+                                } else {
+                                    info!(
+                                        hash = hex::encode(&ann.hash[..8]),
+                                        source = hex::encode(&ann.source_id[..8]),
+                                        name = ann.display_name,
+                                        size = ann.total_size,
+                                        chunks = ann.total_chunks,
+                                        sections = ann.num_sections,
+                                        "SHARE: Received file announcement"
+                                    );
+                                    
+                                    // Check if we already have this blob
+                                    let existing = get_blob(&db_lock, &ann.hash);
+                                    if existing.is_ok() && existing.as_ref().unwrap().is_some() {
+                                        debug!(
+                                            hash = hex::encode(&ann.hash[..8]),
+                                            "blob already known, skipping insert"
+                                        );
+                                    } else {
+                                        // Store blob metadata - it will be in Partial state
+                                        // The background share_pull task will pick it up
+                                        if let Err(e) = insert_blob(
+                                            &db_lock,
+                                            &ann.hash,
+                                            &topic_id,
+                                            &ann.source_id,
+                                            &ann.display_name,
+                                            ann.total_size,
+                                            ann.num_sections,
+                                        ) {
+                                            warn!(error = %e, "failed to store blob metadata");
+                                        } else {
+                                            // Initialize sections for tracking
+                                            let total_chunks = ((ann.total_size + crate::data::CHUNK_SIZE - 1) 
+                                                / crate::data::CHUNK_SIZE) as u32;
+                                            if let Err(e) = init_blob_sections(
+                                                &db_lock,
+                                                &ann.hash,
+                                                ann.num_sections,
+                                                total_chunks,
+                                            ) {
+                                                warn!(error = %e, "failed to init blob sections");
+                                            }
+                                            debug!(
+                                                hash = hex::encode(&ann.hash[..8]),
+                                                "blob stored, will pull via background task"
+                                            );
+                                            
+                                            // Emit FileAnnounced event to app
+                                            let file_event = ProtocolEvent::FileAnnounced(FileAnnouncedEvent {
+                                                topic_id,
+                                                source_id: ann.source_id,
+                                                hash: ann.hash,
+                                                display_name: ann.display_name.clone(),
+                                                total_size: ann.total_size,
+                                                total_chunks,
+                                                timestamp: current_timestamp(),
+                                            });
+                                            if event_tx.send(file_event).await.is_err() {
+                                                debug!("event receiver dropped");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            TopicMessage::CanSeed(can_seed) => {
+                                // Validate seeder matches packet sender
+                                if can_seed.seeder_id != sender_id {
+                                    warn!(
+                                        seeder = %hex::encode(can_seed.seeder_id),
+                                        sender = %hex::encode(sender_id),
+                                        "can seed message seeder doesn't match packet sender - ignoring"
+                                    );
+                                } else {
+                                    info!(
+                                        hash = hex::encode(&can_seed.hash[..8]),
+                                        peer = hex::encode(&can_seed.seeder_id[..8]),
+                                        "SHARE: Peer can seed file"
+                                    );
+                                    
+                                    // Record that this peer can seed all sections
+                                    if let Err(e) = record_peer_can_seed(
+                                        &db_lock,
+                                        &can_seed.hash,
+                                        &can_seed.seeder_id,
+                                    ) {
+                                        warn!(error = %e, "failed to record peer can seed");
+                                    }
+                                }
+                            }
                             TopicMessage::Content(_) => {}
                         }
                     }
 
                     // Only forward Content messages to the app
-                    // Join/Leave are internal control messages, not user content
+                    // Control messages (Join/Leave/FileAnnouncement/CanSeed) are internal
                     if let Some(TopicMessage::Content(data)) = topic_msg {
-                        let event = IncomingMessage {
+                        let event = ProtocolEvent::Message(IncomingMessage {
                             topic_id,
                             sender_id,
                             payload: data,
                             timestamp: current_timestamp(),
-                        };
+                        });
 
                         if event_tx.send(event).await.is_err() {
                             debug!("event receiver dropped");
@@ -268,7 +367,7 @@ impl Protocol {
     async fn handle_packet_with_pow(
         conn: &iroh::endpoint::Connection,
         db: &Arc<Mutex<Connection>>,
-        event_tx: &mpsc::Sender<IncomingMessage>,
+        event_tx: &mpsc::Sender<ProtocolEvent>,
         sender_id: [u8; 32],
         our_id: [u8; 32],
         packet: crate::security::SendPacket,
@@ -373,18 +472,117 @@ impl Protocol {
                                     debug!(leaver = hex::encode(leave.leaver), "member left");
                                 }
                             }
+                            TopicMessage::FileAnnouncement(ann) => {
+                                // Validate source matches packet sender
+                                if ann.source_id != sender_id {
+                                    warn!(
+                                        source = %hex::encode(ann.source_id),
+                                        sender = %hex::encode(sender_id),
+                                        "file announcement source doesn't match packet sender - ignoring"
+                                    );
+                                } else {
+                                    info!(
+                                        hash = hex::encode(&ann.hash[..8]),
+                                        source = hex::encode(&ann.source_id[..8]),
+                                        name = ann.display_name,
+                                        size = ann.total_size,
+                                        chunks = ann.total_chunks,
+                                        sections = ann.num_sections,
+                                        "SHARE: Received file announcement"
+                                    );
+                                    
+                                    // Check if we already have this blob
+                                    let existing = get_blob(&db_lock, &ann.hash);
+                                    if existing.is_ok() && existing.as_ref().unwrap().is_some() {
+                                        debug!(
+                                            hash = hex::encode(&ann.hash[..8]),
+                                            "blob already known, skipping insert"
+                                        );
+                                    } else {
+                                        // Store blob metadata - it will be in Partial state
+                                        // The background share_pull task will pick it up
+                                        if let Err(e) = insert_blob(
+                                            &db_lock,
+                                            &ann.hash,
+                                            &topic_id,
+                                            &ann.source_id,
+                                            &ann.display_name,
+                                            ann.total_size,
+                                            ann.num_sections,
+                                        ) {
+                                            warn!(error = %e, "failed to store blob metadata");
+                                        } else {
+                                            // Initialize sections for tracking
+                                            let total_chunks = ((ann.total_size + crate::data::CHUNK_SIZE - 1) 
+                                                / crate::data::CHUNK_SIZE) as u32;
+                                            if let Err(e) = init_blob_sections(
+                                                &db_lock,
+                                                &ann.hash,
+                                                ann.num_sections,
+                                                total_chunks,
+                                            ) {
+                                                warn!(error = %e, "failed to init blob sections");
+                                            }
+                                            debug!(
+                                                hash = hex::encode(&ann.hash[..8]),
+                                                "blob stored, will pull via background task"
+                                            );
+                                            
+                                            // Emit FileAnnounced event to app
+                                            let file_event = ProtocolEvent::FileAnnounced(FileAnnouncedEvent {
+                                                topic_id,
+                                                source_id: ann.source_id,
+                                                hash: ann.hash,
+                                                display_name: ann.display_name.clone(),
+                                                total_size: ann.total_size,
+                                                total_chunks,
+                                                timestamp: current_timestamp(),
+                                            });
+                                            if event_tx.send(file_event).await.is_err() {
+                                                debug!("event receiver dropped");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            TopicMessage::CanSeed(can_seed) => {
+                                // Validate seeder matches packet sender
+                                if can_seed.seeder_id != sender_id {
+                                    warn!(
+                                        seeder = %hex::encode(can_seed.seeder_id),
+                                        sender = %hex::encode(sender_id),
+                                        "can seed message seeder doesn't match packet sender - ignoring"
+                                    );
+                                } else {
+                                    info!(
+                                        hash = hex::encode(&can_seed.hash[..8]),
+                                        peer = hex::encode(&can_seed.seeder_id[..8]),
+                                        "SHARE: Peer can seed file"
+                                    );
+                                    
+                                    // Record that this peer can seed all sections
+                                    if let Err(e) = record_peer_can_seed(
+                                        &db_lock,
+                                        &can_seed.hash,
+                                        &can_seed.seeder_id,
+                                    ) {
+                                        warn!(error = %e, "failed to record peer can seed");
+                                    }
+                                }
+                            }
                             TopicMessage::Content(_) => {}
                         }
                     }
 
                     // Only forward Content messages to the app
+                    // Control messages (Join/Leave/FileAnnouncement/CanSeed) are internal
                     if let Some(TopicMessage::Content(data)) = topic_msg {
-                        let event = IncomingMessage {
+                        let event = ProtocolEvent::Message(IncomingMessage {
                             topic_id,
                             sender_id,
                             payload: data,
                             timestamp: current_timestamp(),
-                        };
+                        });
 
                         if event_tx.send(event).await.is_err() {
                             debug!("event receiver dropped");

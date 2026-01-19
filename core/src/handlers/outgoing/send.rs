@@ -12,7 +12,7 @@ use futures::future::join_all;
 use iroh::{NodeId, NodeAddr};
 use tracing::{debug, trace, info};
 
-use crate::data::outgoing::store_outgoing_packet;
+use crate::data::send::store_outgoing_packet;
 use crate::data::WILDCARD_RECIPIENT;
 use crate::network::harbor::protocol::HarborPacketType;
 use crate::network::send::protocol::{SEND_ALPN, SendMessage};

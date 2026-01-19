@@ -13,6 +13,8 @@ use tracing::{debug, error, info, warn};
 use crate::data::{
     get_topics_for_member, add_topic_member_with_relay,
     remove_topic_member, mark_pulled, was_pulled, get_joined_at,
+    get_blob, insert_blob, init_blob_sections, record_peer_can_seed,
+    CHUNK_SIZE,
 };
 use crate::network::dht::ApiClient as DhtApiClient;
 use crate::network::harbor::protocol::HarborPacketType;
@@ -22,14 +24,14 @@ use crate::security::{
     VerificationMode, SendPacket,
 };
 
-use crate::protocol::{Protocol, IncomingMessage};
+use crate::protocol::{Protocol, IncomingMessage, ProtocolEvent};
 
 impl Protocol {
     /// Run the Harbor pull loop
     pub(crate) async fn run_harbor_pull_loop(
         db: Arc<Mutex<Connection>>,
         endpoint: Endpoint,
-        event_tx: mpsc::Sender<IncomingMessage>,
+        event_tx: mpsc::Sender<ProtocolEvent>,
         our_id: [u8; 32],
         dht_client: Option<DhtApiClient>,
         running: Arc<RwLock<bool>>,
@@ -180,6 +182,58 @@ impl Protocol {
                                                         let _ = remove_topic_member(&db_lock, &topic_id, &leave.leaver);
                                                     }
                                                 }
+                                                TopicMessage::FileAnnouncement(ann) => {
+                                                    // Validate source matches packet sender
+                                                    if ann.source_id != packet_info.sender_id {
+                                                        warn!(
+                                                            source = %hex::encode(ann.source_id),
+                                                            sender = %hex::encode(packet_info.sender_id),
+                                                            "file announcement source doesn't match packet sender - ignoring"
+                                                        );
+                                                    } else {
+                                                        // Check if we already have this blob
+                                                        let existing = get_blob(&db_lock, &ann.hash);
+                                                        if existing.is_ok() && existing.as_ref().unwrap().is_none() {
+                                                            // Store blob metadata
+                                                            if let Err(e) = insert_blob(
+                                                                &db_lock,
+                                                                &ann.hash,
+                                                                &topic_id,
+                                                                &ann.source_id,
+                                                                &ann.display_name,
+                                                                ann.total_size,
+                                                                ann.num_sections,
+                                                            ) {
+                                                                warn!(error = %e, "failed to store blob metadata");
+                                                            } else {
+                                                                let total_chunks = ((ann.total_size + CHUNK_SIZE - 1) 
+                                                                    / CHUNK_SIZE) as u32;
+                                                                let _ = init_blob_sections(
+                                                                    &db_lock,
+                                                                    &ann.hash,
+                                                                    ann.num_sections,
+                                                                    total_chunks,
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                TopicMessage::CanSeed(can_seed) => {
+                                                    // Validate seeder matches packet sender
+                                                    if can_seed.seeder_id != packet_info.sender_id {
+                                                        warn!(
+                                                            seeder = %hex::encode(can_seed.seeder_id),
+                                                            sender = %hex::encode(packet_info.sender_id),
+                                                            "can seed message seeder doesn't match packet sender - ignoring"
+                                                        );
+                                                    } else {
+                                                        let _ = record_peer_can_seed(
+                                                            &db_lock,
+                                                            &can_seed.hash,
+                                                            &can_seed.seeder_id,
+                                                        );
+                                                    }
+                                                }
                                                 TopicMessage::Content(_) => {}
                                             }
                                         }
@@ -187,12 +241,12 @@ impl Protocol {
                                         // Only forward Content messages to the app
                                         // Join/Leave are internal control messages, not user content
                                         if let Some(TopicMessage::Content(data)) = topic_msg {
-                                            let event = IncomingMessage {
+                                            let event = ProtocolEvent::Message(IncomingMessage {
                                                 topic_id,
                                                 sender_id: packet_info.sender_id,
                                                 payload: data,
                                                 timestamp: packet_info.created_at,
-                                            };
+                                            });
 
                                             if event_tx.send(event).await.is_err() {
                                                 debug!("event receiver dropped");

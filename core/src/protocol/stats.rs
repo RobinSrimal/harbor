@@ -13,7 +13,7 @@ use crate::data::{
     current_timestamp, get_all_topics, get_topic_members, get_topic_members_with_info,
 };
 use crate::data::dht::{get_bucket_entries, count_all_entries as count_dht_entries};
-use crate::data::outgoing::get_packets_needing_replication;
+use crate::data::send::get_packets_needing_replication;
 use crate::data::harbor::{get_active_harbor_ids, get_harbor_cache_stats};
 use crate::security::harbor_id_from_topic;
 

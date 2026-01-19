@@ -8,7 +8,7 @@
 //! The sender must find a nonce such that:
 //! BLAKE3(harbor_id || packet_id || timestamp || nonce) has N leading zero bits
 
-use crate::data::peer::current_timestamp;
+use crate::data::dht::current_timestamp;
 
 /// PoW configuration
 #[derive(Debug, Clone)]

@@ -996,7 +996,7 @@ impl std::error::Error for HarborError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::peer::current_timestamp;
+    use crate::data::dht::current_timestamp;
     use crate::data::schema::create_harbor_table;
     use crate::security::create_key_pair::generate_key_pair;
     use crate::security::send::packet::PacketBuilder;

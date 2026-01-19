@@ -36,6 +36,8 @@ pub mod messages;
 pub use messages::{
     get_verification_mode_from_payload, DecodeError as MessageDecodeError, JoinMessage,
     LeaveMessage, MessageType, TopicMessage,
+    // Share-related control messages
+    FileAnnouncementMessage, CanSeedMessage,
 };
 
 // Wildcard recipient for Join/Leave messages stored on Harbor

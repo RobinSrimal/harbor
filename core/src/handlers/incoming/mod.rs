@@ -4,10 +4,12 @@
 //! - SEND_ALPN: Message delivery (packets, receipts)
 //! - DHT_ALPN: DHT protocol (FindNode requests)
 //! - HARBOR_ALPN: Harbor protocol (store, pull, sync)
+//! - SHARE_ALPN: File sharing protocol (chunks, bitfields)
 
 mod dht;
 mod harbor;
 mod send;
+mod share;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,11 +19,13 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, trace};
 
+use crate::data::BlobStore;
 use crate::network::dht::{ApiClient as DhtApiClient, DHT_ALPN};
 use crate::network::harbor::protocol::HARBOR_ALPN;
 use crate::network::send::protocol::SEND_ALPN;
+use crate::network::share::protocol::SHARE_ALPN;
 
-use crate::protocol::{IncomingMessage, Protocol};
+use crate::protocol::{ProtocolEvent, Protocol};
 
 impl Protocol {
     /// Run the incoming connection handler
@@ -30,10 +34,11 @@ impl Protocol {
     pub(crate) async fn run_incoming_handler(
         endpoint: Endpoint,
         db: Arc<Mutex<Connection>>,
-        event_tx: mpsc::Sender<IncomingMessage>,
+        event_tx: mpsc::Sender<ProtocolEvent>,
         our_id: [u8; 32],
         running: Arc<RwLock<bool>>,
         dht_client: Option<DhtApiClient>,
+        blob_store: Option<Arc<BlobStore>>,
     ) {
         loop {
             // Check if we should stop
@@ -112,6 +117,23 @@ impl Protocol {
                         Self::handle_harbor_connection(conn, db, sender_id, our_id).await
                     {
                         debug!(error = %e, sender = %hex::encode(sender_id), "Harbor connection handler error");
+                    }
+                });
+            } else if alpn.as_deref() == Some(SHARE_ALPN) {
+                // Handle Share protocol (file chunks, bitfields)
+                let db = db.clone();
+                let blob_store = blob_store.clone();
+
+                tokio::spawn(async move {
+                    if let Some(store) = blob_store {
+                        trace!(sender = %hex::encode(sender_id), "starting Share connection handler");
+                        if let Err(e) =
+                            Self::handle_share_connection(conn, db, store, sender_id, our_id).await
+                        {
+                            debug!(error = %e, sender = %hex::encode(sender_id), "Share connection handler error");
+                        }
+                    } else {
+                        debug!("Share connection received but blob store not initialized");
                     }
                 });
             } else {

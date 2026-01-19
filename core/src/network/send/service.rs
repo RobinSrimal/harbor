@@ -16,7 +16,7 @@ use iroh::endpoint::Connection;
 use tokio::sync::RwLock;
 use tracing::{debug, trace};
 
-use crate::data::outgoing::{
+use crate::data::send::{
     store_outgoing_packet, acknowledge_receipt as db_acknowledge_receipt,
 };
 use crate::network::harbor::protocol::HarborPacketType;
@@ -651,7 +651,7 @@ mod tests {
         ).unwrap();
 
         // Get packets needing replication (none acked yet)
-        use crate::data::outgoing::get_packets_needing_replication;
+        use crate::data::send::get_packets_needing_replication;
         let needs_replication = get_packets_needing_replication(&db_conn).unwrap();
         assert_eq!(needs_replication.len(), 1);
 
@@ -685,7 +685,7 @@ mod tests {
             ).unwrap();
         }
 
-        use crate::data::outgoing::get_packets_needing_replication;
+        use crate::data::send::get_packets_needing_replication;
         let needs_replication = get_packets_needing_replication(&db_conn).unwrap();
         assert_eq!(needs_replication.len(), 5);
     }

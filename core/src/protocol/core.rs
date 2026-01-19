@@ -23,7 +23,7 @@ use crate::network::harbor::protocol::HARBOR_ALPN;
 use crate::network::send::protocol::SEND_ALPN;
 
 use super::config::ProtocolConfig;
-use super::types::{IncomingMessage, ProtocolError};
+use super::types::{ProtocolError, ProtocolEvent};
 
 /// Maximum message size (512 KB)
 pub const MAX_MESSAGE_SIZE: usize = 512 * 1024;
@@ -55,10 +55,10 @@ pub struct Protocol {
     dht_rpc_client: Option<DhtRpcClient>,
     /// DHT client for finding Harbor Nodes
     pub(crate) dht_client: Option<DhtApiClient>,
-    /// Event sender
-    pub(crate) event_tx: mpsc::Sender<IncomingMessage>,
+    /// Event sender (for app notifications: messages, file events, etc.)
+    pub(crate) event_tx: mpsc::Sender<ProtocolEvent>,
     /// Event receiver (cloneable via Arc)
-    event_rx: Arc<RwLock<Option<mpsc::Receiver<IncomingMessage>>>>,
+    event_rx: Arc<RwLock<Option<mpsc::Receiver<ProtocolEvent>>>>,
     /// Running flag
     pub(crate) running: Arc<RwLock<bool>>,
     /// Background tasks
@@ -112,6 +112,7 @@ impl Protocol {
                 SEND_ALPN.to_vec(),
                 HARBOR_ALPN.to_vec(),
                 DHT_ALPN.to_vec(),
+                crate::network::share::SHARE_ALPN.to_vec(),
             ])
             .bind()
             .await
@@ -314,9 +315,11 @@ impl Protocol {
 
     /// Get the event receiver
     ///
-    /// This returns a receiver for incoming messages.
+    /// Get the protocol event receiver
+    /// 
+    /// This returns a receiver for all protocol events (messages, file events, etc.)
     /// Can only be called once - subsequent calls return None.
-    pub async fn events(&self) -> Option<mpsc::Receiver<IncomingMessage>> {
+    pub async fn events(&self) -> Option<mpsc::Receiver<ProtocolEvent>> {
         let mut rx = self.event_rx.write().await;
         rx.take()
     }
@@ -330,6 +333,24 @@ impl Protocol {
     pub async fn relay_url(&self) -> Option<String> {
         let node_addr = self.endpoint.node_addr();
         node_addr.relay_url.map(|url| url.to_string())
+    }
+
+    /// Get the blob storage path
+    /// 
+    /// Returns the configured blob path, or derives one from the db path,
+    /// or falls back to the system default.
+    pub fn blob_path(&self) -> std::path::PathBuf {
+        if let Some(ref path) = self.config.blob_path {
+            path.clone()
+        } else if let Some(ref db_path) = self.config.db_path {
+            // Derive from db_path: .harbor_blobs/ next to database
+            db_path.parent()
+                .map(|p| p.join(".harbor_blobs"))
+                .unwrap_or_else(|| std::path::PathBuf::from(".harbor_blobs"))
+        } else {
+            // Fall back to system default
+            crate::data::default_blob_path().unwrap_or_else(|_| std::path::PathBuf::from(".harbor_blobs"))
+        }
     }
 
     /// Check if the protocol is running
@@ -347,7 +368,7 @@ impl Protocol {
         dht_client: &DhtApiClient,
     ) -> Result<(), ProtocolError> {
         use crate::data::dht::{clear_all_entries, insert_dht_entry, DhtEntry};
-        use crate::data::peer::{current_timestamp, upsert_peer, PeerInfo};
+        use crate::data::dht::{current_timestamp, upsert_peer, PeerInfo};
         use std::collections::HashMap;
 
         // Get current routing table from DHT actor

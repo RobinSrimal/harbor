@@ -86,6 +86,44 @@ run_advanced_suite() {
     log "=========================================="
 }
 
+# Run file sharing suite
+run_share_suite() {
+    log "=========================================="
+    log "FILE SHARING TEST SUITE"
+    log "=========================================="
+    
+    scenario_share_basic
+    echo ""
+    sleep 5
+    clear_data
+    
+    scenario_share_peer_offline
+    echo ""
+    sleep 5
+    clear_data
+    
+    scenario_share_few_peers
+    echo ""
+    sleep 5
+    clear_data
+    
+    scenario_share_large_file
+    echo ""
+    sleep 5
+    clear_data
+    
+    scenario_share_retry_source
+    echo ""
+    sleep 5
+    clear_data
+    
+    scenario_share_retry_recipient
+    
+    log "=========================================="
+    log "FILE SHARING TEST SUITE COMPLETE"
+    log "=========================================="
+}
+
 # Run full basic suite
 run_full_suite() {
     scenario_basic
