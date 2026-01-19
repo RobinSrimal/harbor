@@ -6,14 +6,15 @@ use tokio::sync::{Mutex, mpsc};
 use serde::Serialize;
 
 use harbor_core::{
-    Protocol, ProtocolConfig, IncomingMessage, TopicInvite,
+    Protocol, ProtocolConfig, TopicInvite,
     ProtocolStats, DhtBucketInfo, TopicDetails, TopicSummary,
+    ProtocolEvent,
 };
 
 /// Shared protocol state
 pub struct AppState {
     protocol: Arc<Mutex<Option<Protocol>>>,
-    event_rx: Arc<Mutex<Option<mpsc::Receiver<IncomingMessage>>>>,
+    event_rx: Arc<Mutex<Option<mpsc::Receiver<ProtocolEvent>>>>,
 }
 
 impl Default for AppState {
@@ -44,6 +45,44 @@ pub struct MessageEvent {
     sender_id: String,
     payload: String,
     timestamp: i64,
+}
+
+/// File announced event for frontend
+#[derive(Serialize, Clone)]
+pub struct FileAnnouncedEventFE {
+    topic_id: String,
+    source_id: String,
+    hash: String,
+    display_name: String,
+    total_size: u64,
+    total_chunks: u32,
+    timestamp: i64,
+}
+
+/// File progress event for frontend
+#[derive(Serialize, Clone)]
+pub struct FileProgressEventFE {
+    hash: String,
+    chunks_complete: u32,
+    total_chunks: u32,
+}
+
+/// File complete event for frontend  
+#[derive(Serialize, Clone)]
+pub struct FileCompleteEventFE {
+    hash: String,
+    display_name: String,
+    total_size: u64,
+}
+
+/// Combined event type for frontend
+#[derive(Serialize, Clone)]
+#[serde(tag = "type")]
+pub enum AppEvent {
+    Message(MessageEvent),
+    FileAnnounced(FileAnnouncedEventFE),
+    FileProgress(FileProgressEventFE),
+    FileComplete(FileCompleteEventFE),
 }
 
 /// Fixed database key for persistent identity (32 bytes)
@@ -278,24 +317,54 @@ async fn get_invite(state: State<'_, AppState>, topic_id: String) -> Result<Stri
     invite.to_hex().map_err(|e| e.to_string())
 }
 
-/// Poll for new messages (call periodically from frontend)
+/// Poll for new events (messages + file events)
 #[tauri::command]
-async fn poll_messages(state: State<'_, AppState>) -> Result<Vec<MessageEvent>, String> {
+async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String> {
     let mut rx_guard = state.event_rx.lock().await;
     let rx = rx_guard.as_mut().ok_or("No event receiver")?;
     
-    let mut messages = Vec::new();
+    let mut events = Vec::new();
     
-    // Non-blocking receive of all available messages
+    // Non-blocking receive of all available events
     loop {
         match rx.try_recv() {
-            Ok(msg) => {
-                messages.push(MessageEvent {
-                    topic_id: hex::encode(msg.topic_id),
-                    sender_id: hex::encode(msg.sender_id),
-                    payload: String::from_utf8_lossy(&msg.payload).to_string(),
-                    timestamp: msg.timestamp,
-                });
+            Ok(event) => {
+                let app_event = match event {
+                    ProtocolEvent::Message(msg) => {
+                        AppEvent::Message(MessageEvent {
+                            topic_id: hex::encode(msg.topic_id),
+                            sender_id: hex::encode(msg.sender_id),
+                            payload: String::from_utf8_lossy(&msg.payload).to_string(),
+                            timestamp: msg.timestamp,
+                        })
+                    }
+                    ProtocolEvent::FileAnnounced(ev) => {
+                        AppEvent::FileAnnounced(FileAnnouncedEventFE {
+                            topic_id: hex::encode(ev.topic_id),
+                            source_id: hex::encode(ev.source_id),
+                            hash: hex::encode(ev.hash),
+                            display_name: ev.display_name,
+                            total_size: ev.total_size,
+                            total_chunks: ev.total_chunks,
+                            timestamp: ev.timestamp,
+                        })
+                    }
+                    ProtocolEvent::FileProgress(ev) => {
+                        AppEvent::FileProgress(FileProgressEventFE {
+                            hash: hex::encode(ev.hash),
+                            chunks_complete: ev.chunks_complete,
+                            total_chunks: ev.total_chunks,
+                        })
+                    }
+                    ProtocolEvent::FileComplete(ev) => {
+                        AppEvent::FileComplete(FileCompleteEventFE {
+                            hash: hex::encode(ev.hash),
+                            display_name: ev.display_name,
+                            total_size: ev.total_size,
+                        })
+                    }
+                };
+                events.push(app_event);
             }
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -304,7 +373,21 @@ async fn poll_messages(state: State<'_, AppState>) -> Result<Vec<MessageEvent>, 
         }
     }
     
-    Ok(messages)
+    Ok(events)
+}
+
+/// Poll for new messages only (backwards compatibility)
+#[tauri::command]
+async fn poll_messages(state: State<'_, AppState>) -> Result<Vec<MessageEvent>, String> {
+    let events = poll_events(state).await?;
+    
+    Ok(events.into_iter().filter_map(|e| {
+        if let AppEvent::Message(msg) = e {
+            Some(msg)
+        } else {
+            None
+        }
+    }).collect())
 }
 
 // ============================================================================
@@ -365,6 +448,88 @@ async fn list_topic_summaries(state: State<'_, AppState>) -> Result<Vec<TopicSum
         .map_err(|e| e.to_string())
 }
 
+// ============================================================================
+// File Sharing Commands
+// ============================================================================
+
+/// Share response for frontend
+#[derive(Serialize)]
+pub struct ShareResponse {
+    hash: String,
+    display_name: String,
+    total_size: u64,
+    total_chunks: u32,
+}
+
+/// Share a file to a topic
+#[tauri::command]
+async fn share_file(
+    state: State<'_, AppState>,
+    topic_id: String,
+    file_path: String,
+) -> Result<ShareResponse, String> {
+    let protocol_guard = state.protocol.lock().await;
+    let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
+    
+    let topic_bytes = hex::decode(&topic_id)
+        .map_err(|e| e.to_string())?;
+    
+    if topic_bytes.len() != 32 {
+        return Err("Invalid topic ID length".to_string());
+    }
+    
+    let mut topic_arr = [0u8; 32];
+    topic_arr.copy_from_slice(&topic_bytes);
+
+    let hash = protocol.share_file(&topic_arr, &file_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    // Get file info for response
+    let file_name = std::path::Path::new(&file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    
+    let file_size = std::fs::metadata(&file_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    
+    let total_chunks = ((file_size + 512 * 1024 - 1) / (512 * 1024)) as u32;
+    
+    Ok(ShareResponse {
+        hash: hex::encode(hash),
+        display_name: file_name,
+        total_size: file_size,
+        total_chunks,
+    })
+}
+
+/// Export a completed file to a destination path
+#[tauri::command]
+async fn export_file(
+    state: State<'_, AppState>,
+    hash: String,
+    destination: String,
+) -> Result<(), String> {
+    let protocol_guard = state.protocol.lock().await;
+    let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
+    
+    let hash_bytes = hex::decode(&hash)
+        .map_err(|e| e.to_string())?;
+    
+    if hash_bytes.len() != 32 {
+        return Err("Invalid hash length".to_string());
+    }
+    
+    let mut hash_arr = [0u8; 32];
+    hash_arr.copy_from_slice(&hash_bytes);
+
+    protocol.export_blob(&hash_arr, &destination)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize tracing
@@ -372,6 +537,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             start_protocol,
@@ -384,11 +550,15 @@ pub fn run() {
             list_topics,
             get_invite,
             poll_messages,
+            poll_events,
             // Stats & Monitoring
             get_stats,
             get_dht_buckets,
             get_topic_details,
             list_topic_summaries,
+            // File Sharing
+            share_file,
+            export_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

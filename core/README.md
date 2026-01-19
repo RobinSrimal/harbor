@@ -5,6 +5,7 @@ The foundation crate for Harbor Protocol - peer-to-peer topic-based messaging.
 ## Features
 
 - **Topic-based messaging**: Send encrypted messages to all members of a topic
+- **File sharing**: P2P distribution for large files (≥512KB) with BLAKE3 chunking
 - **Offline delivery**: Harbor Nodes store messages for offline members
 - **DHT routing**: Kademlia-style distributed hash table for peer discovery
 - **End-to-end encryption**: All messages encrypted with topic-derived keys
@@ -18,7 +19,7 @@ harbor-core = "0.1"
 ```
 
 ```rust
-use harbor_core::{Protocol, ProtocolConfig, TopicInvite};
+use harbor_core::{Protocol, ProtocolConfig, ProtocolEvent, TopicInvite};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,10 +34,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Send a message
     protocol.send(&invite.topic_id, b"Hello, Harbor!").await?;
 
-    // Listen for incoming messages
-    let mut events = protocol.subscribe();
-    while let Some(msg) = events.recv().await {
-        println!("Received: {:?}", String::from_utf8_lossy(&msg.payload));
+    // Listen for events (messages, file announcements, etc.)
+    let mut events = protocol.events().await.unwrap();
+    while let Some(event) = events.recv().await {
+        match event {
+            ProtocolEvent::Message(msg) => {
+                println!("Message: {:?}", String::from_utf8_lossy(&msg.payload));
+            }
+            ProtocolEvent::FileAnnounced(file) => {
+                println!("File shared: {} ({} bytes)", file.display_name, file.total_size);
+            }
+            _ => {}
+        }
     }
 
     Ok(())
@@ -53,11 +62,12 @@ harbor-core/
 │   ├── dht/        # Kademlia DHT implementation
 │   ├── harbor/     # Harbor Node protocol (store, pull, sync)
 │   ├── membership/ # Topic join/leave messages
-│   └── send/       # Direct message sending
+│   ├── send/       # Direct message sending
+│   └── share/      # P2P file sharing protocol
 ├── protocol/       # Core Protocol struct and API
 ├── resilience/     # Rate limiting, PoW, storage limits
 ├── security/       # Cryptographic operations
-└── tasks/          # Background tasks (sync, maintenance)
+└── tasks/          # Background tasks (sync, maintenance, file pulls)
 ```
 
 ## Core Concepts
@@ -95,6 +105,35 @@ Messages are delivered with best-effort semantics:
 protocol.send(&topic_id, payload).await?;
 ```
 
+### Share Mode (File Sharing)
+
+For files ≥512KB, use the Share protocol for efficient P2P distribution:
+
+```rust
+// Share a large file with topic members
+let hash = protocol.share_file(&topic_id, "/path/to/video.mp4").await?;
+println!("Shared with hash: {}", hex::encode(hash));
+
+// Check share status
+let status = protocol.share_status(&hash).await?;
+println!("Progress: {}/{} chunks", status.chunks_complete, status.total_chunks);
+
+// Export a completed file
+protocol.export_file(&hash, "/path/to/output.mp4").await?;
+```
+
+**How it works:**
+1. File is split into 512KB chunks, hashed with BLAKE3
+2. `FileAnnouncement` is broadcast to topic via Send protocol
+3. Recipients pull chunks directly from source and other seeders
+4. When a peer completes download, it broadcasts `CanSeed`
+5. Chunks spread across the swarm (BitTorrent-like distribution)
+
+**Events emitted:**
+- `FileAnnounced` - A file was shared to the topic
+- `FileProgress` - Download progress update
+- `FileComplete` - All chunks received
+
 ### Harbor Nodes
 
 When members are offline, packets are stored on Harbor Nodes:
@@ -120,6 +159,9 @@ let config = ProtocolConfig {
     
     // Database encryption key (generated if not provided)
     db_key: None,
+    
+    // Blob storage path for shared files (defaults to .harbor_blobs/)
+    blob_path: Some(PathBuf::from(".harbor_blobs")),
     
     // Bootstrap nodes for DHT
     bootstrap_nodes: vec![],
@@ -147,6 +189,9 @@ The protocol uses **SQLCipher** (encrypted SQLite) for persistence.
 | `harbor_cache` | Packets stored as Harbor Node |
 | `harbor_recipients` | Per-recipient Harbor delivery status |
 | `pulled_packets` | Tracking pulled packets (deduplication) |
+| `blobs` | File metadata (hash, size, state) |
+| `blob_recipients` | Per-recipient file transfer status |
+| `blob_sections` | Section-level replication traces |
 
 ## Packet Security
 
@@ -218,6 +263,9 @@ RUST_LOG=harbor_core::network::harbor=debug cargo run -p harbor-core
 
 # Debug DHT
 RUST_LOG=harbor_core::network::dht=debug cargo run -p harbor-core
+
+# Debug file sharing
+RUST_LOG=harbor_core::network::share=debug cargo run -p harbor-core
 
 # Multiple modules
 RUST_LOG=info,harbor_core::network=debug cargo run -p harbor-core

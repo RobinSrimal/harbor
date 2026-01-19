@@ -34,5 +34,8 @@ harbor_protocol.db
 # Simulation output logs
 output.log
 
+# Iroh blob storage
+**/iroh-blobs/
+
 # Archive directories (deprecated/old code)
 **/archive/

@@ -1,0 +1,31 @@
+This is a test file for Harbor file sharing simulation.
+
+It contains some sample content to verify that the P2P file sharing protocol
+works correctly across multiple nodes in the network.
+
+The file should be:
+1. Shared by the source node
+2. Announced to all topic members
+3. Chunked and distributed (if above 512KB threshold)
+4. Verified via BLAKE3 hash
+5. Stored in each node's local blob storage
+
+If you can read this on a receiving node, the share protocol worked!
+
+--- Additional padding to ensure the file is large enough for chunked transfer ---
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor
+incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis
+nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
+Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore
+eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt
+in culpa qui officia deserunt mollit anim id est laborum.
+
+Curabitur pretium tincidunt lacus. Nulla gravida orci a odio. Nullam varius,
+turpis et commodo pharetra, est eros bibendum elit, nec luctus magna felis
+sollicitudin mauris. Integer in mauris eu nibh euismod gravida. Duis ac tellus
+et risus vulputate vehicula. Donec lobortis risus a elit. Etiam tempor.
+
+This file is used by the Harbor simulation test suite.
+Generated for testing purposes only.
+

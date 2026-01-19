@@ -40,9 +40,18 @@
 #     flap             - Rapid join/leave (flapping) test
 #     dht-pool         - DHT connection pool verification
 #
+#   File Sharing:
+#     share-basic      - Basic file sharing test
+#     share-peer-offline - Peer offline during file share
+#     share-few-peers  - Adaptive splitting with few peers
+#     share-large-file - Large file (10MB) transfer test
+#     share-retry-source    - Retry when source goes offline
+#     share-retry-recipient - Retry when recipient goes offline
+#
 #   Suites:
 #     membership       - Run all membership scenarios
 #     advanced         - Run all advanced scenarios
+#     share            - Run all file sharing scenarios
 #     full             - Run all scenarios (default)
 
 set -e
@@ -79,6 +88,12 @@ source "$SCRIPT_DIR/scenarios/harbor_churn.sh"
 source "$SCRIPT_DIR/scenarios/race_join.sh"
 source "$SCRIPT_DIR/scenarios/flap.sh"
 source "$SCRIPT_DIR/scenarios/dht_pool.sh"
+source "$SCRIPT_DIR/scenarios/share_basic.sh"
+source "$SCRIPT_DIR/scenarios/share_peer_offline.sh"
+source "$SCRIPT_DIR/scenarios/share_few_peers.sh"
+source "$SCRIPT_DIR/scenarios/share_large_file.sh"
+source "$SCRIPT_DIR/scenarios/share_retry_source.sh"
+source "$SCRIPT_DIR/scenarios/share_retry_recipient.sh"
 source "$SCRIPT_DIR/scenarios/suites.sh"
 
 # ============================================================================
@@ -181,6 +196,28 @@ case $SCENARIO in
     dht-pool)
         scenario_dht_pool
         ;;
+    # File sharing scenarios
+    share-basic)
+        scenario_share_basic
+        ;;
+    share-peer-offline)
+        scenario_share_peer_offline
+        ;;
+    share-few-peers)
+        scenario_share_few_peers
+        ;;
+    share-large-file)
+        scenario_share_large_file
+        ;;
+    share-retry-source)
+        scenario_share_retry_source
+        ;;
+    share-retry-recipient)
+        scenario_share_retry_recipient
+        ;;
+    share)
+        run_share_suite
+        ;;
     advanced)
         run_advanced_suite
         ;;
@@ -196,7 +233,9 @@ case $SCENARIO in
         echo "  Membership: member-join, member-leave, new-to-offline, offline-sync, deduplication"
         echo "  Advanced:   multi-topic, concurrent, large-message, scale-members,"
         echo "              harbor-sync, harbor-churn, race-join, flap, dht-pool"
-        echo "  Suites:     membership, advanced, full"
+        echo "  Share:      share-basic, share-peer-offline, share-few-peers, share-large-file,"
+        echo "              share-retry-source, share-retry-recipient"
+        echo "  Suites:     membership, advanced, share, full"
         echo ""
         exit 1
         ;;

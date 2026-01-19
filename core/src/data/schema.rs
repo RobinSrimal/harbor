@@ -13,6 +13,7 @@ pub fn create_all_tables(conn: &Connection) -> rusqlite::Result<()> {
     create_outgoing_table(conn)?;
     create_harbor_table(conn)?;
     create_membership_tables(conn)?;
+    create_share_tables(conn)?;
     Ok(())
 }
 
@@ -280,6 +281,82 @@ pub fn create_harbor_table(conn: &Connection) -> rusqlite::Result<()> {
 pub fn create_membership_tables(_conn: &Connection) -> rusqlite::Result<()> {
     // No additional tables needed for Tier 1
     // Future tiers will add: mls_group_state, epoch_keys, etc.
+    Ok(())
+}
+
+/// Share tables: File sharing protocol for files ≥512 KB
+///
+/// Implements the pull-based distribution system with:
+/// - `blobs`: File metadata (hash, size, sections, state)
+/// - `blob_recipients`: Track which peers have received files
+/// - `blob_sections`: Track section replication traces
+pub fn create_share_tables(conn: &Connection) -> rusqlite::Result<()> {
+    // Blob metadata table
+    // State: 0=Partial, 1=Complete
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS blobs (
+            hash BLOB PRIMARY KEY NOT NULL CHECK (length(hash) = 32),
+            topic_id BLOB NOT NULL CHECK (length(topic_id) = 32),
+            source_id BLOB NOT NULL CHECK (length(source_id) = 32),
+            display_name TEXT NOT NULL,
+            total_size INTEGER NOT NULL,
+            total_chunks INTEGER NOT NULL,
+            num_sections INTEGER NOT NULL,
+            state INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY (topic_id) REFERENCES topics(topic_id)
+        )",
+        [],
+    )?;
+
+    // Track distribution status per recipient (for knowing when distribution is complete)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS blob_recipients (
+            hash BLOB NOT NULL CHECK (length(hash) = 32),
+            endpoint_id BLOB NOT NULL CHECK (length(endpoint_id) = 32),
+            received INTEGER NOT NULL DEFAULT 0,
+            received_at INTEGER,
+            PRIMARY KEY (hash, endpoint_id),
+            FOREIGN KEY (hash) REFERENCES blobs(hash) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    // Track section replication traces (section-level, not chunk-level)
+    // Records who sent us each section for suggesting peers
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS blob_sections (
+            hash BLOB NOT NULL CHECK (length(hash) = 32),
+            section_id INTEGER NOT NULL,
+            chunk_start INTEGER NOT NULL,
+            chunk_end INTEGER NOT NULL,
+            received_from BLOB CHECK (length(received_from) = 32),
+            received_at INTEGER,
+            PRIMARY KEY (hash, section_id),
+            FOREIGN KEY (hash) REFERENCES blobs(hash) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    // Indexes for efficient queries
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_blobs_topic ON blobs(topic_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_blobs_state ON blobs(state)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_blob_recipients_pending 
+         ON blob_recipients(received) WHERE received = 0",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_blob_sections_hash ON blob_sections(hash)",
+        [],
+    )?;
+
     Ok(())
 }
 

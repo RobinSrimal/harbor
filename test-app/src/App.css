@@ -444,3 +444,93 @@ input[type="text"]::placeholder {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-muted);
 }
+
+/* File Messages */
+.file-message .file-content {
+  display: flex;
+  gap: 1rem;
+  padding: 1rem;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  border-top-left-radius: 4px;
+  min-width: 280px;
+}
+
+.file-message.own .file-content {
+  background: var(--accent-glow);
+  border-color: var(--accent-dim);
+  border-top-left-radius: 12px;
+  border-top-right-radius: 4px;
+}
+
+.file-icon {
+  font-size: 2.5rem;
+  display: flex;
+  align-items: center;
+}
+
+.file-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.file-name {
+  font-weight: 500;
+  font-size: 0.9rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-size {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.file-progress {
+  position: relative;
+  height: 6px;
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+  margin-top: 0.5rem;
+  overflow: hidden;
+}
+
+.file-progress-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.file-progress-text {
+  position: absolute;
+  right: 0;
+  top: -18px;
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+}
+
+.file-save-btn {
+  margin-top: 0.5rem;
+  width: fit-content;
+}
+
+/* Attach Button */
+.attach-btn {
+  padding: 0.625rem;
+  min-width: 44px;
+  font-size: 1.1rem;
+}
+
+.attach-btn:hover {
+  background: var(--accent-glow);
+  border-color: var(--accent-dim);
+}

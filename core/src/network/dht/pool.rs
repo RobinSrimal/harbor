@@ -15,7 +15,7 @@ use iroh::endpoint::Connection;
 use tokio::sync::{oneshot, RwLock};
 use tracing::{debug, trace, warn};
 
-use crate::data::peer::{PeerInfo, ADDRESS_FRESHNESS_THRESHOLD_SECS};
+use crate::data::dht::{PeerInfo, ADDRESS_FRESHNESS_THRESHOLD_SECS};
 
 // Re-export ALPN from rpc module for consistency
 pub use super::rpc::RPC_ALPN as DHT_ALPN;

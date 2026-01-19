@@ -149,3 +149,140 @@ wait_for_api() {
     done
 }
 
+# ============================================================================
+# SHARE API HELPERS
+# ============================================================================
+
+# Share a file with a topic
+# Usage: api_share_file <node> <topic_hex> <file_path>
+# Returns: JSON with hash
+api_share_file() {
+    local n=$1
+    local topic=$2
+    local file_path=$3
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 120 -X POST "http://127.0.0.1:$port/api/share" \
+        -H "Content-Type: application/json" \
+        -d "{\"topic\":\"$topic\",\"file_path\":\"$file_path\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/share"
+    echo "$result"
+}
+
+# Get share status for a blob
+# Usage: api_share_status <node> <hash_hex>
+# Returns: JSON with status
+api_share_status() {
+    local n=$1
+    local hash=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/api/share/status/$hash")
+    local exit_code=$?
+    log_api_error $exit_code $n "GET /api/share/status"
+    echo "$result"
+}
+
+# List blobs for a topic
+# Usage: api_list_blobs <node> <topic_hex>
+# Returns: JSON with blobs array
+api_list_blobs() {
+    local n=$1
+    local topic=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/api/share/blobs/$topic")
+    local exit_code=$?
+    log_api_error $exit_code $n "GET /api/share/blobs"
+    echo "$result"
+}
+
+# Request to pull a blob
+# Usage: api_share_pull <node> <hash_hex>
+api_share_pull() {
+    local n=$1
+    local hash=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/share/pull" \
+        -H "Content-Type: application/json" \
+        -d "{\"hash\":\"$hash\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/share/pull"
+    echo "$result"
+}
+
+# Export a blob to a file
+# Usage: api_share_export <node> <hash_hex> <dest_path>
+api_share_export() {
+    local n=$1
+    local hash=$2
+    local dest_path=$3
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 120 -X POST "http://127.0.0.1:$port/api/share/export" \
+        -H "Content-Type: application/json" \
+        -d "{\"hash\":\"$hash\",\"dest_path\":\"$dest_path\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/share/export"
+    echo "$result"
+}
+
+# Wait for a blob to be complete on a node
+# Usage: wait_for_blob_complete <node> <hash_hex> [timeout_seconds]
+wait_for_blob_complete() {
+    local n=$1
+    local hash=$2
+    local timeout=${3:-300}  # Default 5 minutes
+    local attempts=0
+    local interval=2
+    local max_attempts=$((timeout / interval))
+    
+    while [ $attempts -lt $max_attempts ]; do
+        local status=$(api_share_status $n $hash)
+        local state=$(echo "$status" | grep -o '"state":"[^"]*"' | cut -d'"' -f4)
+        
+        if [ "$state" = "complete" ]; then
+            return 0
+        fi
+        
+        sleep $interval
+        attempts=$((attempts + 1))
+    done
+    
+    return 1  # Timeout
+}
+
+# Create a test file of specified size
+# Usage: create_test_file <path> <size_mb>
+create_test_file() {
+    local path=$1
+    local size_mb=$2
+    dd if=/dev/urandom of="$path" bs=1M count=$size_mb 2>/dev/null
+}
+
+# Verify file hashes match
+# Usage: verify_file_hash <file1> <file2>
+verify_file_hash() {
+    local file1=$1
+    local file2=$2
+    
+    if command -v sha256sum &> /dev/null; then
+        local hash1=$(sha256sum "$file1" | cut -d' ' -f1)
+        local hash2=$(sha256sum "$file2" | cut -d' ' -f1)
+    elif command -v shasum &> /dev/null; then
+        local hash1=$(shasum -a 256 "$file1" | cut -d' ' -f1)
+        local hash2=$(shasum -a 256 "$file2" | cut -d' ' -f1)
+    else
+        warn "No hash tool available, skipping verification"
+        return 0
+    fi
+    
+    if [ "$hash1" = "$hash2" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+

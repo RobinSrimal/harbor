@@ -63,6 +63,11 @@ pub use protocol::{
     IncomingMessage, 
     TopicInvite,
     MemberInfo,
+    // Event types
+    ProtocolEvent,
+    FileAnnouncedEvent,
+    FileProgressEvent,
+    FileCompleteEvent,
     // Stats types
     ProtocolStats,
     IdentityStats,

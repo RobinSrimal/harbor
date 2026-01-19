@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, trace};
 
-use crate::data::outgoing::{
+use crate::data::send::{
     get_packets_needing_replication, delete_outgoing_packet,
 };
 use crate::network::dht::ApiClient as DhtApiClient;
@@ -76,7 +76,7 @@ impl Protocol {
                 // Get unacked recipients for this packet
                 let unacked_recipients: Vec<[u8; 32]> = {
                     let db_lock = db.lock().await;
-                    crate::data::outgoing::get_unacknowledged_recipients(&db_lock, &packet.packet_id)
+                    crate::data::send::get_unacknowledged_recipients(&db_lock, &packet.packet_id)
                         .unwrap_or_default()
                 };
 

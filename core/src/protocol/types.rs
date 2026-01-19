@@ -2,6 +2,26 @@
 
 use serde::{Deserialize, Serialize};
 
+// ============================================================================
+// Protocol Events (for application event bus)
+// ============================================================================
+
+/// Events emitted by the protocol for the application layer
+/// 
+/// Applications can subscribe to these events to update their UI
+/// (e.g., show new messages, file progress bars, notifications)
+#[derive(Debug, Clone)]
+pub enum ProtocolEvent {
+    /// A text message was received in a topic
+    Message(IncomingMessage),
+    /// A file was shared to a topic (announcement received)
+    FileAnnounced(FileAnnouncedEvent),
+    /// File download progress update
+    FileProgress(FileProgressEvent),
+    /// File download completed
+    FileComplete(FileCompleteEvent),
+}
+
 /// An incoming message from the event bus
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {
@@ -13,6 +33,53 @@ pub struct IncomingMessage {
     pub payload: Vec<u8>,
     /// Timestamp when the message was created (Unix seconds)
     pub timestamp: i64,
+}
+
+/// Event: A file was shared to a topic
+/// 
+/// Emitted when a FileAnnouncement is received from another member
+#[derive(Debug, Clone)]
+pub struct FileAnnouncedEvent {
+    /// The topic this file was shared to
+    pub topic_id: [u8; 32],
+    /// Who shared the file
+    pub source_id: [u8; 32],
+    /// BLAKE3 hash of the file (unique identifier)
+    pub hash: [u8; 32],
+    /// Human-readable filename
+    pub display_name: String,
+    /// Total file size in bytes
+    pub total_size: u64,
+    /// Total number of chunks
+    pub total_chunks: u32,
+    /// Timestamp when announced
+    pub timestamp: i64,
+}
+
+/// Event: File download progress update
+/// 
+/// Emitted periodically as chunks are received
+#[derive(Debug, Clone)]
+pub struct FileProgressEvent {
+    /// File hash
+    pub hash: [u8; 32],
+    /// Chunks downloaded so far
+    pub chunks_complete: u32,
+    /// Total chunks in the file
+    pub total_chunks: u32,
+}
+
+/// Event: File download completed
+/// 
+/// Emitted when all chunks have been received
+#[derive(Debug, Clone)]
+pub struct FileCompleteEvent {
+    /// File hash
+    pub hash: [u8; 32],
+    /// Filename
+    pub display_name: String,
+    /// Total size in bytes
+    pub total_size: u64,
 }
 
 /// Member info for topic invites
@@ -124,6 +191,12 @@ pub enum ProtocolError {
     NotRunning,
     /// Message too large (max 512KB)
     MessageTooLarge,
+    /// Invalid input provided
+    InvalidInput(String),
+    /// Resource not found
+    NotFound(String),
+    /// IO error
+    Io(String),
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -137,11 +210,20 @@ impl std::fmt::Display for ProtocolError {
             ProtocolError::InvalidInvite(e) => write!(f, "invalid invite: {}", e),
             ProtocolError::NotRunning => write!(f, "protocol is not running"),
             ProtocolError::MessageTooLarge => write!(f, "message too large (max 512KB)"),
+            ProtocolError::InvalidInput(e) => write!(f, "invalid input: {}", e),
+            ProtocolError::NotFound(e) => write!(f, "not found: {}", e),
+            ProtocolError::Io(e) => write!(f, "io error: {}", e),
         }
     }
 }
 
 impl std::error::Error for ProtocolError {}
+
+impl From<std::io::Error> for ProtocolError {
+    fn from(e: std::io::Error) -> Self {
+        ProtocolError::Io(e.to_string())
+    }
+}
 
 // ============================================================================
 // Stats Types for Dashboard

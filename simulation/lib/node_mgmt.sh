@@ -80,6 +80,9 @@ clear_data() {
             rm -f "$dir/harbor.db"
             rm -f "$dir/harbor.db-shm"
             rm -f "$dir/harbor.db-wal"
+            # Clear blob storage folders
+            rm -rf "$dir/blobs"
+            rm -rf "$dir/.harbor_blobs"
         fi
     done
     rm -f "$BOOTSTRAP_FILE"
@@ -100,7 +103,8 @@ start_bootstrap_node() {
     
     # Start with --no-default-bootstrap so it doesn't try to connect to hardcoded bootstrap
     # Use --testing for shorter intervals during simulation
-    (cd "$dir" && RUST_LOG="$log_level" exec "$HARBOR_BIN" --serve --testing --no-default-bootstrap --db-path "./harbor.db" --api-port "$port" >> output.log 2>&1) &
+    # Use --blob-path ./blobs so shared files are visible in node folders
+    (cd "$dir" && RUST_LOG="$log_level" exec "$HARBOR_BIN" --serve --testing --no-default-bootstrap --db-path "./harbor.db" --blob-path "./blobs" --api-port "$port" >> output.log 2>&1) &
     NODE_PIDS[1]=$!
     disown ${NODE_PIDS[1]} 2>/dev/null  # Suppress "Terminated" messages when killed
     
@@ -154,10 +158,11 @@ start_node() {
     if [ -n "$bootstrap_arg" ]; then
         # --bootstrap replaces defaults, no need for --no-default-bootstrap
         # Use --testing for shorter intervals during simulation
-        (cd "$dir" && RUST_LOG="$log_level" exec "$HARBOR_BIN" --serve --testing --bootstrap "$bootstrap_arg" --db-path "./harbor.db" --api-port "$port" >> output.log 2>&1) &
+        # Use --blob-path ./blobs so shared files are visible in node folders
+        (cd "$dir" && RUST_LOG="$log_level" exec "$HARBOR_BIN" --serve --testing --bootstrap "$bootstrap_arg" --db-path "./harbor.db" --blob-path "./blobs" --api-port "$port" >> output.log 2>&1) &
     else
         # No custom bootstrap, use defaults
-        (cd "$dir" && RUST_LOG="$log_level" exec "$HARBOR_BIN" --serve --testing --db-path "./harbor.db" --api-port "$port" >> output.log 2>&1) &
+        (cd "$dir" && RUST_LOG="$log_level" exec "$HARBOR_BIN" --serve --testing --db-path "./harbor.db" --blob-path "./blobs" --api-port "$port" >> output.log 2>&1) &
     fi
     NODE_PIDS[$n]=$!
     disown ${NODE_PIDS[$n]} 2>/dev/null  # Suppress "Terminated" messages when killed

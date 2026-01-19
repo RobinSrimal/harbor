@@ -34,14 +34,18 @@ mod config;
 mod types;
 mod topics;
 mod stats;
+mod share;
 
 pub use core::Protocol;
 pub use config::ProtocolConfig;
 pub use types::{
     IncomingMessage, TopicInvite, MemberInfo, ProtocolError,
+    // Protocol events (for app event bus)
+    ProtocolEvent, FileAnnouncedEvent, FileProgressEvent, FileCompleteEvent,
     // Stats types
     ProtocolStats, IdentityStats, NetworkStats, DhtStats, TopicsStats,
     OutgoingStats, HarborStats, DhtBucketInfo, DhtNodeInfo, TopicDetails,
     TopicMemberInfo, TopicSummary,
 };
+pub use share::ShareStatus;
 
