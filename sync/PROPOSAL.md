@@ -215,7 +215,7 @@ User A makes edit
 Local Loro doc updated IMMEDIATELY (responsive UI)
     │
     ▼
-Mark dirty, start/reset batch timer
+Mark has_pending_changes, start/reset batch timer
     │
     ▼
 [~1 second later, or on explicit flush]
@@ -252,7 +252,7 @@ Send via Protocol.send()
 
 ```rust
 impl SyncManager {
-    dirty: bool,
+    has_pending_changes: bool,
     last_broadcast_version: VersionVector,
     wal_file: File,
     
@@ -268,20 +268,20 @@ impl SyncManager {
         self.wal_file.sync_data()?;  // Flush to disk NOW
         
         // 3. Mark for batched network send (EFFICIENCY - debounced)
-        self.dirty = true;
+        self.has_pending_changes = true;
         self.schedule_flush();  // Will send in ~1 second
     }
     
     /// Called by debounce timer (~1 second)
     fn flush(&mut self) {
-        if !self.dirty { return; }
+        if !self.has_pending_changes { return; }
         
         // Export all changes since last broadcast as ONE network packet
         let batch = self.doc.export_from(&self.last_broadcast_version);
         self.broadcast(SyncMessage::Update { data: batch });
         
         self.last_broadcast_version = self.doc.oplog_version();
-        self.dirty = false;
+        self.has_pending_changes = false;
     }
 }
 ```
@@ -583,9 +583,9 @@ impl SyncManager {
         
         // 2. Broadcast to peers
         self.broadcast(SyncMessage::Update { data: delta }).await?;
-        
-        // 3. Mark dirty, schedule debounced snapshot
-        self.dirty = true;
+
+        // 3. Mark has_pending_changes, schedule debounced snapshot
+        self.has_pending_changes = true;
         self.schedule_snapshot();  // Will snapshot after 5s of no changes
         
         Ok(())
@@ -598,7 +598,7 @@ impl SyncManager {
         
         // Clear WAL (all changes now in snapshot)
         fs::write(&self.wal_path, [])?;
-        self.dirty = false;
+        self.has_pending_changes = false;
         
         Ok(())
     }

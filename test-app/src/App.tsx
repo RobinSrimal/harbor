@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 import Dashboard from "./Dashboard";
+import Document from "./Document";
 
 interface Message {
   topic_id: string;
@@ -50,7 +51,7 @@ type ChatItem =
   | { type: "message"; data: Message }
   | { type: "file"; data: FileTransfer };
 
-type Tab = "chat" | "dashboard";
+type Tab = "chat" | "document" | "dashboard";
 
 function App() {
   const [isRunning, setIsRunning] = useState(false);
@@ -349,6 +350,12 @@ function App() {
               💬 Chat
             </button>
             <button
+              className={`tab ${activeTab === "document" ? "active" : ""}`}
+              onClick={() => setActiveTab("document")}
+            >
+              📝 Document
+            </button>
+            <button
               className={`tab ${activeTab === "dashboard" ? "active" : ""}`}
               onClick={() => setActiveTab("dashboard")}
             >
@@ -373,6 +380,8 @@ function App() {
         </div>
       ) : activeTab === "dashboard" ? (
         <Dashboard isRunning={isRunning} />
+      ) : activeTab === "document" ? (
+        <Document isRunning={isRunning} endpointId={endpointId} />
       ) : (
         <div className="main-content">
           <aside className="sidebar">

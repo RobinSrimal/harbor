@@ -358,7 +358,7 @@ api_sync_get_text() {
 
 # Get sync status for a topic
 # Usage: api_sync_status <node> <topic_hex>
-# Returns: JSON with enabled, dirty, version
+# Returns: JSON with enabled, has_pending_changes, version
 api_sync_status() {
     local n=$1
     local topic=$2

@@ -12,7 +12,7 @@ pub struct SyncStatus {
     /// Whether sync is enabled for this topic
     pub enabled: bool,
     /// Whether there are pending changes to broadcast
-    pub dirty: bool,
+    pub has_pending_changes: bool,
     /// Current document version (hex-encoded)
     pub version: String,
 }

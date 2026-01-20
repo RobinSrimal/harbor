@@ -12,7 +12,7 @@ scenario_sync_concurrent() {
     log "SCENARIO: Concurrent CRDT Edits"
     log "=========================================="
     
-    local TEST_NODES=10
+    local TEST_NODES=20
     local TOPIC_MEMBERS=3
     local CONTAINER="shared-doc"
     

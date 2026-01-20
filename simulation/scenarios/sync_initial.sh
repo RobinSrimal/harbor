@@ -12,7 +12,7 @@ scenario_sync_initial() {
     log "SCENARIO: Initial Sync for New Member"
     log "=========================================="
     
-    local TEST_NODES=10
+    local TEST_NODES=20
     local INITIAL_MEMBERS=2
     local NEW_MEMBER=3
     local CONTAINER="initial-sync-test"

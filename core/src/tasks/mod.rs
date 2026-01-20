@@ -42,7 +42,6 @@ impl Protocol {
         let running = self.running.clone();
         let dht_client = self.dht_client.clone();
         let sync_managers = self.sync_managers.clone();
-        let sync_enabled = self.config.sync_enabled;
         
         // Initialize blob store for Share protocol
         let blob_path = self.blob_path();
@@ -57,7 +56,7 @@ impl Protocol {
         let incoming_task = tokio::spawn(async move {
             Self::run_incoming_handler(
                 endpoint, db, event_tx, our_id, running, dht_client, blob_store,
-                sync_managers, sync_enabled,
+                sync_managers,
             ).await;
         });
         tasks.push(incoming_task);
@@ -195,8 +194,10 @@ impl Protocol {
         });
         tasks.push(share_pull_task);
 
-        // 9. Sync flush task (batches and sends CRDT updates, if enabled)
-        if self.config.sync_enabled {
+        // 9. Sync flush task (batches and sends CRDT updates)
+        // Always started - it's cheap when there are no managers (just checks empty HashMap)
+        // Sync is enabled per-topic via API, not globally via config flag
+        {
             let db = self.db.clone();
             let endpoint = self.endpoint.clone();
             let sync_managers = self.sync_managers.clone();

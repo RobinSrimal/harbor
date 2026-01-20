@@ -14,7 +14,7 @@ use std::time::Duration;
 use iroh::Endpoint;
 use rusqlite::Connection;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::data::{get_or_create_identity, start_db, LocalIdentity};
 use crate::network::dht::{
@@ -71,7 +71,7 @@ pub struct Protocol {
     pub(crate) tasks: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
     /// Shutdown signal sender
     shutdown_tx: mpsc::Sender<()>,
-    /// CRDT sync managers (one per topic, only if sync_enabled)
+    /// CRDT sync managers (one per topic)
     pub(crate) sync_managers: Arc<RwLock<HashMap<[u8; 32], SyncManager>>>,
 }
 
@@ -114,16 +114,13 @@ impl Protocol {
 
         // Create Iroh endpoint with our identity's secret key
         let secret_key = iroh::SecretKey::from_bytes(&identity.private_key);
-        let mut alpns = vec![
+        let alpns = vec![
             SEND_ALPN.to_vec(),
             HARBOR_ALPN.to_vec(),
             DHT_ALPN.to_vec(),
             crate::network::share::SHARE_ALPN.to_vec(),
+            SYNC_ALPN.to_vec(),
         ];
-        // Add SYNC_ALPN if sync is enabled
-        if config.sync_enabled {
-            alpns.push(SYNC_ALPN.to_vec());
-        }
         let endpoint = Endpoint::builder()
             .secret_key(secret_key)
             .alpns(alpns)
@@ -385,22 +382,13 @@ impl Protocol {
         }
     }
     
-    /// Check if sync is enabled
-    pub fn sync_enabled(&self) -> bool {
-        self.config.sync_enabled
-    }
-    
     /// Get or create a sync manager for a topic
     /// 
-    /// Returns None if sync is not enabled.
-    pub async fn get_sync_manager(&self, topic_id: &[u8; 32]) -> Option<Result<(), ProtocolError>> {
-        if !self.config.sync_enabled {
-            return None;
-        }
-        
+    /// Creates a new SyncManager if one doesn't exist for the topic.
+    pub async fn get_sync_manager(&self, topic_id: &[u8; 32]) -> Result<(), ProtocolError> {
         let mut managers = self.sync_managers.write().await;
         if managers.contains_key(topic_id) {
-            return Some(Ok(()));
+            return Ok(());
         }
         
         // Create new manager
@@ -408,9 +396,9 @@ impl Protocol {
         match SyncManager::new(&sync_path, *topic_id) {
             Ok(manager) => {
                 managers.insert(*topic_id, manager);
-                Some(Ok(()))
+                Ok(())
             }
-            Err(e) => Some(Err(ProtocolError::Sync(e.to_string()))),
+            Err(e) => Err(ProtocolError::Sync(e.to_string())),
         }
     }
     
@@ -418,18 +406,180 @@ impl Protocol {
     
     /// Enable sync for a topic
     ///
-    /// Creates a SyncManager for the topic if sync is enabled.
-    /// Returns error if sync is not enabled in config.
+    /// Creates a SyncManager for the topic. If the document is empty and there
+    /// are other members in the topic, automatically requests initial sync.
     pub async fn sync_enable(&self, topic_id: &[u8; 32]) -> Result<(), ProtocolError> {
-        if !self.config.sync_enabled {
-            return Err(ProtocolError::Sync("sync not enabled in config".to_string()));
+        // Create the manager first
+        self.get_sync_manager(topic_id).await?;
+        
+        // Check if we need initial sync
+        let needs_initial_sync = {
+            let managers = self.sync_managers.read().await;
+            if let Some(manager) = managers.get(topic_id) {
+                manager.is_empty()
+            } else {
+                false
+            }
+        };
+        
+        if needs_initial_sync {
+            // Get other members in the topic
+            let members = {
+                let db_lock = self.db.lock().await;
+                crate::data::get_topic_members(&db_lock, topic_id)
+                    .unwrap_or_default()
+            };
+            
+            // Filter out ourselves
+            let other_members: Vec<_> = members.iter()
+                .filter(|m| **m != self.identity.public_key)
+                .collect();
+            
+            if !other_members.is_empty() {
+                info!(
+                    topic = %hex::encode(&topic_id[..8]),
+                    member_count = other_members.len(),
+                    "Document is empty, requesting initial sync from existing members"
+                );
+                
+                // Generate initial sync request
+                let request = {
+                    let mut managers = self.sync_managers.write().await;
+                    if let Some(manager) = managers.get_mut(topic_id) {
+                        Some(manager.generate_initial_sync_request())
+                    } else {
+                        None
+                    }
+                };
+                
+                if let Some(request) = request {
+                    // Send request to each member via direct connection
+                    for member_id in other_members {
+                        if let Err(e) = self.send_initial_sync_request(topic_id, member_id, &request).await {
+                            warn!(
+                                topic = %hex::encode(&topic_id[..8]),
+                                member = %hex::encode(&member_id[..8]),
+                                error = %e,
+                                "Failed to send initial sync request"
+                            );
+                        }
+                    }
+                }
+            }
         }
         
-        match self.get_sync_manager(topic_id).await {
-            Some(Ok(())) => Ok(()),
-            Some(Err(e)) => Err(e),
-            None => Err(ProtocolError::Sync("sync not enabled".to_string())),
+        Ok(())
+    }
+    
+    /// Send an initial sync request to a specific member via direct connection
+    async fn send_initial_sync_request(
+        &self,
+        topic_id: &[u8; 32],
+        member_id: &[u8; 32],
+        request: &crate::network::sync::SyncMessage,
+    ) -> Result<(), String> {
+        use crate::network::sync::SYNC_ALPN;
+        
+        let node_id = iroh::NodeId::from_bytes(member_id)
+            .map_err(|e| format!("invalid node id: {}", e))?;
+        
+        // Encode the request
+        let encoded = request.encode();
+        
+        info!(
+            topic = %hex::encode(&topic_id[..8]),
+            member = %hex::encode(&member_id[..8]),
+            encoded_len = encoded.len(),
+            "INITIAL_SYNC: connecting to member via SYNC_ALPN"
+        );
+        
+        // Connect via SYNC_ALPN for initial sync (with timeout for offline peers)
+        let conn = match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.endpoint.connect(node_id, SYNC_ALPN)
+        ).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return Err(format!("connection failed: {}", e)),
+            Err(_) => return Err("connection timeout (peer may be offline)".to_string()),
+        };
+        
+        info!(
+            topic = %hex::encode(&topic_id[..8]),
+            member = %hex::encode(&member_id[..8]),
+            "INITIAL_SYNC: connection established, opening stream"
+        );
+        
+        let mut send = conn
+            .open_uni()
+            .await
+            .map_err(|e| format!("failed to open stream: {}", e))?;
+        
+        info!(
+            topic = %hex::encode(&topic_id[..8]),
+            member = %hex::encode(&member_id[..8]),
+            "INITIAL_SYNC: stream opened, writing topic_id + request"
+        );
+        
+        // Write topic_id first (so receiver knows which topic)
+        tokio::io::AsyncWriteExt::write_all(&mut send, topic_id)
+            .await
+            .map_err(|e| format!("failed to write topic_id: {}", e))?;
+        
+        // Write the request
+        tokio::io::AsyncWriteExt::write_all(&mut send, &encoded)
+            .await
+            .map_err(|e| format!("failed to write request: {}", e))?;
+        
+        info!(
+            topic = %hex::encode(&topic_id[..8]),
+            member = %hex::encode(&member_id[..8]),
+            total_bytes = 32 + encoded.len(),
+            "INITIAL_SYNC: data written, calling finish()"
+        );
+        
+        send.finish()
+            .map_err(|e| format!("failed to finish stream: {}", e))?;
+        
+        info!(
+            topic = %hex::encode(&topic_id[..8]),
+            member = %hex::encode(&member_id[..8]),
+            "INITIAL_SYNC: stream finished, waiting for stopped()"
+        );
+        
+        // Wait for stream to be processed with timeout (don't block forever)
+        let timeout = tokio::time::timeout(
+            Duration::from_secs(10),
+            send.stopped()
+        ).await;
+        
+        match timeout {
+            Ok(Ok(_)) => {
+                info!(
+                    topic = %hex::encode(&topic_id[..8]),
+                    member = %hex::encode(&member_id[..8]),
+                    "Sent initial sync request"
+                );
+            }
+            Ok(Err(e)) => {
+                // Stream error but data was likely sent
+                warn!(
+                    topic = %hex::encode(&topic_id[..8]),
+                    member = %hex::encode(&member_id[..8]),
+                    error = %e,
+                    "Initial sync request stream error (data likely sent)"
+                );
+            }
+            Err(_) => {
+                // Timeout - data was sent, just no confirmation
+                info!(
+                    topic = %hex::encode(&topic_id[..8]),
+                    member = %hex::encode(&member_id[..8]),
+                    "Initial sync request sent (no ack within timeout)"
+                );
+            }
         }
+        
+        Ok(())
     }
     
     /// Insert text into a sync document's text container
@@ -442,10 +592,6 @@ impl Protocol {
         index: usize,
         text: &str,
     ) -> Result<(), ProtocolError> {
-        if !self.config.sync_enabled {
-            return Err(ProtocolError::Sync("sync not enabled in config".to_string()));
-        }
-        
         // Ensure manager exists
         self.sync_enable(topic_id).await?;
         
@@ -473,10 +619,6 @@ impl Protocol {
         index: usize,
         len: usize,
     ) -> Result<(), ProtocolError> {
-        if !self.config.sync_enabled {
-            return Err(ProtocolError::Sync("sync not enabled in config".to_string()));
-        }
-        
         self.sync_enable(topic_id).await?;
         
         let mut managers = self.sync_managers.write().await;
@@ -499,10 +641,6 @@ impl Protocol {
         topic_id: &[u8; 32],
         container: &str,
     ) -> Result<String, ProtocolError> {
-        if !self.config.sync_enabled {
-            return Err(ProtocolError::Sync("sync not enabled in config".to_string()));
-        }
-        
         let managers = self.sync_managers.read().await;
         let manager = managers.get(topic_id)
             .ok_or_else(|| ProtocolError::Sync("sync not enabled for this topic".to_string()))?;
@@ -513,17 +651,13 @@ impl Protocol {
     
     /// Get sync status for a topic
     pub async fn sync_get_status(&self, topic_id: &[u8; 32]) -> Result<SyncStatus, ProtocolError> {
-        if !self.config.sync_enabled {
-            return Err(ProtocolError::Sync("sync not enabled in config".to_string()));
-        }
-        
         let managers = self.sync_managers.read().await;
         let manager = managers.get(topic_id)
             .ok_or_else(|| ProtocolError::Sync("sync not enabled for this topic".to_string()))?;
         
         Ok(SyncStatus {
             enabled: true,
-            dirty: manager.is_dirty(),
+            has_pending_changes: manager.has_pending_changes(),
             version: hex::encode(manager.doc().oplog_vv().encode()),
         })
     }

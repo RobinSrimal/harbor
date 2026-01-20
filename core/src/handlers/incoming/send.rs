@@ -38,7 +38,6 @@ impl Protocol {
         sender_id: [u8; 32],
         our_id: [u8; 32],
         sync_managers: Arc<RwLock<HashMap<[u8; 32], SyncManager>>>,
-        sync_enabled: bool,
     ) -> Result<(), ProtocolError> {
         // Maximum message size (512KB + overhead)
         const MAX_READ_SIZE: usize = 600 * 1024;
@@ -82,13 +81,13 @@ impl Protocol {
 
             match message {
                 SendMessage::Packet(packet) => {
-                    Self::handle_packet(&conn, &db, &event_tx, sender_id, our_id, packet, &sync_managers, sync_enabled).await?;
+                    Self::handle_packet(&conn, &db, &event_tx, sender_id, our_id, packet, &sync_managers).await?;
                 }
                 SendMessage::Receipt(receipt) => {
                     Self::handle_receipt(&db, receipt).await;
                 }
                 SendMessage::PacketWithPoW { packet, proof_of_work } => {
-                    Self::handle_packet_with_pow(&conn, &db, &event_tx, sender_id, our_id, packet, proof_of_work, &sync_managers, sync_enabled).await?;
+                    Self::handle_packet_with_pow(&conn, &db, &event_tx, sender_id, our_id, packet, proof_of_work, &sync_managers).await?;
                 }
             }
         }
@@ -105,9 +104,8 @@ impl Protocol {
         our_id: [u8; 32],
         packet: crate::security::SendPacket,
         sync_managers: &Arc<RwLock<HashMap<[u8; 32], SyncManager>>>,
-        sync_enabled: bool,
     ) -> Result<(), ProtocolError> {
-        trace!(harbor_id = %hex::encode(packet.harbor_id), "processing packet");
+        info!(harbor_id = %hex::encode(packet.harbor_id), sender = %hex::encode(&sender_id[..8]), "processing incoming packet");
         
         // Find which topic this packet belongs to
         let topics = {
@@ -116,7 +114,7 @@ impl Protocol {
                 .map_err(|e| ProtocolError::Database(e.to_string()))?
         };
 
-        trace!(topic_count = topics.len(), "member of topics");
+        info!(topic_count = topics.len(), "member of topics");
 
         // Try each topic we're subscribed to
         let mut processed = false;
@@ -125,7 +123,7 @@ impl Protocol {
             if packet.harbor_id != harbor_id {
                 continue;
             }
-            trace!(topic = %hex::encode(topic_id), "found matching topic");
+            info!(topic = %hex::encode(&topic_id[..8]), "found matching topic for packet");
 
             // Determine verification mode from payload prefix
             let mode = crate::network::membership::messages::get_verification_mode_from_payload(
@@ -135,53 +133,65 @@ impl Protocol {
             // Verify and decrypt
             match verify_and_decrypt_packet_with_mode(&packet, &topic_id, mode) {
                 Ok(plaintext) => {
+                    info!(plaintext_len = plaintext.len(), "packet decrypted successfully");
+                    
                     // Parse topic message
-                    let topic_msg = TopicMessage::decode(&plaintext).ok();
+                    let topic_msg = match TopicMessage::decode(&plaintext) {
+                        Ok(msg) => {
+                            info!(msg_type = ?msg.message_type(), "decoded TopicMessage");
+                            Some(msg)
+                        }
+                        Err(e) => {
+                            warn!(
+                                topic = %hex::encode(&topic_id[..8]),
+                                error = %e,
+                                plaintext_len = plaintext.len(),
+                                first_byte = ?plaintext.first(),
+                                "failed to decode TopicMessage"
+                            );
+                            None
+                        }
+                    };
 
                     // Handle SyncUpdate separately (doesn't need db lock, uses sync_managers)
+                    // Note: We check for manager existence rather than sync_enabled flag,
+                    // since sync can be enabled per-topic at runtime via API
                     if let Some(TopicMessage::SyncUpdate(ref sync_msg)) = topic_msg {
-                        if sync_enabled {
-                            info!(
-                                topic = %hex::encode(&topic_id[..8]),
-                                sender = %hex::encode(&sender_id[..8]),
-                                size = sync_msg.data.len(),
-                                "SYNC: received update from peer"
-                            );
-                            
-                            // Apply to sync manager
-                            let mut managers = sync_managers.write().await;
-                            if let Some(manager) = managers.get_mut(&topic_id) {
-                                let update = crate::network::sync::protocol::SyncUpdate {
-                                    data: sync_msg.data.clone(),
-                                };
-                                if let Err(e) = manager.apply_update(&update) {
-                                    warn!(error = %e, "SYNC: failed to apply update");
-                                } else {
-                                    info!(
-                                        topic = %hex::encode(&topic_id[..8]),
-                                        sender = %hex::encode(&sender_id[..8]),
-                                        size = sync_msg.data.len(),
-                                        "SYNC: applied update from peer"
-                                    );
-                                    
-                                    // Emit event
-                                    let event = ProtocolEvent::SyncUpdated(crate::protocol::SyncUpdatedEvent {
-                                        topic_id,
-                                        sender_id,
-                                        update_size: sync_msg.data.len(),
-                                    });
-                                    let _ = event_tx.send(event).await;
-                                }
+                        info!(
+                            topic = %hex::encode(&topic_id[..8]),
+                            sender = %hex::encode(&sender_id[..8]),
+                            size = sync_msg.data.len(),
+                            "SYNC: received update from peer"
+                        );
+                        
+                        // Apply to sync manager if one exists for this topic
+                        let mut managers = sync_managers.write().await;
+                        if let Some(manager) = managers.get_mut(&topic_id) {
+                            let update = crate::network::sync::protocol::SyncUpdate {
+                                data: sync_msg.data.clone(),
+                            };
+                            if let Err(e) = manager.apply_update(&update) {
+                                warn!(error = %e, "SYNC: failed to apply update");
                             } else {
-                                warn!(
+                                info!(
                                     topic = %hex::encode(&topic_id[..8]),
-                                    "SYNC: no manager for topic"
+                                    sender = %hex::encode(&sender_id[..8]),
+                                    size = sync_msg.data.len(),
+                                    "SYNC: applied update from peer"
                                 );
+                                
+                                // Emit event
+                                let event = ProtocolEvent::SyncUpdated(crate::protocol::SyncUpdatedEvent {
+                                    topic_id,
+                                    sender_id,
+                                    update_size: sync_msg.data.len(),
+                                });
+                                let _ = event_tx.send(event).await;
                             }
                         } else {
                             debug!(
                                 topic = %hex::encode(&topic_id[..8]),
-                                "SYNC: sync not enabled, ignoring update"
+                                "SYNC: no manager for topic (sync not enabled for this topic)"
                             );
                         }
                         
@@ -446,7 +456,6 @@ impl Protocol {
         packet: crate::security::SendPacket,
         proof_of_work: crate::resilience::ProofOfWork,
         sync_managers: &Arc<RwLock<HashMap<[u8; 32], SyncManager>>>,
-        sync_enabled: bool,
     ) -> Result<(), ProtocolError> {
         trace!(harbor_id = %hex::encode(packet.harbor_id), "processing packet with PoW");
         
@@ -505,49 +514,44 @@ impl Protocol {
                     let topic_msg = TopicMessage::decode(&plaintext).ok();
 
                     // Handle SyncUpdate separately (doesn't need db lock, uses sync_managers)
+                    // Note: We check for manager existence rather than sync_enabled flag,
+                    // since sync can be enabled per-topic at runtime via API
                     if let Some(TopicMessage::SyncUpdate(ref sync_msg)) = topic_msg {
-                        if sync_enabled {
-                            info!(
-                                topic = %hex::encode(&topic_id[..8]),
-                                sender = %hex::encode(&sender_id[..8]),
-                                size = sync_msg.data.len(),
-                                "SYNC: received update from peer (with PoW)"
-                            );
-                            
-                            // Apply to sync manager
-                            let mut managers = sync_managers.write().await;
-                            if let Some(manager) = managers.get_mut(&topic_id) {
-                                let update = crate::network::sync::protocol::SyncUpdate {
-                                    data: sync_msg.data.clone(),
-                                };
-                                if let Err(e) = manager.apply_update(&update) {
-                                    warn!(error = %e, "SYNC: failed to apply update (with PoW)");
-                                } else {
-                                    info!(
-                                        topic = %hex::encode(&topic_id[..8]),
-                                        sender = %hex::encode(&sender_id[..8]),
-                                        size = sync_msg.data.len(),
-                                        "SYNC: applied update from peer (with PoW)"
-                                    );
-                                    
-                                    // Emit event
-                                    let event = ProtocolEvent::SyncUpdated(crate::protocol::SyncUpdatedEvent {
-                                        topic_id,
-                                        sender_id,
-                                        update_size: sync_msg.data.len(),
-                                    });
-                                    let _ = event_tx.send(event).await;
-                                }
+                        info!(
+                            topic = %hex::encode(&topic_id[..8]),
+                            sender = %hex::encode(&sender_id[..8]),
+                            size = sync_msg.data.len(),
+                            "SYNC: received update from peer (with PoW)"
+                        );
+                        
+                        // Apply to sync manager if one exists for this topic
+                        let mut managers = sync_managers.write().await;
+                        if let Some(manager) = managers.get_mut(&topic_id) {
+                            let update = crate::network::sync::protocol::SyncUpdate {
+                                data: sync_msg.data.clone(),
+                            };
+                            if let Err(e) = manager.apply_update(&update) {
+                                warn!(error = %e, "SYNC: failed to apply update (with PoW)");
                             } else {
-                                warn!(
+                                info!(
                                     topic = %hex::encode(&topic_id[..8]),
-                                    "SYNC: no manager for topic (with PoW)"
+                                    sender = %hex::encode(&sender_id[..8]),
+                                    size = sync_msg.data.len(),
+                                    "SYNC: applied update from peer (with PoW)"
                                 );
+                                
+                                // Emit event
+                                let event = ProtocolEvent::SyncUpdated(crate::protocol::SyncUpdatedEvent {
+                                    topic_id,
+                                    sender_id,
+                                    update_size: sync_msg.data.len(),
+                                });
+                                let _ = event_tx.send(event).await;
                             }
                         } else {
                             debug!(
                                 topic = %hex::encode(&topic_id[..8]),
-                                "SYNC: sync not enabled, ignoring update (with PoW)"
+                                "SYNC: no manager for topic (sync not enabled for this topic, with PoW)"
                             );
                         }
                         

@@ -12,7 +12,7 @@ scenario_sync_offline() {
     log "SCENARIO: Sync with Offline Node"
     log "=========================================="
     
-    local TEST_NODES=10
+    local TEST_NODES=20
     local TOPIC_MEMBERS=3
     local OFFLINE_NODE=3
     local CONTAINER="offline-test"

@@ -560,6 +560,141 @@ async fn export_file(
         .map_err(|e| e.to_string())
 }
 
+// ============================================================================
+// Sync / Document Editing Commands
+// ============================================================================
+
+/// Sync status response for frontend
+#[derive(Serialize)]
+pub struct SyncStatusResponse {
+    enabled: bool,
+    has_pending_changes: bool,
+    version: String,
+}
+
+/// Enable sync for a topic
+#[tauri::command]
+async fn sync_enable(
+    state: State<'_, AppState>,
+    topic_id: String,
+) -> Result<(), String> {
+    let protocol_guard = state.protocol.lock().await;
+    let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
+    
+    let topic_bytes = hex::decode(&topic_id)
+        .map_err(|e| e.to_string())?;
+    
+    if topic_bytes.len() != 32 {
+        return Err("Invalid topic ID length".to_string());
+    }
+    
+    let mut topic_arr = [0u8; 32];
+    topic_arr.copy_from_slice(&topic_bytes);
+
+    protocol.sync_enable(&topic_arr)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Get sync status for a topic
+#[tauri::command]
+async fn sync_get_status(
+    state: State<'_, AppState>,
+    topic_id: String,
+) -> Result<SyncStatusResponse, String> {
+    let protocol_guard = state.protocol.lock().await;
+    let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
+    
+    let topic_bytes = hex::decode(&topic_id)
+        .map_err(|e| e.to_string())?;
+    
+    if topic_bytes.len() != 32 {
+        return Err("Invalid topic ID length".to_string());
+    }
+    
+    let mut topic_arr = [0u8; 32];
+    topic_arr.copy_from_slice(&topic_bytes);
+
+    let status = protocol.sync_get_status(&topic_arr)
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    Ok(SyncStatusResponse {
+        enabled: status.enabled,
+        has_pending_changes: status.has_pending_changes,
+        version: hex::encode(status.version),
+    })
+}
+
+/// Get text from a sync document container
+#[tauri::command]
+async fn sync_get_text(
+    state: State<'_, AppState>,
+    topic_id: String,
+    container: String,
+) -> Result<String, String> {
+    let protocol_guard = state.protocol.lock().await;
+    let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
+    
+    let topic_bytes = hex::decode(&topic_id)
+        .map_err(|e| e.to_string())?;
+    
+    if topic_bytes.len() != 32 {
+        return Err("Invalid topic ID length".to_string());
+    }
+    
+    let mut topic_arr = [0u8; 32];
+    topic_arr.copy_from_slice(&topic_bytes);
+
+    protocol.sync_get_text(&topic_arr, &container)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Replace entire text in a sync document container
+/// (For simplicity - a real implementation would compute deltas)
+#[tauri::command]
+async fn sync_replace_text(
+    state: State<'_, AppState>,
+    topic_id: String,
+    container: String,
+    text: String,
+) -> Result<(), String> {
+    let protocol_guard = state.protocol.lock().await;
+    let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
+    
+    let topic_bytes = hex::decode(&topic_id)
+        .map_err(|e| e.to_string())?;
+    
+    if topic_bytes.len() != 32 {
+        return Err("Invalid topic ID length".to_string());
+    }
+    
+    let mut topic_arr = [0u8; 32];
+    topic_arr.copy_from_slice(&topic_bytes);
+
+    // Get current text length to know how much to delete
+    let current_text = protocol.sync_get_text(&topic_arr, &container)
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    // Delete all existing text
+    if !current_text.is_empty() {
+        protocol.sync_text_delete(&topic_arr, &container, 0, current_text.len())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    
+    // Insert new text
+    if !text.is_empty() {
+        protocol.sync_text_insert(&topic_arr, &container, 0, &text)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize tracing
@@ -589,6 +724,11 @@ pub fn run() {
             // File Sharing
             share_file,
             export_file,
+            // Sync / Document Editing
+            sync_enable,
+            sync_get_status,
+            sync_get_text,
+            sync_replace_text,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

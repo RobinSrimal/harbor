@@ -104,10 +104,6 @@ pub struct ProtocolConfig {
     /// If None, uses .harbor_sync/ next to the database
     pub sync_path: Option<PathBuf>,
     
-    /// Enable CRDT sync feature
-    /// Default: false (opt-in)
-    pub sync_enabled: bool,
-    
     /// How often to flush batched sync updates to the network (seconds)
     /// Default: 1
     pub sync_flush_interval_secs: u64,
@@ -144,7 +140,6 @@ impl fmt::Debug for ProtocolConfig {
             .field("pow_difficulty", &self.pow_difficulty)
             .field("share_pull_interval_secs", &self.share_pull_interval_secs)
             .field("sync_path", &self.sync_path)
-            .field("sync_enabled", &self.sync_enabled)
             .field("sync_flush_interval_secs", &self.sync_flush_interval_secs)
             .field("sync_snapshot_interval_secs", &self.sync_snapshot_interval_secs)
             .finish()
@@ -181,7 +176,6 @@ impl Default for ProtocolConfig {
             pow_difficulty: 18,
             share_pull_interval_secs: 30,
             sync_path: None,
-            sync_enabled: false,
             sync_flush_interval_secs: 1,
             sync_snapshot_interval_secs: 300,
         }
@@ -268,14 +262,14 @@ impl ProtocolConfig {
             db_key: None,
             bootstrap_nodes: vec![],
             max_storage_bytes: 10 * 1024 * 1024, // 10 MB
-            harbor_sync_interval_secs: 10,
-            harbor_sync_candidates: 5,
-            harbor_pull_interval_secs: 5,
+            harbor_sync_interval_secs: 5,    // Faster for testing
+            harbor_sync_candidates: 8,       // Store on more nodes
+            harbor_pull_interval_secs: 3,    // Faster pulls
             replication_check_interval_secs: 5,
             replication_factor: 5,           // Higher for testing reliability
             max_replication_attempts: 10,    // Try more nodes
-            harbor_pull_max_nodes: 8,        // Pull from more nodes
-            harbor_pull_early_stop: 3,       // Be more thorough
+            harbor_pull_max_nodes: 12,       // Pull from more nodes
+            harbor_pull_early_stop: 10,      // Much more thorough
             harbor_connect_timeout_secs: 5,  // Same as default
             harbor_response_timeout_secs: 30, // Same as default
             dht_bootstrap_delay_secs: 5,     // Same as default
@@ -287,7 +281,6 @@ impl ProtocolConfig {
             pow_difficulty: 8,
             share_pull_interval_secs: 10,    // Faster for testing
             sync_path: None,
-            sync_enabled: false,
             sync_flush_interval_secs: 1,     // Same as default
             sync_snapshot_interval_secs: 60, // Faster for testing
         }
@@ -376,12 +369,6 @@ impl ProtocolConfig {
     /// Set the sync document storage path
     pub fn with_sync_path(mut self, path: PathBuf) -> Self {
         self.sync_path = Some(path);
-        self
-    }
-    
-    /// Enable CRDT sync feature
-    pub fn with_sync_enabled(mut self, enabled: bool) -> Self {
-        self.sync_enabled = enabled;
         self
     }
     
@@ -485,15 +472,15 @@ mod tests {
         assert!(!config.enable_pow);
         assert!(config.bootstrap_nodes.is_empty());
         assert_eq!(config.max_storage_bytes, 10 * 1024 * 1024); // 10 MB
-        assert_eq!(config.harbor_sync_interval_secs, 10);
-        assert_eq!(config.harbor_sync_candidates, 5);
-        assert_eq!(config.harbor_pull_interval_secs, 5);
+        assert_eq!(config.harbor_sync_interval_secs, 5);
+        assert_eq!(config.harbor_sync_candidates, 8);
+        assert_eq!(config.harbor_pull_interval_secs, 3);
         assert_eq!(config.replication_check_interval_secs, 5);
         // Testing config has higher replication for reliability
         assert_eq!(config.replication_factor, 5);
         assert_eq!(config.max_replication_attempts, 10);
-        assert_eq!(config.harbor_pull_max_nodes, 8);
-        assert_eq!(config.harbor_pull_early_stop, 3);
+        assert_eq!(config.harbor_pull_max_nodes, 12);
+        assert_eq!(config.harbor_pull_early_stop, 10);
     }
 
     #[test]
@@ -599,7 +586,6 @@ mod tests {
         let config = ProtocolConfig::default();
         
         assert!(config.sync_path.is_none());
-        assert!(!config.sync_enabled); // Disabled by default
         assert_eq!(config.sync_flush_interval_secs, 1);
         assert_eq!(config.sync_snapshot_interval_secs, 300);
     }
@@ -610,15 +596,6 @@ mod tests {
         let config = ProtocolConfig::new().with_sync_path(path.clone());
         
         assert_eq!(config.sync_path, Some(path));
-    }
-    
-    #[test]
-    fn test_with_sync_enabled() {
-        let config = ProtocolConfig::new().with_sync_enabled(true);
-        assert!(config.sync_enabled);
-        
-        let config2 = ProtocolConfig::new().with_sync_enabled(false);
-        assert!(!config2.sync_enabled);
     }
     
     #[test]
@@ -636,12 +613,10 @@ mod tests {
     #[test]
     fn test_sync_config_builder_chain() {
         let config = ProtocolConfig::new()
-            .with_sync_enabled(true)
             .with_sync_path(PathBuf::from("/sync"))
             .with_sync_flush_interval(2)
             .with_sync_snapshot_interval(120);
         
-        assert!(config.sync_enabled);
         assert_eq!(config.sync_path, Some(PathBuf::from("/sync")));
         assert_eq!(config.sync_flush_interval_secs, 2);
         assert_eq!(config.sync_snapshot_interval_secs, 120);
@@ -652,7 +627,6 @@ mod tests {
         let config = ProtocolConfig::for_testing();
         
         // Testing config should have faster snapshot interval
-        assert!(!config.sync_enabled);
         assert_eq!(config.sync_flush_interval_secs, 1);
         assert_eq!(config.sync_snapshot_interval_secs, 60);
     }
@@ -660,12 +634,10 @@ mod tests {
     #[test]
     fn test_debug_includes_sync_fields() {
         let config = ProtocolConfig::new()
-            .with_sync_enabled(true)
             .with_sync_path(PathBuf::from("/test/sync"));
         
         let debug_output = format!("{:?}", config);
         
-        assert!(debug_output.contains("sync_enabled: true"));
         assert!(debug_output.contains("sync_path"));
         assert!(debug_output.contains("sync_flush_interval_secs"));
         assert!(debug_output.contains("sync_snapshot_interval_secs"));

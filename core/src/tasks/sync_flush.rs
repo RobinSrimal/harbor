@@ -4,7 +4,7 @@
 //!
 //! Design:
 //! - Runs every ~1 second (configurable)
-//! - For each topic with dirty SyncManager:
+//! - For each topic with pending changes in SyncManager:
 //!   - Generates batched update message
 //!   - Sends via Protocol.send() to topic members
 //! - Periodically saves snapshots (every N minutes)
@@ -31,7 +31,7 @@ pub const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Run the sync flush task
 ///
 /// This task:
-/// 1. Periodically checks for dirty sync managers (with pending local changes)
+/// 1. Periodically checks for sync managers with pending local changes
 /// 2. Generates batched updates and broadcasts them to topic members
 /// 3. Periodically saves snapshots for compaction
 pub async fn run_sync_flush_task(
@@ -67,7 +67,7 @@ pub async fn run_sync_flush_task(
                     break;
                 }
                 
-                // Flush dirty managers
+                // Flush managers with pending changes
                 let updates = {
                     let mut managers = sync_managers.write().await;
                     let mut updates = Vec::new();
@@ -81,13 +81,13 @@ pub async fn run_sync_flush_task(
                     }
                     
                     for (topic_id, manager) in managers.iter_mut() {
-                        let is_dirty = manager.is_dirty();
+                        let has_pending = manager.has_pending_changes();
                         let should_flush = manager.should_flush();
                         
-                        if is_dirty {
+                        if has_pending {
                             debug!(
                                 topic = %hex::encode(&topic_id[..8]),
-                                is_dirty = is_dirty,
+                                has_pending_changes = has_pending,
                                 should_flush = should_flush,
                                 "SYNC: checking manager for flush"
                             );
@@ -258,11 +258,15 @@ async fn send_sync_update(
     let node_id = iroh::NodeId::from_bytes(recipient_id)
         .map_err(|e| format!("invalid node id: {}", e))?;
     
-    // Try to connect and send
-    let conn = endpoint
-        .connect(node_id, SEND_ALPN)
-        .await
-        .map_err(|e| format!("connection failed: {}", e))?;
+    // Try to connect with timeout (peer might be offline)
+    let conn = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        endpoint.connect(node_id, SEND_ALPN)
+    ).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(format!("connection failed: {}", e)),
+        Err(_) => return Err("connection timeout (peer may be offline)".to_string()),
+    };
     
     let mut send = conn
         .open_uni()
@@ -276,12 +280,40 @@ async fn send_sync_update(
     send.finish()
         .map_err(|e| format!("failed to finish stream: {}", e))?;
     
-    trace!(
-        topic = %hex::encode(&topic_id[..8]),
-        recipient = %hex::encode(&recipient_id[..8]),
-        size = wire_bytes.len(),
-        "sent sync update"
-    );
+    // Wait for the stream to be fully acknowledged with timeout
+    // Don't hang forever if recipient is offline
+    let timeout = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        send.stopped()
+    ).await;
+    
+    match timeout {
+        Ok(Ok(_)) => {
+            trace!(
+                topic = %hex::encode(&topic_id[..8]),
+                recipient = %hex::encode(&recipient_id[..8]),
+                size = wire_bytes.len(),
+                "sent sync update (acknowledged)"
+            );
+        }
+        Ok(Err(e)) => {
+            // Stream error but data was likely sent
+            trace!(
+                topic = %hex::encode(&topic_id[..8]),
+                recipient = %hex::encode(&recipient_id[..8]),
+                error = %e,
+                "sync update stream error (data likely sent)"
+            );
+        }
+        Err(_) => {
+            // Timeout - recipient might be offline
+            trace!(
+                topic = %hex::encode(&topic_id[..8]),
+                recipient = %hex::encode(&recipient_id[..8]),
+                "sync update timeout (recipient may be offline)"
+            );
+        }
+    }
     
     Ok(())
 }

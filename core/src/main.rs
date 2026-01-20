@@ -138,25 +138,17 @@ async fn main() {
     println!("Harbor Protocol Node v0.1.0");
     println!();
 
-    // Parse --sync flag
-    let sync_enabled = args.iter().any(|a| a == "--sync");
-    
     // Build config - use testing intervals if --testing flag is set
     let mut config = if testing_mode {
         ProtocolConfig::for_testing()
             .with_db_key(DB_KEY)
             .with_db_path(db_path.clone())
             .with_blob_path(blob_path.clone())
-            .with_sync_enabled(true)  // Enable sync in testing mode
     } else {
-        let mut cfg = ProtocolConfig::default()
+        ProtocolConfig::default()
             .with_db_key(DB_KEY)
             .with_db_path(db_path.clone())
-            .with_blob_path(blob_path.clone());
-        if sync_enabled {
-            cfg = cfg.with_sync_enabled(true);
-        }
-        cfg
+            .with_blob_path(blob_path.clone())
     };
 
     // Handle bootstrap configuration:
@@ -1041,9 +1033,9 @@ async fn handle_sync_status(protocol: &Protocol, topic_hex: &str) -> String {
     match protocol.sync_get_status(&topic_bytes).await {
         Ok(status) => {
             let json = format!(
-                r#"{{"enabled":{},"dirty":{},"version":"{}"}}"#,
+                r#"{{"enabled":{},"has_pending_changes":{},"version":"{}"}}"#,
                 status.enabled,
-                status.dirty,
+                status.has_pending_changes,
                 status.version
             );
             http_json_response(200, &json)

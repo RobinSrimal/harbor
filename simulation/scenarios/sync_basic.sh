@@ -12,7 +12,7 @@ scenario_sync_basic() {
     log "SCENARIO: Basic CRDT Sync"
     log "=========================================="
     
-    local TEST_NODES=10
+    local TEST_NODES=20
     local TOPIC_MEMBERS=3  # Keep small for sync testing
     local CONTAINER="doc1"
     local TEST_TEXT="SYNC-BASIC-TEST"

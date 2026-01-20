@@ -22,44 +22,128 @@ use crate::protocol::sync::SyncManager;
 use crate::protocol::{Protocol, ProtocolEvent, SyncUpdatedEvent, SyncInitializedEvent, ProtocolError};
 
 impl Protocol {
-    /// Handle incoming direct sync connection (InitialSyncResponse)
+    /// Handle incoming direct sync connection (InitialSyncRequest or InitialSyncResponse)
     pub(crate) async fn handle_sync_connection(
         conn: iroh::endpoint::Connection,
+        endpoint: iroh::Endpoint,
         event_tx: mpsc::Sender<ProtocolEvent>,
         sync_managers: Arc<RwLock<HashMap<[u8; 32], SyncManager>>>,
         sender_id: [u8; 32],
     ) -> Result<(), ProtocolError> {
+        use crate::network::sync::protocol::SyncMessage;
+        
         // Maximum snapshot size (100MB - generous for large documents)
         const MAX_READ_SIZE: usize = 100 * 1024 * 1024;
         
-        trace!(sender = %hex::encode(sender_id), "waiting for sync streams");
+        info!(sender = %hex::encode(&sender_id[..8]), "SYNC_HANDLER: waiting for sync streams");
         
         loop {
             // Accept unidirectional stream
+            info!(sender = %hex::encode(&sender_id[..8]), "SYNC_HANDLER: calling accept_uni()");
             let mut recv = match conn.accept_uni().await {
-                Ok(r) => r,
+                Ok(r) => {
+                    info!(sender = %hex::encode(&sender_id[..8]), "SYNC_HANDLER: stream accepted");
+                    r
+                }
                 Err(e) => {
-                    trace!(error = %e, sender = %hex::encode(sender_id), "sync stream accept ended");
+                    info!(error = %e, sender = %hex::encode(&sender_id[..8]), "SYNC_HANDLER: accept_uni ended");
                     break;
                 }
             };
             
             // Read message
+            info!(sender = %hex::encode(&sender_id[..8]), "SYNC_HANDLER: reading stream data");
             let buf = match recv.read_to_end(MAX_READ_SIZE).await {
-                Ok(data) => data,
+                Ok(data) => {
+                    info!(sender = %hex::encode(&sender_id[..8]), bytes = data.len(), "SYNC_HANDLER: read complete");
+                    data
+                }
                 Err(e) => {
-                    debug!(error = %e, "failed to read sync stream");
+                    warn!(error = %e, sender = %hex::encode(&sender_id[..8]), "SYNC_HANDLER: failed to read stream");
                     continue;
                 }
             };
             
-            trace!(bytes = buf.len(), "read from sync stream");
+            // Check minimum size: 32 bytes topic_id + at least 1 byte message
+            if buf.len() < 33 {
+                warn!(len = buf.len(), sender = %hex::encode(&sender_id[..8]), "SYNC_HANDLER: message too short");
+                continue;
+            }
             
-            // Decode InitialSyncResponse
-            let response = match InitialSyncResponse::decode(&buf) {
+            // First 32 bytes are the topic_id
+            let mut topic_id = [0u8; 32];
+            topic_id.copy_from_slice(&buf[..32]);
+            let message_bytes = &buf[32..];
+            
+            info!(
+                topic = %hex::encode(&topic_id[..8]),
+                sender = %hex::encode(&sender_id[..8]),
+                message_len = message_bytes.len(),
+                first_byte = ?message_bytes.first(),
+                "SYNC_HANDLER: parsing message"
+            );
+            
+            // Try to decode as InitialSyncRequest first
+            if let Ok(request) = SyncMessage::decode(message_bytes) {
+                info!(
+                    topic = %hex::encode(&topic_id[..8]),
+                    sender = %hex::encode(&sender_id[..8]),
+                    "SYNC_HANDLER: decoded as SyncMessage"
+                );
+                if let SyncMessage::InitialSyncRequest(req) = request {
+                    info!(
+                        topic = %hex::encode(&topic_id[..8]),
+                        sender = %hex::encode(&sender_id[..8]),
+                        request_id = %hex::encode(&req.request_id[..8]),
+                        "SYNC_HANDLER: received InitialSyncRequest"
+                    );
+                    
+                    // Generate response from our manager
+                    let response = {
+                        let managers = sync_managers.read().await;
+                        if let Some(manager) = managers.get(&topic_id) {
+                            Some(manager.handle_initial_sync_request(&req))
+                        } else {
+                            None
+                        }
+                    };
+                    
+                    if let Some(response) = response {
+                        // Send response back via a new direct connection
+                        if let Err(e) = Self::send_initial_sync_response(
+                            &endpoint,
+                            &topic_id,
+                            &sender_id,
+                            &response,
+                        ).await {
+                            warn!(
+                                topic = %hex::encode(&topic_id[..8]),
+                                error = %e,
+                                "Failed to send initial sync response"
+                            );
+                        } else {
+                            info!(
+                                topic = %hex::encode(&topic_id[..8]),
+                                sender = %hex::encode(&sender_id[..8]),
+                                snapshot_size = response.snapshot.len(),
+                                "Sent initial sync response"
+                            );
+                        }
+                    } else {
+                        debug!(
+                            topic = %hex::encode(&topic_id[..8]),
+                            "No sync manager for topic, cannot respond to initial sync request"
+                        );
+                    }
+                    continue;
+                }
+            }
+            
+            // Try to decode as InitialSyncResponse
+            let response = match InitialSyncResponse::decode(message_bytes) {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!(error = ?e, "failed to decode sync response");
+                    debug!(error = ?e, "failed to decode sync message");
                     continue;
                 }
             };
@@ -70,47 +154,144 @@ impl Protocol {
                 "received initial sync response"
             );
             
-            // Find the manager that requested this
+            // Apply the response to the correct manager
             let mut managers = sync_managers.write().await;
-            let mut found_topic = None;
-            
-            for (topic_id, manager) in managers.iter_mut() {
+            if let Some(manager) = managers.get_mut(&topic_id) {
                 match manager.apply_initial_sync_response(&response) {
                     Ok(true) => {
-                        found_topic = Some(*topic_id);
-                        break;
+                        info!(
+                            topic = %hex::encode(&topic_id[..8]),
+                            snapshot_size = response.snapshot.len(),
+                            "Initial sync completed"
+                        );
+                        
+                        // Emit event
+                        let event = ProtocolEvent::SyncInitialized(SyncInitializedEvent {
+                            topic_id,
+                            snapshot_size: response.snapshot.len(),
+                        });
+                        
+                        if event_tx.send(event).await.is_err() {
+                            debug!("event receiver dropped");
+                        }
                     }
-                    Ok(false) => continue, // Not for this manager
+                    Ok(false) => {
+                        debug!(
+                            topic = %hex::encode(&topic_id[..8]),
+                            request_id = %hex::encode(&response.request_id[..8]),
+                            "Received initial sync response for unknown request"
+                        );
+                    }
                     Err(e) => {
                         warn!(
                             topic = %hex::encode(&topic_id[..8]),
                             error = %e,
-                            "failed to apply initial sync response"
+                            "Failed to apply initial sync response"
                         );
                     }
                 }
-            }
-            
-            if let Some(topic_id) = found_topic {
-                info!(
-                    topic = %hex::encode(&topic_id[..8]),
-                    snapshot_size = response.snapshot.len(),
-                    "initial sync completed"
-                );
-                
-                // Emit event
-                let event = ProtocolEvent::SyncInitialized(SyncInitializedEvent {
-                    topic_id,
-                    snapshot_size: response.snapshot.len(),
-                });
-                
-                if event_tx.send(event).await.is_err() {
-                    debug!("event receiver dropped");
-                }
             } else {
                 debug!(
-                    request_id = %hex::encode(&response.request_id[..8]),
-                    "received initial sync response for unknown request"
+                    topic = %hex::encode(&topic_id[..8]),
+                    "Received initial sync response but no manager exists"
+                );
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Send an initial sync response to a requester
+    async fn send_initial_sync_response(
+        endpoint: &iroh::Endpoint,
+        topic_id: &[u8; 32],
+        recipient_id: &[u8; 32],
+        response: &InitialSyncResponse,
+    ) -> Result<(), String> {
+        use crate::network::sync::SYNC_ALPN;
+        use std::time::Duration;
+        
+        let node_id = iroh::NodeId::from_bytes(recipient_id)
+            .map_err(|e| format!("invalid node id: {}", e))?;
+        
+        // Encode the response
+        let encoded = response.encode();
+        
+        info!(
+            topic = %hex::encode(&topic_id[..8]),
+            recipient = %hex::encode(&recipient_id[..8]),
+            encoded_len = encoded.len(),
+            "SYNC_RESPONSE: connecting to requester"
+        );
+        
+        // Connect via SYNC_ALPN (with timeout for offline peers)
+        let conn = match tokio::time::timeout(
+            Duration::from_secs(5),
+            endpoint.connect(node_id, SYNC_ALPN)
+        ).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return Err(format!("connection failed: {}", e)),
+            Err(_) => return Err("connection timeout (peer may be offline)".to_string()),
+        };
+        
+        info!(
+            topic = %hex::encode(&topic_id[..8]),
+            recipient = %hex::encode(&recipient_id[..8]),
+            "SYNC_RESPONSE: connection established"
+        );
+        
+        let mut send = conn
+            .open_uni()
+            .await
+            .map_err(|e| format!("failed to open stream: {}", e))?;
+        
+        // Write topic_id first
+        tokio::io::AsyncWriteExt::write_all(&mut send, topic_id)
+            .await
+            .map_err(|e| format!("failed to write topic_id: {}", e))?;
+        
+        // Write the response
+        tokio::io::AsyncWriteExt::write_all(&mut send, &encoded)
+            .await
+            .map_err(|e| format!("failed to write response: {}", e))?;
+        
+        info!(
+            topic = %hex::encode(&topic_id[..8]),
+            recipient = %hex::encode(&recipient_id[..8]),
+            total_bytes = 32 + encoded.len(),
+            "SYNC_RESPONSE: data written, finishing stream"
+        );
+        
+        send.finish()
+            .map_err(|e| format!("failed to finish stream: {}", e))?;
+        
+        // Wait for acknowledgment with timeout
+        let timeout = tokio::time::timeout(
+            Duration::from_secs(10),
+            send.stopped()
+        ).await;
+        
+        match timeout {
+            Ok(Ok(_)) => {
+                info!(
+                    topic = %hex::encode(&topic_id[..8]),
+                    recipient = %hex::encode(&recipient_id[..8]),
+                    "SYNC_RESPONSE: sent successfully"
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    topic = %hex::encode(&topic_id[..8]),
+                    recipient = %hex::encode(&recipient_id[..8]),
+                    error = %e,
+                    "SYNC_RESPONSE: stream error (data likely sent)"
+                );
+            }
+            Err(_) => {
+                info!(
+                    topic = %hex::encode(&topic_id[..8]),
+                    recipient = %hex::encode(&recipient_id[..8]),
+                    "SYNC_RESPONSE: sent (no ack within timeout)"
                 );
             }
         }

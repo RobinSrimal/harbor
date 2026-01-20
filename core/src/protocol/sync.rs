@@ -42,7 +42,7 @@ pub struct SyncManager {
     /// Version at last network broadcast
     last_broadcast_version: Vec<u8>,
     /// Whether there are pending changes to broadcast
-    dirty: bool,
+    has_pending_changes: bool,
     /// Last flush time
     last_flush: Instant,
     /// Batch interval
@@ -79,7 +79,7 @@ impl SyncManager {
             doc,
             store,
             last_broadcast_version,
-            dirty: false,
+            has_pending_changes: false,
             last_flush: Instant::now(),
             batch_interval: DEFAULT_BATCH_INTERVAL,
             pending_initial_syncs: HashMap::new(),
@@ -103,6 +103,13 @@ impl SyncManager {
         &mut self.doc
     }
     
+    /// Check if the document is empty (has no history)
+    pub fn is_empty(&self) -> bool {
+        // An empty VersionVector encodes to just [0x00] or similar minimal value
+        let version = self.doc.oplog_vv().encode();
+        version.len() <= 1 || version == vec![0x00]
+    }
+    
     /// Called after making local changes to the document
     ///
     /// This:
@@ -120,8 +127,8 @@ impl SyncManager {
         self.store.append_to_wal(&delta)
             .map_err(|e| SyncError::Storage(e.to_string()))?;
         
-        // Mark dirty for batched network send
-        self.dirty = true;
+        // Mark as having pending changes for batched network send
+        self.has_pending_changes = true;
         
         trace!(
             topic = %hex::encode(&self.topic_id[..8]),
@@ -133,20 +140,20 @@ impl SyncManager {
     }
     
     /// Check if there are pending changes to broadcast
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
+    pub fn has_pending_changes(&self) -> bool {
+        self.has_pending_changes
     }
     
     /// Check if it's time to flush (batch interval elapsed)
     pub fn should_flush(&self) -> bool {
-        self.dirty && self.last_flush.elapsed() >= self.batch_interval
+        self.has_pending_changes && self.last_flush.elapsed() >= self.batch_interval
     }
     
     /// Generate the batched update message for network broadcast
     ///
     /// Returns None if no changes to broadcast.
     pub fn generate_update(&mut self) -> Option<SyncMessage> {
-        if !self.dirty {
+        if !self.has_pending_changes {
             return None;
         }
         
@@ -155,13 +162,13 @@ impl SyncManager {
         let delta = self.doc.export(loro::ExportMode::Updates { from: Cow::Borrowed(&last_version) }).ok()?;
         
         if delta.is_empty() {
-            self.dirty = false;
+            self.has_pending_changes = false;
             return None;
         }
         
         // Update tracking
         self.last_broadcast_version = self.doc.oplog_vv().encode();
-        self.dirty = false;
+        self.has_pending_changes = false;
         self.last_flush = Instant::now();
         
         debug!(
@@ -294,6 +301,8 @@ impl SyncManager {
     /// Set the batch interval for network sending
     pub fn set_batch_interval(&mut self, interval: Duration) {
         self.batch_interval = interval;
+        // Reset the timer so the new interval starts from now
+        self.last_flush = Instant::now();
     }
 }
 
@@ -338,7 +347,7 @@ mod tests {
         let manager = SyncManager::new(&temp_dir.path().to_path_buf(), test_topic_id()).unwrap();
         
         assert_eq!(manager.topic_id(), test_topic_id());
-        assert!(!manager.is_dirty());
+        assert!(!manager.has_pending_changes());
     }
     
     #[test]
@@ -350,12 +359,12 @@ mod tests {
         manager.doc().get_text("content").insert(0, "Hello").unwrap();
         manager.on_local_change().unwrap();
         
-        assert!(manager.is_dirty());
+        assert!(manager.has_pending_changes());
         
         // Generate update
         let update = manager.generate_update();
         assert!(update.is_some());
-        assert!(!manager.is_dirty());
+        assert!(!manager.has_pending_changes());
     }
     
     #[test]
@@ -491,7 +500,7 @@ mod tests {
         manager.on_local_change().unwrap();
         
         // Should not flush immediately
-        assert!(manager.is_dirty());
+        assert!(manager.has_pending_changes());
         assert!(!manager.should_flush()); // Interval hasn't elapsed
         
         // Wait for interval
@@ -500,9 +509,9 @@ mod tests {
         // Now should be ready to flush
         assert!(manager.should_flush());
         
-        // After generating update, should not be dirty
+        // After generating update, should have no pending changes
         let _update = manager.generate_update();
-        assert!(!manager.is_dirty());
+        assert!(!manager.has_pending_changes());
         assert!(!manager.should_flush());
     }
     
