@@ -22,8 +22,12 @@ pub enum MessageType {
     FileAnnouncement = 0x03,
     /// Can seed announcement (peer has complete file)
     CanSeed = 0x04,
-    /// CRDT sync update
+    /// CRDT sync update (delta)
     SyncUpdate = 0x05,
+    /// Sync request (asking peers for their state)
+    SyncRequest = 0x06,
+    /// Sync response (full CRDT state)
+    SyncResponse = 0x07,
 }
 
 impl MessageType {
@@ -34,6 +38,7 @@ impl MessageType {
     /// - Leave: Full - sender should be known member
     /// - FileAnnouncement: Full - sender should be known member
     /// - CanSeed: Full - sender should be known member
+    /// - SyncUpdate/Request/Response: Full - sender should be known member
     pub fn verification_mode(&self) -> VerificationMode {
         match self {
             MessageType::Content => VerificationMode::Full,
@@ -42,6 +47,8 @@ impl MessageType {
             MessageType::FileAnnouncement => VerificationMode::Full,
             MessageType::CanSeed => VerificationMode::Full,
             MessageType::SyncUpdate => VerificationMode::Full,
+            MessageType::SyncRequest => VerificationMode::Full,
+            MessageType::SyncResponse => VerificationMode::Full,
         }
     }
 
@@ -62,6 +69,8 @@ impl TryFrom<u8> for MessageType {
             0x03 => Ok(MessageType::FileAnnouncement),
             0x04 => Ok(MessageType::CanSeed),
             0x05 => Ok(MessageType::SyncUpdate),
+            0x06 => Ok(MessageType::SyncRequest),
+            0x07 => Ok(MessageType::SyncResponse),
             _ => Err(()),
         }
     }
@@ -80,14 +89,25 @@ pub enum TopicMessage {
     FileAnnouncement(FileAnnouncementMessage),
     /// Can seed announcement (peer has complete file, can serve)
     CanSeed(CanSeedMessage),
-    /// CRDT sync update (Loro delta)
+    /// CRDT sync update (delta bytes)
     SyncUpdate(SyncUpdateMessage),
+    /// Sync request (asking peers for their current state)
+    SyncRequest,
+    /// Sync response (full CRDT state)
+    SyncResponse(SyncResponseMessage),
 }
 
-/// CRDT sync update message
+/// CRDT sync update message (delta)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncUpdateMessage {
-    /// The Loro delta bytes
+    /// Raw CRDT delta bytes
+    pub data: Vec<u8>,
+}
+
+/// CRDT sync response message (full state)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncResponseMessage {
+    /// Full CRDT state bytes
     pub data: Vec<u8>,
 }
 
@@ -138,6 +158,17 @@ impl TopicMessage {
                 bytes.extend_from_slice(&payload);
                 bytes
             }
+            TopicMessage::SyncRequest => {
+                // No payload, just the type byte
+                vec![MessageType::SyncRequest as u8]
+            }
+            TopicMessage::SyncResponse(msg) => {
+                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
+                let mut bytes = Vec::with_capacity(1 + payload.len());
+                bytes.push(MessageType::SyncResponse as u8);
+                bytes.extend_from_slice(&payload);
+                bytes
+            }
         }
     }
 
@@ -179,6 +210,15 @@ impl TopicMessage {
                     .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
                 Ok(TopicMessage::SyncUpdate(msg))
             }
+            MessageType::SyncRequest => {
+                // No payload
+                Ok(TopicMessage::SyncRequest)
+            }
+            MessageType::SyncResponse => {
+                let msg: SyncResponseMessage = postcard::from_bytes(&bytes[1..])
+                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                Ok(TopicMessage::SyncResponse(msg))
+            }
         }
     }
 
@@ -210,6 +250,8 @@ impl TopicMessage {
             TopicMessage::FileAnnouncement(_) => MessageType::FileAnnouncement,
             TopicMessage::CanSeed(_) => MessageType::CanSeed,
             TopicMessage::SyncUpdate(_) => MessageType::SyncUpdate,
+            TopicMessage::SyncRequest => MessageType::SyncRequest,
+            TopicMessage::SyncResponse(_) => MessageType::SyncResponse,
         }
     }
 

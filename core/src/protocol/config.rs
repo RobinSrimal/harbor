@@ -97,20 +97,6 @@ pub struct ProtocolConfig {
     /// How often to check for incomplete blobs and retry pulling (seconds)
     /// Default: 30
     pub share_pull_interval_secs: u64,
-    
-    // --- Sync (CRDT) Configuration ---
-    
-    /// Path to sync document storage directory
-    /// If None, uses .harbor_sync/ next to the database
-    pub sync_path: Option<PathBuf>,
-    
-    /// How often to flush batched sync updates to the network (seconds)
-    /// Default: 1
-    pub sync_flush_interval_secs: u64,
-    
-    /// How often to save sync document snapshots (seconds)
-    /// Default: 300 (5 minutes)
-    pub sync_snapshot_interval_secs: u64,
 }
 
 impl fmt::Debug for ProtocolConfig {
@@ -139,9 +125,6 @@ impl fmt::Debug for ProtocolConfig {
             .field("enable_pow", &self.enable_pow)
             .field("pow_difficulty", &self.pow_difficulty)
             .field("share_pull_interval_secs", &self.share_pull_interval_secs)
-            .field("sync_path", &self.sync_path)
-            .field("sync_flush_interval_secs", &self.sync_flush_interval_secs)
-            .field("sync_snapshot_interval_secs", &self.sync_snapshot_interval_secs)
             .finish()
     }
 }
@@ -175,9 +158,6 @@ impl Default for ProtocolConfig {
             enable_pow: true,
             pow_difficulty: 18,
             share_pull_interval_secs: 30,
-            sync_path: None,
-            sync_flush_interval_secs: 1,
-            sync_snapshot_interval_secs: 300,
         }
     }
 }
@@ -280,9 +260,6 @@ impl ProtocolConfig {
             enable_pow: false,
             pow_difficulty: 8,
             share_pull_interval_secs: 10,    // Faster for testing
-            sync_path: None,
-            sync_flush_interval_secs: 1,     // Same as default
-            sync_snapshot_interval_secs: 60, // Faster for testing
         }
     }
     
@@ -361,26 +338,6 @@ impl ProtocolConfig {
     /// Set share pull retry interval
     pub fn with_share_pull_interval(mut self, secs: u64) -> Self {
         self.share_pull_interval_secs = secs;
-        self
-    }
-    
-    // --- Sync (CRDT) Configuration ---
-    
-    /// Set the sync document storage path
-    pub fn with_sync_path(mut self, path: PathBuf) -> Self {
-        self.sync_path = Some(path);
-        self
-    }
-    
-    /// Set sync flush interval
-    pub fn with_sync_flush_interval(mut self, secs: u64) -> Self {
-        self.sync_flush_interval_secs = secs;
-        self
-    }
-    
-    /// Set sync snapshot interval
-    pub fn with_sync_snapshot_interval(mut self, secs: u64) -> Self {
-        self.sync_snapshot_interval_secs = secs;
         self
     }
 }
@@ -577,70 +534,6 @@ mod tests {
         assert_eq!(config.harbor_sync_interval_secs, 600);
         assert_eq!(config.harbor_sync_candidates, 8);
         assert_eq!(config.harbor_pull_interval_secs, 30);
-    }
-    
-    // --- Sync Config Tests ---
-    
-    #[test]
-    fn test_sync_defaults() {
-        let config = ProtocolConfig::default();
-        
-        assert!(config.sync_path.is_none());
-        assert_eq!(config.sync_flush_interval_secs, 1);
-        assert_eq!(config.sync_snapshot_interval_secs, 300);
-    }
-    
-    #[test]
-    fn test_with_sync_path() {
-        let path = PathBuf::from("/tmp/sync_data");
-        let config = ProtocolConfig::new().with_sync_path(path.clone());
-        
-        assert_eq!(config.sync_path, Some(path));
-    }
-    
-    #[test]
-    fn test_with_sync_flush_interval() {
-        let config = ProtocolConfig::new().with_sync_flush_interval(5);
-        assert_eq!(config.sync_flush_interval_secs, 5);
-    }
-    
-    #[test]
-    fn test_with_sync_snapshot_interval() {
-        let config = ProtocolConfig::new().with_sync_snapshot_interval(600);
-        assert_eq!(config.sync_snapshot_interval_secs, 600);
-    }
-    
-    #[test]
-    fn test_sync_config_builder_chain() {
-        let config = ProtocolConfig::new()
-            .with_sync_path(PathBuf::from("/sync"))
-            .with_sync_flush_interval(2)
-            .with_sync_snapshot_interval(120);
-        
-        assert_eq!(config.sync_path, Some(PathBuf::from("/sync")));
-        assert_eq!(config.sync_flush_interval_secs, 2);
-        assert_eq!(config.sync_snapshot_interval_secs, 120);
-    }
-    
-    #[test]
-    fn test_testing_config_sync_values() {
-        let config = ProtocolConfig::for_testing();
-        
-        // Testing config should have faster snapshot interval
-        assert_eq!(config.sync_flush_interval_secs, 1);
-        assert_eq!(config.sync_snapshot_interval_secs, 60);
-    }
-    
-    #[test]
-    fn test_debug_includes_sync_fields() {
-        let config = ProtocolConfig::new()
-            .with_sync_path(PathBuf::from("/test/sync"));
-        
-        let debug_output = format!("{:?}", config);
-        
-        assert!(debug_output.contains("sync_path"));
-        assert!(debug_output.contains("sync_flush_interval_secs"));
-        assert!(debug_output.contains("sync_snapshot_interval_secs"));
     }
 }
 

@@ -17,10 +17,12 @@ pub enum ProtocolEvent {
     FileProgress(FileProgressEvent),
     /// File download completed
     FileComplete(FileCompleteEvent),
-    /// Sync document was updated (CRDT changes received)
-    SyncUpdated(SyncUpdatedEvent),
-    /// Initial sync completed for a topic
-    SyncInitialized(SyncInitializedEvent),
+    /// Sync update received from a peer (raw CRDT bytes)
+    SyncUpdate(SyncUpdateEvent),
+    /// A peer is requesting sync state
+    SyncRequest(SyncRequestEvent),
+    /// Response to our sync request (full CRDT state)
+    SyncResponse(SyncResponseEvent),
 }
 
 /// An incoming message from the event bus
@@ -83,28 +85,41 @@ pub struct FileCompleteEvent {
     pub total_size: u64,
 }
 
-/// Event: Sync document was updated
+/// Event: Sync update received from a peer
 ///
-/// Emitted when CRDT changes are received from other members
+/// Application should apply this to their local CRDT.
+/// Harbor is a transport layer - the `data` bytes are opaque.
 #[derive(Debug, Clone)]
-pub struct SyncUpdatedEvent {
-    /// The topic this sync document belongs to
+pub struct SyncUpdateEvent {
+    /// The topic this sync update belongs to
     pub topic_id: [u8; 32],
     /// The sender who made the changes
     pub sender_id: [u8; 32],
-    /// Size of the update in bytes
-    pub update_size: usize,
+    /// Raw CRDT bytes (Loro delta, Yjs update, etc.)
+    pub data: Vec<u8>,
 }
 
-/// Event: Initial sync completed
+/// Event: A peer is requesting sync state
 ///
-/// Emitted when a new member receives the full document state
+/// Application should respond with their current CRDT state via
+/// `protocol.respond_sync()`.
 #[derive(Debug, Clone)]
-pub struct SyncInitializedEvent {
-    /// The topic that was synced
+pub struct SyncRequestEvent {
+    /// The topic being synced
     pub topic_id: [u8; 32],
-    /// Size of the snapshot in bytes
-    pub snapshot_size: usize,
+    /// Who is requesting (respond to this peer)
+    pub sender_id: [u8; 32],
+}
+
+/// Event: Response to our sync request
+///
+/// Application should import this into their CRDT.
+#[derive(Debug, Clone)]
+pub struct SyncResponseEvent {
+    /// The topic this response is for
+    pub topic_id: [u8; 32],
+    /// Full CRDT state bytes
+    pub data: Vec<u8>,
 }
 
 #[cfg(test)]

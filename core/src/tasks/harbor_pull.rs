@@ -235,10 +235,30 @@ impl Protocol {
                                                     }
                                                 }
                                                 TopicMessage::Content(_) => {}
-                                                TopicMessage::SyncUpdate(_) => {
-                                                    // Sync updates pulled from Harbor are handled
-                                                    // by the sync manager, not here
-                                                    // TODO: Apply to sync manager when offline sync is needed
+                                                TopicMessage::SyncUpdate(sync_update) => {
+                                                    // Emit SyncUpdate event for app to handle
+                                                    let event = ProtocolEvent::SyncUpdate(crate::protocol::SyncUpdateEvent {
+                                                        topic_id,
+                                                        sender_id: packet_info.sender_id,
+                                                        data: sync_update.data.clone(),
+                                                    });
+                                                    let _ = event_tx.send(event).await;
+                                                }
+                                                TopicMessage::SyncRequest => {
+                                                    // Emit SyncRequest event for app to handle
+                                                    let event = ProtocolEvent::SyncRequest(crate::protocol::SyncRequestEvent {
+                                                        topic_id,
+                                                        sender_id: packet_info.sender_id,
+                                                    });
+                                                    let _ = event_tx.send(event).await;
+                                                }
+                                                TopicMessage::SyncResponse(sync_response) => {
+                                                    // Emit SyncResponse event for app to handle
+                                                    let event = ProtocolEvent::SyncResponse(crate::protocol::SyncResponseEvent {
+                                                        topic_id,
+                                                        data: sync_response.data.clone(),
+                                                    });
+                                                    let _ = event_tx.send(event).await;
                                                 }
                                             }
                                         }

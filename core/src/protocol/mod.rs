@@ -42,7 +42,6 @@ mod topics;
 mod send;
 mod stats;
 mod share;
-pub mod sync;
 
 // Core protocol
 pub use core::Protocol;
@@ -54,11 +53,11 @@ pub use error::ProtocolError;
 // Events (for app layer)
 pub use events::{
     FileAnnouncedEvent, FileCompleteEvent, FileProgressEvent, IncomingMessage, ProtocolEvent,
-    SyncUpdatedEvent, SyncInitializedEvent,
+    SyncUpdateEvent, SyncRequestEvent, SyncResponseEvent,
 };
 
 // Domain types
-pub use types::{MemberInfo, TopicInvite, SyncStatus};
+pub use types::{MemberInfo, TopicInvite};
 
 // Stats types
 pub use stats::{
@@ -68,6 +67,3 @@ pub use stats::{
 
 // Share types
 pub use share::ShareStatus;
-
-// Sync types
-pub use sync::{SyncManager, SyncError};

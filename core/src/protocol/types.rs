@@ -6,17 +6,6 @@ use serde::{Deserialize, Serialize};
 
 use super::error::ProtocolError;
 
-/// Sync status for a topic
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncStatus {
-    /// Whether sync is enabled for this topic
-    pub enabled: bool,
-    /// Whether there are pending changes to broadcast
-    pub has_pending_changes: bool,
-    /// Current document version (hex-encoded)
-    pub version: String,
-}
-
 /// Member info for topic invites
 ///
 /// Contains the EndpointID and optional relay URL for connectivity

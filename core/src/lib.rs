@@ -68,8 +68,9 @@ pub use protocol::{
     FileAnnouncedEvent,
     FileProgressEvent,
     FileCompleteEvent,
-    SyncUpdatedEvent,
-    SyncInitializedEvent,
+    SyncUpdateEvent,
+    SyncRequestEvent,
+    SyncResponseEvent,
     // Stats types
     ProtocolStats,
     IdentityStats,
@@ -83,8 +84,4 @@ pub use protocol::{
     TopicDetails,
     TopicMemberInfo,
     TopicSummary,
-    // Sync types
-    SyncManager,
-    SyncError,
-    SyncStatus,
 };

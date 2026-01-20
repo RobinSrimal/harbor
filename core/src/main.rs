@@ -309,19 +309,26 @@ async fn main() {
                                 "File complete"
                             );
                         }
-                        harbor_core::ProtocolEvent::SyncUpdated(ev) => {
+                        harbor_core::ProtocolEvent::SyncUpdate(ev) => {
                             debug!(
                                 topic = %hex::encode(&ev.topic_id[..8]),
                                 sender = %hex::encode(&ev.sender_id[..8]),
-                                size = ev.update_size,
-                                "Sync updated"
+                                size = ev.data.len(),
+                                "Sync update received"
                             );
                         }
-                        harbor_core::ProtocolEvent::SyncInitialized(ev) => {
+                        harbor_core::ProtocolEvent::SyncRequest(ev) => {
+                            debug!(
+                                topic = %hex::encode(&ev.topic_id[..8]),
+                                sender = %hex::encode(&ev.sender_id[..8]),
+                                "Sync request received"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::SyncResponse(ev) => {
                             info!(
                                 topic = %hex::encode(&ev.topic_id[..8]),
-                                size = ev.snapshot_size,
-                                "Sync initialized"
+                                size = ev.data.len(),
+                                "Sync response received"
                             );
                         }
                     }

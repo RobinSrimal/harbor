@@ -6,8 +6,6 @@
 //! - `handlers/`: Connection handling (incoming/outgoing)
 //! - `tasks/`: Background automation
 
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,12 +22,10 @@ use crate::network::dht::{
 use crate::network::harbor::protocol::HARBOR_ALPN;
 use crate::network::send::protocol::SEND_ALPN;
 use crate::network::sync::protocol::SYNC_ALPN;
-use crate::protocol::sync::SyncManager;
 
 use super::config::ProtocolConfig;
 use super::error::ProtocolError;
 use super::events::ProtocolEvent;
-use super::types::SyncStatus;
 
 /// Maximum message size (512 KB)
 pub const MAX_MESSAGE_SIZE: usize = 512 * 1024;
@@ -71,8 +67,6 @@ pub struct Protocol {
     pub(crate) tasks: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
     /// Shutdown signal sender
     shutdown_tx: mpsc::Sender<()>,
-    /// CRDT sync managers (one per topic)
-    pub(crate) sync_managers: Arc<RwLock<HashMap<[u8; 32], SyncManager>>>,
 }
 
 impl Protocol {
@@ -280,7 +274,6 @@ impl Protocol {
             running: Arc::new(RwLock::new(true)),
             tasks: Arc::new(RwLock::new(Vec::new())),
             shutdown_tx,
-            sync_managers: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Start background tasks
@@ -363,304 +356,6 @@ impl Protocol {
             crate::data::default_blob_path().unwrap_or_else(|_| PathBuf::from(".harbor_blobs"))
         }
     }
-    
-    /// Get the sync storage path
-    /// 
-    /// Returns the configured sync path, or derives one from the db path,
-    /// or falls back to the system default.
-    pub fn sync_path(&self) -> PathBuf {
-        if let Some(ref path) = self.config.sync_path {
-            path.clone()
-        } else if let Some(ref db_path) = self.config.db_path {
-            // Derive from db_path: .harbor_sync/ next to database
-            db_path.parent()
-                .map(|p| p.join(".harbor_sync"))
-                .unwrap_or_else(|| PathBuf::from(".harbor_sync"))
-        } else {
-            // Fall back to system default
-            crate::data::sync::default_sync_path().unwrap_or_else(|_| PathBuf::from(".harbor_sync"))
-        }
-    }
-    
-    /// Get or create a sync manager for a topic
-    /// 
-    /// Creates a new SyncManager if one doesn't exist for the topic.
-    pub async fn get_sync_manager(&self, topic_id: &[u8; 32]) -> Result<(), ProtocolError> {
-        let mut managers = self.sync_managers.write().await;
-        if managers.contains_key(topic_id) {
-            return Ok(());
-        }
-        
-        // Create new manager
-        let sync_path = self.sync_path();
-        match SyncManager::new(&sync_path, *topic_id) {
-            Ok(manager) => {
-                managers.insert(*topic_id, manager);
-                Ok(())
-            }
-            Err(e) => Err(ProtocolError::Sync(e.to_string())),
-        }
-    }
-    
-    // ========== Public Sync API ==========
-    
-    /// Enable sync for a topic
-    ///
-    /// Creates a SyncManager for the topic. If the document is empty and there
-    /// are other members in the topic, automatically requests initial sync.
-    pub async fn sync_enable(&self, topic_id: &[u8; 32]) -> Result<(), ProtocolError> {
-        // Create the manager first
-        self.get_sync_manager(topic_id).await?;
-        
-        // Check if we need initial sync
-        let needs_initial_sync = {
-            let managers = self.sync_managers.read().await;
-            if let Some(manager) = managers.get(topic_id) {
-                manager.is_empty()
-            } else {
-                false
-            }
-        };
-        
-        if needs_initial_sync {
-            // Get other members in the topic
-            let members = {
-                let db_lock = self.db.lock().await;
-                crate::data::get_topic_members(&db_lock, topic_id)
-                    .unwrap_or_default()
-            };
-            
-            // Filter out ourselves
-            let other_members: Vec<_> = members.iter()
-                .filter(|m| **m != self.identity.public_key)
-                .collect();
-            
-            if !other_members.is_empty() {
-                info!(
-                    topic = %hex::encode(&topic_id[..8]),
-                    member_count = other_members.len(),
-                    "Document is empty, requesting initial sync from existing members"
-                );
-                
-                // Generate initial sync request
-                let request = {
-                    let mut managers = self.sync_managers.write().await;
-                    if let Some(manager) = managers.get_mut(topic_id) {
-                        Some(manager.generate_initial_sync_request())
-                    } else {
-                        None
-                    }
-                };
-                
-                if let Some(request) = request {
-                    // Send request to each member via direct connection
-                    for member_id in other_members {
-                        if let Err(e) = self.send_initial_sync_request(topic_id, member_id, &request).await {
-                            warn!(
-                                topic = %hex::encode(&topic_id[..8]),
-                                member = %hex::encode(&member_id[..8]),
-                                error = %e,
-                                "Failed to send initial sync request"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Send an initial sync request to a specific member via direct connection
-    async fn send_initial_sync_request(
-        &self,
-        topic_id: &[u8; 32],
-        member_id: &[u8; 32],
-        request: &crate::network::sync::SyncMessage,
-    ) -> Result<(), String> {
-        use crate::network::sync::SYNC_ALPN;
-        
-        let node_id = iroh::NodeId::from_bytes(member_id)
-            .map_err(|e| format!("invalid node id: {}", e))?;
-        
-        // Encode the request
-        let encoded = request.encode();
-        
-        info!(
-            topic = %hex::encode(&topic_id[..8]),
-            member = %hex::encode(&member_id[..8]),
-            encoded_len = encoded.len(),
-            "INITIAL_SYNC: connecting to member via SYNC_ALPN"
-        );
-        
-        // Connect via SYNC_ALPN for initial sync (with timeout for offline peers)
-        let conn = match tokio::time::timeout(
-            Duration::from_secs(5),
-            self.endpoint.connect(node_id, SYNC_ALPN)
-        ).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => return Err(format!("connection failed: {}", e)),
-            Err(_) => return Err("connection timeout (peer may be offline)".to_string()),
-        };
-        
-        info!(
-            topic = %hex::encode(&topic_id[..8]),
-            member = %hex::encode(&member_id[..8]),
-            "INITIAL_SYNC: connection established, opening stream"
-        );
-        
-        let mut send = conn
-            .open_uni()
-            .await
-            .map_err(|e| format!("failed to open stream: {}", e))?;
-        
-        info!(
-            topic = %hex::encode(&topic_id[..8]),
-            member = %hex::encode(&member_id[..8]),
-            "INITIAL_SYNC: stream opened, writing topic_id + request"
-        );
-        
-        // Write topic_id first (so receiver knows which topic)
-        tokio::io::AsyncWriteExt::write_all(&mut send, topic_id)
-            .await
-            .map_err(|e| format!("failed to write topic_id: {}", e))?;
-        
-        // Write the request
-        tokio::io::AsyncWriteExt::write_all(&mut send, &encoded)
-            .await
-            .map_err(|e| format!("failed to write request: {}", e))?;
-        
-        info!(
-            topic = %hex::encode(&topic_id[..8]),
-            member = %hex::encode(&member_id[..8]),
-            total_bytes = 32 + encoded.len(),
-            "INITIAL_SYNC: data written, calling finish()"
-        );
-        
-        send.finish()
-            .map_err(|e| format!("failed to finish stream: {}", e))?;
-        
-        info!(
-            topic = %hex::encode(&topic_id[..8]),
-            member = %hex::encode(&member_id[..8]),
-            "INITIAL_SYNC: stream finished, waiting for stopped()"
-        );
-        
-        // Wait for stream to be processed with timeout (don't block forever)
-        let timeout = tokio::time::timeout(
-            Duration::from_secs(10),
-            send.stopped()
-        ).await;
-        
-        match timeout {
-            Ok(Ok(_)) => {
-                info!(
-                    topic = %hex::encode(&topic_id[..8]),
-                    member = %hex::encode(&member_id[..8]),
-                    "Sent initial sync request"
-                );
-            }
-            Ok(Err(e)) => {
-                // Stream error but data was likely sent
-                warn!(
-                    topic = %hex::encode(&topic_id[..8]),
-                    member = %hex::encode(&member_id[..8]),
-                    error = %e,
-                    "Initial sync request stream error (data likely sent)"
-                );
-            }
-            Err(_) => {
-                // Timeout - data was sent, just no confirmation
-                info!(
-                    topic = %hex::encode(&topic_id[..8]),
-                    member = %hex::encode(&member_id[..8]),
-                    "Initial sync request sent (no ack within timeout)"
-                );
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Insert text into a sync document's text container
-    ///
-    /// Container names are used to have multiple "documents" per topic.
-    pub async fn sync_text_insert(
-        &self,
-        topic_id: &[u8; 32],
-        container: &str,
-        index: usize,
-        text: &str,
-    ) -> Result<(), ProtocolError> {
-        // Ensure manager exists
-        self.sync_enable(topic_id).await?;
-        
-        let mut managers = self.sync_managers.write().await;
-        let manager = managers.get_mut(topic_id)
-            .ok_or_else(|| ProtocolError::Sync("sync manager not found".to_string()))?;
-        
-        // Get or create the text container
-        let text_container = manager.doc_mut().get_text(container);
-        text_container.insert(index, text)
-            .map_err(|e| ProtocolError::Sync(format!("text insert failed: {}", e)))?;
-        
-        // Persist and mark for broadcast
-        manager.on_local_change()
-            .map_err(|e| ProtocolError::Sync(e.to_string()))?;
-        
-        Ok(())
-    }
-    
-    /// Delete text from a sync document's text container
-    pub async fn sync_text_delete(
-        &self,
-        topic_id: &[u8; 32],
-        container: &str,
-        index: usize,
-        len: usize,
-    ) -> Result<(), ProtocolError> {
-        self.sync_enable(topic_id).await?;
-        
-        let mut managers = self.sync_managers.write().await;
-        let manager = managers.get_mut(topic_id)
-            .ok_or_else(|| ProtocolError::Sync("sync manager not found".to_string()))?;
-        
-        let text_container = manager.doc_mut().get_text(container);
-        text_container.delete(index, len)
-            .map_err(|e| ProtocolError::Sync(format!("text delete failed: {}", e)))?;
-        
-        manager.on_local_change()
-            .map_err(|e| ProtocolError::Sync(e.to_string()))?;
-        
-        Ok(())
-    }
-    
-    /// Get the current text value from a sync document container
-    pub async fn sync_get_text(
-        &self,
-        topic_id: &[u8; 32],
-        container: &str,
-    ) -> Result<String, ProtocolError> {
-        let managers = self.sync_managers.read().await;
-        let manager = managers.get(topic_id)
-            .ok_or_else(|| ProtocolError::Sync("sync not enabled for this topic".to_string()))?;
-        
-        let text_container = manager.doc().get_text(container);
-        Ok(text_container.to_string())
-    }
-    
-    /// Get sync status for a topic
-    pub async fn sync_get_status(&self, topic_id: &[u8; 32]) -> Result<SyncStatus, ProtocolError> {
-        let managers = self.sync_managers.read().await;
-        let manager = managers.get(topic_id)
-            .ok_or_else(|| ProtocolError::Sync("sync not enabled for this topic".to_string()))?;
-        
-        Ok(SyncStatus {
-            enabled: true,
-            has_pending_changes: manager.has_pending_changes(),
-            version: hex::encode(manager.doc().oplog_vv().encode()),
-        })
-    }
 
     /// Check if the protocol is running
     pub(crate) async fn check_running(&self) -> Result<(), ProtocolError> {
@@ -668,6 +363,190 @@ impl Protocol {
         if !*running {
             return Err(ProtocolError::NotRunning);
         }
+        Ok(())
+    }
+    
+    // ========== Sync Transport API (NEW) ==========
+    //
+    // These methods provide sync transport without internal CRDT handling.
+    // Applications bring their own CRDT (Loro, Yjs, Automerge, etc.).
+    
+    /// Send a sync update to all topic members
+    ///
+    /// The `data` bytes are opaque to Harbor - application provides
+    /// serialized CRDT updates (Loro delta, Yjs update, etc.)
+    /// 
+    /// Max size: 512 KB (uses broadcast via send protocol)
+    pub async fn send_sync_update(
+        &self,
+        topic_id: &[u8; 32],
+        data: Vec<u8>,
+    ) -> Result<(), ProtocolError> {
+        use crate::data::get_topic_members_with_info;
+        use crate::network::harbor::protocol::HarborPacketType;
+        use crate::network::membership::messages::{TopicMessage, SyncUpdateMessage};
+        use super::types::MemberInfo;
+        
+        self.check_running().await?;
+        
+        // Check size limit
+        if data.len() > MAX_MESSAGE_SIZE {
+            return Err(ProtocolError::MessageTooLarge);
+        }
+        
+        // Get topic members
+        let members_with_info = {
+            let db = self.db.lock().await;
+            get_topic_members_with_info(&db, topic_id)
+                .map_err(|e| ProtocolError::Database(e.to_string()))?
+        };
+        
+        if members_with_info.is_empty() {
+            return Err(ProtocolError::TopicNotFound);
+        }
+        
+        let our_id = self.endpoint_id();
+        
+        // Get recipients (all members except us)
+        let recipients: Vec<MemberInfo> = members_with_info
+            .into_iter()
+            .filter(|m| m.endpoint_id != our_id)
+            .map(|m| MemberInfo {
+                endpoint_id: m.endpoint_id,
+                relay_url: m.relay_url,
+            })
+            .collect();
+        
+        if recipients.is_empty() {
+            return Ok(()); // No one to send to
+        }
+        
+        // Encode as SyncUpdate message
+        let msg = TopicMessage::SyncUpdate(SyncUpdateMessage { data });
+        let encoded = msg.encode();
+        
+        // Broadcast to all members
+        self.send_raw_with_info(topic_id, &encoded, &recipients, HarborPacketType::Content)
+            .await
+    }
+    
+    /// Request sync state from topic members
+    ///
+    /// Broadcasts a sync request to all members. When peers respond,
+    /// you'll receive `ProtocolEvent::SyncResponse` events.
+    pub async fn request_sync(
+        &self,
+        topic_id: &[u8; 32],
+    ) -> Result<(), ProtocolError> {
+        use crate::data::get_topic_members_with_info;
+        use crate::network::harbor::protocol::HarborPacketType;
+        use crate::network::membership::messages::TopicMessage;
+        use super::types::MemberInfo;
+        
+        self.check_running().await?;
+        
+        // Get topic members
+        let members_with_info = {
+            let db = self.db.lock().await;
+            get_topic_members_with_info(&db, topic_id)
+                .map_err(|e| ProtocolError::Database(e.to_string()))?
+        };
+        
+        if members_with_info.is_empty() {
+            return Err(ProtocolError::TopicNotFound);
+        }
+        
+        let our_id = self.endpoint_id();
+        
+        // Get recipients (all members except us)
+        let recipients: Vec<MemberInfo> = members_with_info
+            .into_iter()
+            .filter(|m| m.endpoint_id != our_id)
+            .map(|m| MemberInfo {
+                endpoint_id: m.endpoint_id,
+                relay_url: m.relay_url,
+            })
+            .collect();
+        
+        if recipients.is_empty() {
+            return Ok(()); // No one to request from
+        }
+        
+        // Encode as SyncRequest message (no payload)
+        let msg = TopicMessage::SyncRequest;
+        let encoded = msg.encode();
+        
+        info!(
+            topic = %hex::encode(&topic_id[..8]),
+            recipients = recipients.len(),
+            "Broadcasting sync request"
+        );
+        
+        // Broadcast to all members
+        self.send_raw_with_info(topic_id, &encoded, &recipients, HarborPacketType::Content)
+            .await
+    }
+    
+    /// Respond to a sync request with current state
+    ///
+    /// Call this when you receive `ProtocolEvent::SyncRequest`.
+    /// Uses direct connection - no size limit.
+    pub async fn respond_sync(
+        &self,
+        topic_id: &[u8; 32],
+        requester_id: &[u8; 32],
+        data: Vec<u8>,
+    ) -> Result<(), ProtocolError> {
+        use crate::network::membership::messages::{TopicMessage, SyncResponseMessage};
+        use crate::network::send::protocol::{SendMessage, SEND_ALPN};
+        use crate::security::create_packet;
+        
+        self.check_running().await?;
+        
+        // Encode as SyncResponse message
+        let msg = TopicMessage::SyncResponse(SyncResponseMessage { data });
+        let encoded = msg.encode();
+        
+        // Create packet
+        let packet = create_packet(
+            topic_id,
+            &self.identity.private_key,
+            &self.identity.public_key,
+            &encoded,
+        ).map_err(|e| ProtocolError::Network(e.to_string()))?;
+        
+        // Encode for wire
+        let wire_msg = SendMessage::Packet(packet);
+        let wire_bytes = wire_msg.encode();
+        
+        // Connect to requester
+        let node_id = iroh::NodeId::from_bytes(requester_id)
+            .map_err(|e| ProtocolError::Network(format!("invalid node id: {}", e)))?;
+        
+        let conn = self.endpoint
+            .connect(node_id, SEND_ALPN)
+            .await
+            .map_err(|e| ProtocolError::Network(format!("connection failed: {}", e)))?;
+        
+        let mut send = conn
+            .open_uni()
+            .await
+            .map_err(|e| ProtocolError::Network(format!("failed to open stream: {}", e)))?;
+        
+        tokio::io::AsyncWriteExt::write_all(&mut send, &wire_bytes)
+            .await
+            .map_err(|e| ProtocolError::Network(format!("failed to write: {}", e)))?;
+        
+        send.finish()
+            .map_err(|e| ProtocolError::Network(format!("failed to finish: {}", e)))?;
+        
+        info!(
+            topic = %hex::encode(&topic_id[..8]),
+            requester = %hex::encode(&requester_id[..8]),
+            size = encoded.len(),
+            "Sent sync response"
+        );
+        
         Ok(())
     }
 

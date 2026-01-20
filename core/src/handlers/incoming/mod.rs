@@ -13,7 +13,6 @@ mod send;
 mod share;
 mod sync;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,7 +27,6 @@ use crate::network::harbor::protocol::HARBOR_ALPN;
 use crate::network::send::protocol::SEND_ALPN;
 use crate::network::share::protocol::SHARE_ALPN;
 use crate::network::sync::protocol::SYNC_ALPN;
-use crate::protocol::sync::SyncManager;
 
 use crate::protocol::{ProtocolEvent, Protocol};
 
@@ -44,7 +42,6 @@ impl Protocol {
         running: Arc<RwLock<bool>>,
         dht_client: Option<DhtApiClient>,
         blob_store: Option<Arc<BlobStore>>,
-        sync_managers: Arc<RwLock<HashMap<[u8; 32], SyncManager>>>,
     ) {
         loop {
             // Check if we should stop
@@ -91,12 +88,11 @@ impl Protocol {
                 // Handle Send protocol
                 let db = db.clone();
                 let event_tx = event_tx.clone();
-                let sync_managers = sync_managers.clone();
 
                 tokio::spawn(async move {
                     trace!(sender = %hex::encode(sender_id), "starting Send connection handler");
                     if let Err(e) =
-                        Self::handle_send_connection(conn, db, event_tx, sender_id, our_id, sync_managers).await
+                        Self::handle_send_connection(conn, db, event_tx, sender_id, our_id).await
                     {
                         debug!(error = %e, sender = %hex::encode(sender_id), "Send connection handler error");
                     }
@@ -144,16 +140,15 @@ impl Protocol {
                     }
                 });
             } else if alpn.as_deref() == Some(SYNC_ALPN) {
-                // Handle Sync protocol (CRDT initial sync requests and responses)
+                // Handle Sync protocol (sync requests and responses)
                 info!(sender = %hex::encode(&sender_id[..8]), "INCOMING: received SYNC_ALPN connection");
                 let endpoint_clone = endpoint.clone();
                 let event_tx = event_tx.clone();
-                let sync_managers = sync_managers.clone();
 
                 tokio::spawn(async move {
                     info!(sender = %hex::encode(&sender_id[..8]), "INCOMING: starting Sync connection handler");
                     if let Err(e) =
-                        Self::handle_sync_connection(conn, endpoint_clone, event_tx, sync_managers, sender_id).await
+                        Self::handle_sync_connection(conn, endpoint_clone, event_tx, sender_id).await
                     {
                         debug!(error = %e, sender = %hex::encode(sender_id), "Sync connection handler error");
                     }
