@@ -15,6 +15,7 @@ use harbor_core::{
 pub struct AppState {
     protocol: Arc<Mutex<Option<Protocol>>>,
     event_rx: Arc<Mutex<Option<mpsc::Receiver<ProtocolEvent>>>>,
+    frontend_log_path: Arc<Mutex<Option<std::path::PathBuf>>>,
 }
 
 impl Default for AppState {
@@ -22,6 +23,7 @@ impl Default for AppState {
         Self {
             protocol: Arc::new(Mutex::new(None)),
             event_rx: Arc::new(Mutex::new(None)),
+            frontend_log_path: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -75,6 +77,42 @@ pub struct FileCompleteEventFE {
     total_size: u64,
 }
 
+/// Sync update event for frontend (includes raw bytes)
+#[derive(Serialize, Clone)]
+pub struct SyncUpdateEventFE {
+    topic_id: String,
+    sender_id: String,
+    #[serde(with = "serde_bytes_as_array")]
+    data: Vec<u8>,
+}
+
+/// Sync request event for frontend
+#[derive(Serialize, Clone)]
+pub struct SyncRequestEventFE {
+    topic_id: String,
+    sender_id: String,
+}
+
+/// Sync response event for frontend (includes raw bytes)
+#[derive(Serialize, Clone)]
+pub struct SyncResponseEventFE {
+    topic_id: String,
+    #[serde(with = "serde_bytes_as_array")]
+    data: Vec<u8>,
+}
+
+// Helper module for serializing Vec<u8> as array
+mod serde_bytes_as_array {
+    use serde::{Serializer, Serialize};
+
+    pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        bytes.serialize(serializer)
+    }
+}
+
 /// Combined event type for frontend
 #[derive(Serialize, Clone)]
 #[serde(tag = "type")]
@@ -83,6 +121,9 @@ pub enum AppEvent {
     FileAnnounced(FileAnnouncedEventFE),
     FileProgress(FileProgressEventFE),
     FileComplete(FileCompleteEventFE),
+    SyncUpdate(SyncUpdateEventFE),
+    SyncRequest(SyncRequestEventFE),
+    SyncResponse(SyncResponseEventFE),
 }
 
 /// Fixed database key for persistent identity (32 bytes)
@@ -108,9 +149,16 @@ async fn start_protocol(state: State<'_, AppState>) -> Result<StartResponse, Str
     
     // Use fixed db_key for persistent identity
     // Add bootstrap node so we can join the DHT network
-    let config = ProtocolConfig::for_testing()
+    // Check for HARBOR_DB_PATH env var to allow multiple instances
+    let mut config = ProtocolConfig::for_testing()
         .with_db_key(DB_KEY)
         .with_bootstrap_node(bootstrap_id.to_string());
+
+    // Allow overriding db path via environment variable for running multiple instances
+    if let Ok(db_path) = std::env::var("HARBOR_DB_PATH") {
+        println!("Using custom database path: {}", db_path);
+        config = config.with_db_path(db_path.into());
+    }
     
     let protocol = Protocol::start(config)
         .await
@@ -171,6 +219,16 @@ async fn start_protocol(state: State<'_, AppState>) -> Result<StartResponse, Str
     }
 
     *protocol_guard = Some(protocol);
+
+    // Set up frontend log file path if using custom db
+    if let Ok(db_path) = std::env::var("HARBOR_DB_PATH") {
+        let path = std::path::Path::new(&db_path);
+        if let Some(parent) = path.parent() {
+            let log_path = parent.join("frontend.log");
+            let mut log_guard = state.frontend_log_path.lock().await;
+            *log_guard = Some(log_path);
+        }
+    }
 
     Ok(StartResponse { endpoint_id })
 }
@@ -240,14 +298,14 @@ async fn join_topic(state: State<'_, AppState>, invite_hex: String) -> Result<To
 async fn leave_topic(state: State<'_, AppState>, topic_id: String) -> Result<(), String> {
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
-    
+
     let topic_bytes = hex::decode(&topic_id)
         .map_err(|e| e.to_string())?;
-    
+
     if topic_bytes.len() != 32 {
         return Err("Invalid topic ID length".to_string());
     }
-    
+
     let mut topic_arr = [0u8; 32];
     topic_arr.copy_from_slice(&topic_bytes);
 
@@ -317,20 +375,21 @@ async fn get_invite(state: State<'_, AppState>, topic_id: String) -> Result<Stri
     invite.to_hex().map_err(|e| e.to_string())
 }
 
-/// Poll for new events (messages + file events)
+/// Poll for new events (messages + file events + sync events)
 #[tauri::command]
 async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String> {
     let mut rx_guard = state.event_rx.lock().await;
     let rx = rx_guard.as_mut().ok_or("No event receiver")?;
-    
+
     let mut events = Vec::new();
-    
+
     // Non-blocking receive of all available events
     loop {
         match rx.try_recv() {
             Ok(event) => {
                 let app_event = match event {
                     ProtocolEvent::Message(msg) => {
+                        println!("[poll_events] Message event - topic: {}", hex::encode(&msg.topic_id[..4]));
                         AppEvent::Message(MessageEvent {
                             topic_id: hex::encode(msg.topic_id),
                             sender_id: hex::encode(msg.sender_id),
@@ -339,6 +398,7 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                         })
                     }
                     ProtocolEvent::FileAnnounced(ev) => {
+                        println!("[poll_events] FileAnnounced event - hash: {}", hex::encode(&ev.hash[..4]));
                         AppEvent::FileAnnounced(FileAnnouncedEventFE {
                             topic_id: hex::encode(ev.topic_id),
                             source_id: hex::encode(ev.source_id),
@@ -357,10 +417,46 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                         })
                     }
                     ProtocolEvent::FileComplete(ev) => {
+                        println!("[poll_events] FileComplete event - hash: {}", hex::encode(&ev.hash[..4]));
                         AppEvent::FileComplete(FileCompleteEventFE {
                             hash: hex::encode(ev.hash),
                             display_name: ev.display_name,
                             total_size: ev.total_size,
+                        })
+                    }
+                    ProtocolEvent::SyncUpdate(ev) => {
+                        println!("[poll_events] SyncUpdate event - topic: {}, sender: {}, size: {} bytes",
+                            hex::encode(&ev.topic_id[..4]),
+                            hex::encode(&ev.sender_id[..4]),
+                            ev.data.len()
+                        );
+                        // Pass through to frontend - it will handle with Loro
+                        AppEvent::SyncUpdate(SyncUpdateEventFE {
+                            topic_id: hex::encode(ev.topic_id),
+                            sender_id: hex::encode(ev.sender_id),
+                            data: ev.data,
+                        })
+                    }
+                    ProtocolEvent::SyncRequest(ev) => {
+                        println!("[poll_events] SyncRequest event - topic: {}, sender: {}",
+                            hex::encode(&ev.topic_id[..4]),
+                            hex::encode(&ev.sender_id[..4])
+                        );
+                        // Pass through to frontend - it will export and respond
+                        AppEvent::SyncRequest(SyncRequestEventFE {
+                            topic_id: hex::encode(ev.topic_id),
+                            sender_id: hex::encode(ev.sender_id),
+                        })
+                    }
+                    ProtocolEvent::SyncResponse(ev) => {
+                        println!("[poll_events] SyncResponse event - topic: {}, size: {} bytes",
+                            hex::encode(&ev.topic_id[..4]),
+                            ev.data.len()
+                        );
+                        // Pass through to frontend - it will import the snapshot
+                        AppEvent::SyncResponse(SyncResponseEventFE {
+                            topic_id: hex::encode(ev.topic_id),
+                            data: ev.data,
                         })
                     }
                 };
@@ -372,7 +468,11 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
             }
         }
     }
-    
+
+    if !events.is_empty() {
+        println!("[poll_events] Returning {} events to frontend", events.len());
+    }
+
     Ok(events)
 }
 
@@ -530,10 +630,183 @@ async fn export_file(
         .map_err(|e| e.to_string())
 }
 
+// ============================================================================
+// Sync Commands (Pass-through to Harbor Protocol)
+// ============================================================================
+
+/// Send a sync update (CRDT delta bytes) to all topic members
+#[tauri::command]
+async fn sync_send_update(
+    state: State<'_, AppState>,
+    topic_id: String,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    println!("[sync_send_update] Called for topic: {}", &topic_id[..16]);
+    println!("[sync_send_update] Data size: {} bytes", data.len());
+
+    let protocol_guard = state.protocol.lock().await;
+    let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
+
+    let topic_bytes = hex::decode(&topic_id)
+        .map_err(|e| e.to_string())?;
+
+    if topic_bytes.len() != 32 {
+        return Err("Invalid topic ID length".to_string());
+    }
+
+    let mut topic_arr = [0u8; 32];
+    topic_arr.copy_from_slice(&topic_bytes);
+
+    println!("[sync_send_update] Calling protocol.send_sync_update...");
+    protocol.send_sync_update(&topic_arr, data)
+        .await
+        .map_err(|e| {
+            println!("[sync_send_update] ✗ Error: {}", e);
+            e.to_string()
+        })?;
+
+    println!("[sync_send_update] ✓ Success");
+    Ok(())
+}
+
+/// Request sync state from all topic members
+#[tauri::command]
+async fn sync_request(
+    state: State<'_, AppState>,
+    topic_id: String,
+) -> Result<(), String> {
+    println!("[sync_request] Called for topic: {}", &topic_id[..16]);
+
+    let protocol_guard = state.protocol.lock().await;
+    let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
+
+    let topic_bytes = hex::decode(&topic_id)
+        .map_err(|e| e.to_string())?;
+
+    if topic_bytes.len() != 32 {
+        return Err("Invalid topic ID length".to_string());
+    }
+
+    let mut topic_arr = [0u8; 32];
+    topic_arr.copy_from_slice(&topic_bytes);
+
+    println!("[sync_request] Calling protocol.request_sync...");
+    protocol.request_sync(&topic_arr)
+        .await
+        .map_err(|e| {
+            println!("[sync_request] ✗ Error: {}", e);
+            e.to_string()
+        })?;
+
+    println!("[sync_request] ✓ Success");
+    Ok(())
+}
+
+/// Respond to a sync request with full CRDT state
+#[tauri::command]
+async fn sync_respond(
+    state: State<'_, AppState>,
+    topic_id: String,
+    requester_id: String,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    println!("[sync_respond] Called for topic: {}", &topic_id[..16]);
+    println!("[sync_respond] Requester: {}", &requester_id[..16]);
+    println!("[sync_respond] Data size: {} bytes", data.len());
+
+    let protocol_guard = state.protocol.lock().await;
+    let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
+
+    let topic_bytes = hex::decode(&topic_id)
+        .map_err(|e| e.to_string())?;
+    let requester_bytes = hex::decode(&requester_id)
+        .map_err(|e| e.to_string())?;
+
+    if topic_bytes.len() != 32 || requester_bytes.len() != 32 {
+        return Err("Invalid ID length".to_string());
+    }
+
+    let mut topic_arr = [0u8; 32];
+    let mut requester_arr = [0u8; 32];
+    topic_arr.copy_from_slice(&topic_bytes);
+    requester_arr.copy_from_slice(&requester_bytes);
+
+    println!("[sync_respond] Calling protocol.respond_sync...");
+    protocol.respond_sync(&topic_arr, &requester_arr, data)
+        .await
+        .map_err(|e| {
+            println!("[sync_respond] ✗ Error: {}", e);
+            e.to_string()
+        })?;
+
+    println!("[sync_respond] ✓ Success");
+    Ok(())
+}
+
+/// Write a log message to the frontend log file
+#[tauri::command]
+async fn write_frontend_log(state: State<'_, AppState>, message: String) -> Result<(), String> {
+    let log_guard = state.frontend_log_path.lock().await;
+
+    if let Some(ref log_path) = *log_guard {
+        use std::io::Write;
+
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let log_line = format!("[{}] {}\n", timestamp, message);
+
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            let _ = file.write_all(log_line.as_bytes());
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Initialize tracing - write to file if HARBOR_DB_PATH is set
+    // Use try_init() to avoid panic if already initialized
+    if let Ok(db_path) = std::env::var("HARBOR_DB_PATH") {
+        // Extract instance directory from db path (e.g., "./test-data/instance1/harbor.db" -> "./test-data/instance1")
+        let path = std::path::Path::new(&db_path);
+        if let Some(parent) = path.parent() {
+            // Create the directory if it doesn't exist
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("Failed to create log directory: {}", e);
+                let _ = tracing_subscriber::fmt::try_init();
+            } else {
+                let log_path = parent.join("app.log");
+                println!("Logging to: {}", log_path.display());
+
+                // Create log file
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    Ok(log_file) => {
+                        // Initialize tracing with file output
+                        let _ = tracing_subscriber::fmt()
+                            .with_writer(std::sync::Mutex::new(log_file))
+                            .with_ansi(false)
+                            .try_init();
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to create log file: {}", e);
+                        let _ = tracing_subscriber::fmt::try_init();
+                    }
+                }
+            }
+        } else {
+            let _ = tracing_subscriber::fmt::try_init();
+        }
+    } else {
+        let _ = tracing_subscriber::fmt::try_init();
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -559,6 +832,12 @@ pub fn run() {
             // File Sharing
             share_file,
             export_file,
+            // Sync Commands
+            sync_send_update,
+            sync_request,
+            sync_respond,
+            // Logging
+            write_frontend_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

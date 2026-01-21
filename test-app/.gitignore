@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Test data directories for multiple instances
+test-data/*
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

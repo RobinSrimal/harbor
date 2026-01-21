@@ -9,6 +9,7 @@
 //! - Harbor cache
 //! - Packet deduplication
 //! - File sharing (blobs)
+//! - CRDT sync documents
 //!
 //! Organized by protocol domain (mirrors network/ structure):
 //! - `dht/` - Peer information and DHT routing
@@ -16,6 +17,7 @@
 //! - `harbor/` - Harbor cache and deduplication
 //! - `membership/` - Topic subscriptions and members
 //! - `share/` - File sharing metadata and blob storage
+//! - `sync/` - CRDT document persistence (WAL + snapshots)
 
 pub mod dht;
 pub mod harbor;

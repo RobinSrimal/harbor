@@ -19,7 +19,7 @@ use crate::network::share::protocol::{
 };
 
 use super::core::Protocol;
-use super::types::ProtocolError;
+use super::error::ProtocolError;
 
 /// Status of a file share operation
 #[derive(Debug, Clone)]

@@ -6,6 +6,7 @@
 //! - `handlers/`: Connection handling (incoming/outgoing)
 //! - `tasks/`: Background automation
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,13 +18,15 @@ use tracing::info;
 use crate::data::{get_or_create_identity, start_db, LocalIdentity};
 use crate::network::dht::{
     bootstrap_dial_info, bootstrap_node_ids, create_dht_node_with_buckets, ApiClient as DhtApiClient,
-    Buckets, DhtConfig, DhtPool, DialInfo, PoolConfig, RpcClient as DhtRpcClient, DHT_ALPN,
+    Buckets, DhtConfig, DhtPool, DhtPoolConfig, DialInfo, RpcClient as DhtRpcClient, DHT_ALPN,
 };
 use crate::network::harbor::protocol::HARBOR_ALPN;
-use crate::network::send::protocol::SEND_ALPN;
+use crate::network::send::{SendPool, SendPoolConfig, protocol::SEND_ALPN};
+use crate::network::sync::protocol::SYNC_ALPN;
 
 use super::config::ProtocolConfig;
-use super::types::{ProtocolError, ProtocolEvent};
+use super::error::ProtocolError;
+use super::events::ProtocolEvent;
 
 /// Maximum message size (512 KB)
 pub const MAX_MESSAGE_SIZE: usize = 512 * 1024;
@@ -55,6 +58,8 @@ pub struct Protocol {
     dht_rpc_client: Option<DhtRpcClient>,
     /// DHT client for finding Harbor Nodes
     pub(crate) dht_client: Option<DhtApiClient>,
+    /// Send protocol connection pool
+    pub(crate) send_pool: SendPool,
     /// Event sender (for app notifications: messages, file events, etc.)
     pub(crate) event_tx: mpsc::Sender<ProtocolEvent>,
     /// Event receiver (cloneable via Arc)
@@ -106,14 +111,16 @@ impl Protocol {
 
         // Create Iroh endpoint with our identity's secret key
         let secret_key = iroh::SecretKey::from_bytes(&identity.private_key);
+        let alpns = vec![
+            SEND_ALPN.to_vec(),
+            HARBOR_ALPN.to_vec(),
+            DHT_ALPN.to_vec(),
+            crate::network::share::SHARE_ALPN.to_vec(),
+            SYNC_ALPN.to_vec(),
+        ];
         let endpoint = Endpoint::builder()
             .secret_key(secret_key)
-            .alpns(vec![
-                SEND_ALPN.to_vec(),
-                HARBOR_ALPN.to_vec(),
-                DHT_ALPN.to_vec(),
-                crate::network::share::SHARE_ALPN.to_vec(),
-            ])
+            .alpns(alpns)
             .bind()
             .await
             .map_err(|e| ProtocolError::StartFailed(format!("failed to create endpoint: {}", e)))?;
@@ -122,7 +129,7 @@ impl Protocol {
 
         // Initialize DHT
         let local_dht_id = crate::network::dht::Id::new(identity.public_key);
-        let dht_pool = DhtPool::new(endpoint.clone(), PoolConfig::default());
+        let dht_pool = DhtPool::new(endpoint.clone(), DhtPoolConfig::default());
 
         // Parse and register bootstrap nodes from config
         let mut bootstrap_ids: Vec<crate::network::dht::Id> = Vec::new();
@@ -258,6 +265,9 @@ impl Protocol {
         let dht_rpc_client = Some(dht_rpc_client);
         let dht_client = Some(dht_client);
 
+        // Initialize Send connection pool
+        let send_pool = SendPool::new(endpoint.clone(), SendPoolConfig::default());
+
         let protocol = Self {
             config,
             endpoint,
@@ -265,6 +275,7 @@ impl Protocol {
             db: Arc::new(Mutex::new(db)),
             dht_rpc_client,
             dht_client,
+            send_pool,
             event_tx,
             event_rx: Arc::new(RwLock::new(Some(event_rx))),
             running: Arc::new(RwLock::new(true)),
@@ -339,17 +350,17 @@ impl Protocol {
     /// 
     /// Returns the configured blob path, or derives one from the db path,
     /// or falls back to the system default.
-    pub fn blob_path(&self) -> std::path::PathBuf {
+    pub fn blob_path(&self) -> PathBuf {
         if let Some(ref path) = self.config.blob_path {
             path.clone()
         } else if let Some(ref db_path) = self.config.db_path {
             // Derive from db_path: .harbor_blobs/ next to database
             db_path.parent()
                 .map(|p| p.join(".harbor_blobs"))
-                .unwrap_or_else(|| std::path::PathBuf::from(".harbor_blobs"))
+                .unwrap_or_else(|| PathBuf::from(".harbor_blobs"))
         } else {
             // Fall back to system default
-            crate::data::default_blob_path().unwrap_or_else(|_| std::path::PathBuf::from(".harbor_blobs"))
+            crate::data::default_blob_path().unwrap_or_else(|_| PathBuf::from(".harbor_blobs"))
         }
     }
 
@@ -359,6 +370,184 @@ impl Protocol {
         if !*running {
             return Err(ProtocolError::NotRunning);
         }
+        Ok(())
+    }
+    
+    // ========== Sync Transport API (NEW) ==========
+    //
+    // These methods provide sync transport without internal CRDT handling.
+    // Applications bring their own CRDT (Loro, Yjs, Automerge, etc.).
+    
+    /// Send a sync update to all topic members
+    ///
+    /// The `data` bytes are opaque to Harbor - application provides
+    /// serialized CRDT updates (Loro delta, Yjs update, etc.)
+    /// 
+    /// Max size: 512 KB (uses broadcast via send protocol)
+    pub async fn send_sync_update(
+        &self,
+        topic_id: &[u8; 32],
+        data: Vec<u8>,
+    ) -> Result<(), ProtocolError> {
+        use crate::data::get_topic_members_with_info;
+        use crate::network::harbor::protocol::HarborPacketType;
+        use crate::network::membership::messages::{TopicMessage, SyncUpdateMessage};
+        use super::types::MemberInfo;
+        
+        self.check_running().await?;
+        
+        // Check size limit
+        if data.len() > MAX_MESSAGE_SIZE {
+            return Err(ProtocolError::MessageTooLarge);
+        }
+        
+        // Get topic members
+        let members_with_info = {
+            let db = self.db.lock().await;
+            get_topic_members_with_info(&db, topic_id)
+                .map_err(|e| ProtocolError::Database(e.to_string()))?
+        };
+        
+        if members_with_info.is_empty() {
+            return Err(ProtocolError::TopicNotFound);
+        }
+        
+        let our_id = self.endpoint_id();
+        
+        // Get recipients (all members except us)
+        let recipients: Vec<MemberInfo> = members_with_info
+            .into_iter()
+            .filter(|m| m.endpoint_id != our_id)
+            .map(|m| MemberInfo {
+                endpoint_id: m.endpoint_id,
+                relay_url: m.relay_url,
+            })
+            .collect();
+        
+        if recipients.is_empty() {
+            return Ok(()); // No one to send to
+        }
+        
+        // Encode as SyncUpdate message
+        let msg = TopicMessage::SyncUpdate(SyncUpdateMessage { data });
+        let encoded = msg.encode();
+        
+        // Broadcast to all members
+        self.send_raw_with_info(topic_id, &encoded, &recipients, HarborPacketType::Content)
+            .await
+    }
+    
+    /// Request sync state from topic members
+    ///
+    /// Broadcasts a sync request to all members. When peers respond,
+    /// you'll receive `ProtocolEvent::SyncResponse` events.
+    pub async fn request_sync(
+        &self,
+        topic_id: &[u8; 32],
+    ) -> Result<(), ProtocolError> {
+        use crate::data::get_topic_members_with_info;
+        use crate::network::harbor::protocol::HarborPacketType;
+        use crate::network::membership::messages::TopicMessage;
+        use super::types::MemberInfo;
+        
+        self.check_running().await?;
+        
+        // Get topic members
+        let members_with_info = {
+            let db = self.db.lock().await;
+            get_topic_members_with_info(&db, topic_id)
+                .map_err(|e| ProtocolError::Database(e.to_string()))?
+        };
+        
+        if members_with_info.is_empty() {
+            return Err(ProtocolError::TopicNotFound);
+        }
+        
+        let our_id = self.endpoint_id();
+        
+        // Get recipients (all members except us)
+        let recipients: Vec<MemberInfo> = members_with_info
+            .into_iter()
+            .filter(|m| m.endpoint_id != our_id)
+            .map(|m| MemberInfo {
+                endpoint_id: m.endpoint_id,
+                relay_url: m.relay_url,
+            })
+            .collect();
+        
+        if recipients.is_empty() {
+            return Ok(()); // No one to request from
+        }
+        
+        // Encode as SyncRequest message (no payload)
+        let msg = TopicMessage::SyncRequest;
+        let encoded = msg.encode();
+        
+        info!(
+            topic = %hex::encode(&topic_id[..8]),
+            recipients = recipients.len(),
+            "Broadcasting sync request"
+        );
+        
+        // Broadcast to all members
+        self.send_raw_with_info(topic_id, &encoded, &recipients, HarborPacketType::Content)
+            .await
+    }
+    
+    /// Respond to a sync request with current state
+    ///
+    /// Call this when you receive `ProtocolEvent::SyncRequest`.
+    /// Uses direct SYNC_ALPN connection - no size limit.
+    pub async fn respond_sync(
+        &self,
+        topic_id: &[u8; 32],
+        requester_id: &[u8; 32],
+        data: Vec<u8>,
+    ) -> Result<(), ProtocolError> {
+        self.check_running().await?;
+
+        // Build raw SYNC_ALPN message format:
+        // [32 bytes topic_id][1 byte type = 0x02][data]
+        let mut message = Vec::with_capacity(32 + 1 + data.len());
+        message.extend_from_slice(topic_id);
+        message.push(0x02); // SyncResponse type
+        message.extend_from_slice(&data);
+
+        // Connect to requester via SYNC_ALPN
+        let node_id = iroh::NodeId::from_bytes(requester_id)
+            .map_err(|e| ProtocolError::Network(format!("invalid node id: {}", e)))?;
+
+        let conn = self.endpoint
+            .connect(node_id, SYNC_ALPN)
+            .await
+            .map_err(|e| ProtocolError::Network(format!("connection failed: {}", e)))?;
+
+        let mut send = conn
+            .open_uni()
+            .await
+            .map_err(|e| ProtocolError::Network(format!("failed to open stream: {}", e)))?;
+
+        tokio::io::AsyncWriteExt::write_all(&mut send, &message)
+            .await
+            .map_err(|e| ProtocolError::Network(format!("failed to write: {}", e)))?;
+
+        // Finish the stream - this signals we're done sending
+        send.finish()
+            .map_err(|e| ProtocolError::Network(format!("failed to finish: {}", e)))?;
+
+        // Wait for the stream to actually be transmitted before dropping connection
+        // stopped() completes when the peer has received and acknowledged the data
+        send.stopped()
+            .await
+            .map_err(|e| ProtocolError::Network(format!("stream error: {}", e)))?;
+
+        info!(
+            topic = %hex::encode(&topic_id[..8]),
+            requester = %hex::encode(&requester_id[..8]),
+            size = data.len(),
+            "Sent sync response via SYNC_ALPN"
+        );
+
         Ok(())
     }
 

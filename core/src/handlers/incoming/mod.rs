@@ -5,11 +5,13 @@
 //! - DHT_ALPN: DHT protocol (FindNode requests)
 //! - HARBOR_ALPN: Harbor protocol (store, pull, sync)
 //! - SHARE_ALPN: File sharing protocol (chunks, bitfields)
+//! - SYNC_ALPN: CRDT sync protocol (initial sync responses)
 
 mod dht;
 mod harbor;
 mod send;
 mod share;
+mod sync;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +26,7 @@ use crate::network::dht::{ApiClient as DhtApiClient, DHT_ALPN};
 use crate::network::harbor::protocol::HARBOR_ALPN;
 use crate::network::send::protocol::SEND_ALPN;
 use crate::network::share::protocol::SHARE_ALPN;
+use crate::network::sync::protocol::SYNC_ALPN;
 
 use crate::protocol::{ProtocolEvent, Protocol};
 
@@ -134,6 +137,20 @@ impl Protocol {
                         }
                     } else {
                         debug!("Share connection received but blob store not initialized");
+                    }
+                });
+            } else if alpn.as_deref() == Some(SYNC_ALPN) {
+                // Handle Sync protocol (sync requests and responses)
+                info!(sender = %hex::encode(&sender_id[..8]), "INCOMING: received SYNC_ALPN connection");
+                let endpoint_clone = endpoint.clone();
+                let event_tx = event_tx.clone();
+
+                tokio::spawn(async move {
+                    info!(sender = %hex::encode(&sender_id[..8]), "INCOMING: starting Sync connection handler");
+                    if let Err(e) =
+                        Self::handle_sync_connection(conn, endpoint_clone, event_tx, sender_id).await
+                    {
+                        debug!(error = %e, sender = %hex::encode(sender_id), "Sync connection handler error");
                     }
                 });
             } else {

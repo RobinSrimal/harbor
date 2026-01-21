@@ -37,5 +37,11 @@ output.log
 # Iroh blob storage
 **/iroh-blobs/
 
+# Harbor blob storage
+**/.harbor_blobs/
+
+# Harbor sync storage (CRDT documents)
+**/.harbor_sync/
+
 # Archive directories (deprecated/old code)
 **/archive/

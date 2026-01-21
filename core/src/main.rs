@@ -39,7 +39,8 @@ fn print_usage() {
     println!("  --api-port <PORT>           Enable HTTP API on this port");
     println!("  --bootstrap <ID:RELAY>      Use this bootstrap node (replaces defaults)");
     println!("  --no-default-bootstrap      Don't use any bootstrap (for first node)");
-    println!("  --testing                   Use shorter intervals (5-10s) for testing");
+    println!("  --testing                   Use shorter intervals (5-10s) for testing, enables sync");
+    println!("  --sync                      Enable CRDT sync feature");
     println!("  --help, -h                  Show this help");
     println!();
     println!("API Endpoints (when --api-port is set):");
@@ -58,6 +59,13 @@ fn print_usage() {
     println!("  POST /api/share/export      Export blob to file (JSON: hash, dest_path)");
     println!("  GET  /api/share/status/:hash Get share progress");
     println!("  GET  /api/share/blobs/:topic List blobs for topic");
+    println!();
+    println!("Sync Endpoints (CRDT collaboration):");
+    println!("  POST /api/sync/enable       Enable sync for topic (JSON: topic)");
+    println!("  POST /api/sync/text/insert  Insert text (JSON: topic, container, index, text)");
+    println!("  POST /api/sync/text/delete  Delete text (JSON: topic, container, index, len)");
+    println!("  GET  /api/sync/text/:topic/:container  Get text value");
+    println!("  GET  /api/sync/status/:topic Get sync status");
     println!();
     println!("Environment:");
     println!("  RUST_LOG                    Set log level (e.g., info, debug)");
@@ -301,6 +309,28 @@ async fn main() {
                                 "File complete"
                             );
                         }
+                        harbor_core::ProtocolEvent::SyncUpdate(ev) => {
+                            debug!(
+                                topic = %hex::encode(&ev.topic_id[..8]),
+                                sender = %hex::encode(&ev.sender_id[..8]),
+                                size = ev.data.len(),
+                                "Sync update received"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::SyncRequest(ev) => {
+                            debug!(
+                                topic = %hex::encode(&ev.topic_id[..8]),
+                                sender = %hex::encode(&ev.sender_id[..8]),
+                                "Sync request received"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::SyncResponse(ev) => {
+                            info!(
+                                topic = %hex::encode(&ev.topic_id[..8]),
+                                size = ev.data.len(),
+                                "Sync response received"
+                            );
+                        }
                     }
                 }
             } else {
@@ -509,7 +539,7 @@ async fn handle_request(protocol: &Protocol, bootstrap: &BootstrapInfo, request:
         let topic_hex = &path[17..]; // Strip "/api/share/blobs/"
         return handle_list_blobs(protocol, topic_hex).await;
     }
-
+    
     match (method, path) {
         ("POST", "/api/topic") => handle_create_topic(protocol).await,
         ("POST", "/api/join") => handle_join_topic(protocol, body).await,
@@ -518,6 +548,10 @@ async fn handle_request(protocol: &Protocol, bootstrap: &BootstrapInfo, request:
         ("POST", "/api/share") => handle_share_file(protocol, body).await,
         ("POST", "/api/share/pull") => handle_share_pull(protocol, body).await,
         ("POST", "/api/share/export") => handle_share_export(protocol, body).await,
+        // Sync transport endpoints
+        ("POST", "/api/sync/update") => handle_sync_update(protocol, body).await,
+        ("POST", "/api/sync/request") => handle_sync_request(protocol, body).await,
+        ("POST", "/api/sync/respond") => handle_sync_respond(protocol, body).await,
         ("GET", "/api/stats") => handle_stats(protocol).await,
         ("GET", "/api/topics") => handle_list_topics(protocol).await,
         ("GET", "/api/bootstrap") => handle_bootstrap(bootstrap),
@@ -841,6 +875,116 @@ async fn handle_share_export(protocol: &Protocol, body: &str) -> String {
     }
 }
 
+// ============================================================================
+// Sync API Handlers
+// ============================================================================
+
+/// Send a sync update to all topic members
+/// POST /api/sync/update
+/// Body: {"topic": "hex...", "data": "hex-encoded-crdt-update"}
+async fn handle_sync_update(protocol: &Protocol, body: &str) -> String {
+    let topic_hex = match extract_json_string(body, "topic") {
+        Some(t) => t,
+        None => return http_response(400, "Missing 'topic' field"),
+    };
+
+    let data_hex = match extract_json_string(body, "data") {
+        Some(d) => d,
+        None => return http_response(400, "Missing 'data' field"),
+    };
+
+    let topic_bytes = match hex::decode(&topic_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
+    };
+
+    let data = match hex::decode(&data_hex) {
+        Ok(d) => d,
+        Err(_) => return http_response(400, "Invalid hex data"),
+    };
+
+    match protocol.send_sync_update(&topic_bytes, data).await {
+        Ok(()) => http_response(200, "Sync update sent"),
+        Err(e) => http_response(500, &format!("Failed to send sync update: {}", e)),
+    }
+}
+
+/// Request sync state from topic members
+/// POST /api/sync/request
+/// Body: {"topic": "hex..."}
+async fn handle_sync_request(protocol: &Protocol, body: &str) -> String {
+    let topic_hex = match extract_json_string(body, "topic") {
+        Some(t) => t,
+        None => return http_response(400, "Missing 'topic' field"),
+    };
+
+    let topic_bytes = match hex::decode(&topic_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
+    };
+
+    match protocol.request_sync(&topic_bytes).await {
+        Ok(()) => http_response(200, "Sync request sent"),
+        Err(e) => http_response(500, &format!("Failed to request sync: {}", e)),
+    }
+}
+
+/// Respond to a sync request with current state
+/// POST /api/sync/respond
+/// Body: {"topic": "hex...", "requester": "hex...", "data": "hex-encoded-crdt-snapshot"}
+async fn handle_sync_respond(protocol: &Protocol, body: &str) -> String {
+    let topic_hex = match extract_json_string(body, "topic") {
+        Some(t) => t,
+        None => return http_response(400, "Missing 'topic' field"),
+    };
+
+    let requester_hex = match extract_json_string(body, "requester") {
+        Some(r) => r,
+        None => return http_response(400, "Missing 'requester' field"),
+    };
+
+    let data_hex = match extract_json_string(body, "data") {
+        Some(d) => d,
+        None => return http_response(400, "Missing 'data' field"),
+    };
+
+    let topic_bytes = match hex::decode(&topic_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
+    };
+
+    let requester_bytes = match hex::decode(&requester_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid requester ID (must be 64 hex chars)"),
+    };
+
+    let data = match hex::decode(&data_hex) {
+        Ok(d) => d,
+        Err(_) => return http_response(400, "Invalid hex data"),
+    };
+
+    match protocol.respond_sync(&topic_bytes, &requester_bytes, data).await {
+        Ok(()) => http_response(200, "Sync response sent"),
+        Err(e) => http_response(500, &format!("Failed to respond to sync: {}", e)),
+    }
+}
+
 fn http_response(status: u16, body: &str) -> String {
     let status_text = match status {
         200 => "OK",
@@ -893,3 +1037,4 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
         None
     }
 }
+

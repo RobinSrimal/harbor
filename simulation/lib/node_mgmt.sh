@@ -83,6 +83,8 @@ clear_data() {
             # Clear blob storage folders
             rm -rf "$dir/blobs"
             rm -rf "$dir/.harbor_blobs"
+            # Clear sync storage
+            rm -rf "$dir/.harbor_sync"
         fi
     done
     rm -f "$BOOTSTRAP_FILE"

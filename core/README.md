@@ -5,6 +5,7 @@ The foundation crate for Harbor Protocol - peer-to-peer topic-based messaging.
 ## Features
 
 - **Topic-based messaging**: Send encrypted messages to all members of a topic
+- **CRDT sync primitives**: Three sync operations for building collaborative applications (SyncUpdate, SyncRequest, SyncResponse)
 - **File sharing**: P2P distribution for large files (≥512KB) with BLAKE3 chunking
 - **Offline delivery**: Harbor Nodes store messages for offline members
 - **DHT routing**: Kademlia-style distributed hash table for peer discovery
@@ -56,18 +57,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```
 harbor-core/
-├── data/           # SQLCipher-encrypted storage
+├── data/           # SQLCipher-encrypted storage + file storage for Share
 ├── handlers/       # Incoming/outgoing message handlers
 ├── network/
 │   ├── dht/        # Kademlia DHT implementation
-│   ├── harbor/     # Harbor Node protocol (store, pull, sync)
+│   ├── harbor/     # Harbor Node protocol (store, pull, harbor sync)
 │   ├── membership/ # Topic join/leave messages
-│   ├── send/       # Direct message sending
-│   └── share/      # P2P file sharing protocol
-├── protocol/       # Core Protocol struct and API
+│   ├── send/       # Direct message sending (includes CRDT sync messages)
+│   ├── share/      # P2P file sharing protocol
+│   └── sync/       # CRDT sync protocol (direct peer-to-peer, no size limit)
+├── protocol/       # Core Protocol struct 
 ├── resilience/     # Rate limiting, PoW, storage limits
 ├── security/       # Cryptographic operations
-└── tasks/          # Background tasks (sync, maintenance, file pulls)
+└── tasks/          # Background tasks (harbor pull, share pull, maintenance)
 ```
 
 ## Core Concepts
@@ -133,6 +135,33 @@ protocol.export_file(&hash, "/path/to/output.mp4").await?;
 - `FileAnnounced` - A file was shared to the topic
 - `FileProgress` - Download progress update
 - `FileComplete` - All chunks received
+
+### Sync Primitives (CRDT Support)
+
+Harbor provides three primitives for building collaborative applications with CRDTs:
+
+```rust
+// Send a CRDT update (delta) to all topic members
+protocol.sync_send_update(&topic_id, update_bytes).await?;
+
+// Request full state from all topic members
+protocol.sync_request(&topic_id).await?;
+
+// Respond with full state to a specific peer (direct connection, no size limit)
+protocol.sync_respond(&topic_id, &requester_id, snapshot_bytes).await?;
+```
+
+**How it works:**
+1. **SyncUpdate**: Broadcasts CRDT deltas via Send protocol (max 512KB), replicated through Harbor Nodes
+2. **SyncRequest**: Broadcasts a request for full state to all members
+3. **SyncResponse**: Direct peer-to-peer transfer via dedicated SYNC_ALPN protocol (no size limit)
+
+**Events emitted:**
+- `SyncUpdate` - A CRDT update was received
+- `SyncRequest` - A peer is requesting full state
+- `SyncResponse` - Full state snapshot received
+
+**Example use case:** The test app uses these primitives with [Loro CRDT](https://loro.dev) for real-time collaborative text editing.
 
 ### Harbor Nodes
 

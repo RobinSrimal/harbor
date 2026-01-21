@@ -15,20 +15,21 @@ A topic-based message protocol for consumer apps built on [Iroh](https://iroh.co
 
 | Crate | Description | Status |
 |-------|-------------|--------|
-| [`harbor-core`](core/) | Core messaging protocol - peer connections, topics, Send mode, DHT, Harbor Nodes | ✅ Implemented |
-| [`harbor-sync`](sync/) | CRDT synchronization for collaborative data structures | 🚧 Planned |
+| [`harbor-core`](core/) | Core protocol with messaging, DHT, Harbor Nodes, and CRDT sync primitives | ✅ Implemented |
 | [`harbor-stream`](stream/) | Real-time audio/video streaming | 🚧 Planned |
 
 ```
-                       ┌──────────────┐
-                       │  harbor-core │ 
-                       └──────────────┘
-                              ↑
-              ┌───────────────┴───────────────┐
-              │                               │
-      ┌───────────────┐               ┌────────────────┐
-      │  harbor-sync  │               │ harbor-stream  │
-      └───────────────┘               └────────────────┘
+                       ┌──────────────────────────┐
+                       │      harbor-core         │
+                       │  • Messaging & Topics    │
+                       │  • DHT & Harbor Nodes    │
+                       │  • Sync Primitives       │
+                       └──────────────────────────┘
+                                    ↑
+                                    │
+                          ┌─────────────────┐
+                          │  harbor-stream  │
+                          └─────────────────┘
 ```
 
 ## Quick Start
@@ -88,27 +89,26 @@ npm run tauri dev
 
 ```
 harbor/
-├── core/               # harbor-core: Foundation protocol
+├── core/               # harbor-core: Core protocol with sync primitives
 │   └── src/
-│       ├── data/       # SQLCipher-encrypted storage
+│       ├── data/       # SQLCipher-encrypted storage + file storage for Share
 │       ├── handlers/   # Incoming/outgoing message handlers
-│       ├── network/    # Network protocols (DHT, Send, Harbor)
-│       ├── protocol/   # Core Protocol struct and API
+│       ├── network/    # Network protocols (DHT, Send, Harbor, Share, Sync)
+│       ├── protocol/   # Core Protocol struct and sync API
 │       ├── security/   # Cryptographic operations
-│       ├── tasks/      # Background tasks (sync, maintenance)
+│       ├── tasks/      # Background tasks (harbor pull, share pull, maintenance)
 │       └── resilience/ # Rate limiting, PoW, storage limits
-├── sync/               # harbor-sync: CRDT synchronization (planned)
 ├── stream/             # harbor-stream: Audio/video streaming (planned)
-└── test-app/           # Tauri desktop app for testing
-    ├── src/            # React frontend
+└── test-app/           # Tauri desktop app with Loro CRDT collaboration
+    ├── src/            # React frontend with Loro integration
     └── src-tauri/      # Tauri/Rust backend
 ```
 
 ---
 
-## Testing
+## Testing & Simulations
 
-### Running Tests
+### Unit Tests
 
 ```bash
 # Run all core protocol tests
@@ -119,6 +119,17 @@ cargo test -p harbor-core -- --nocapture
 
 # Run a specific test
 cargo test -p harbor-core test_name
+```
+
+### Integration Tests
+
+For detailed information on running simulations and integration tests, see [SIMULATIONS.md](SIMULATIONS.md).
+
+Quick start:
+```bash
+# Build and run all simulations
+cargo build -p harbor-core
+cd simulation && ./simulate.sh
 ```
 
 ---

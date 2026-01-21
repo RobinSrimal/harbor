@@ -1,0 +1,317 @@
+import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { LoroDoc } from "loro-crdt";
+import { LoroEditor } from "./LoroEditor";
+import { logger } from "./logger";
+import "./Document.css";
+
+interface DocumentProps {
+  isRunning: boolean;
+  endpointId: string | null;
+}
+
+interface TopicInfo {
+  topic_id: string;
+  members: string[];
+  invite_hex: string;
+}
+
+interface SyncUpdateEvent {
+  topic_id: string;
+  sender_id: string;
+  data: number[]; // Array of bytes
+}
+
+interface SyncRequestEvent {
+  topic_id: string;
+  sender_id: string;
+}
+
+interface SyncResponseEvent {
+  topic_id: string;
+  data: number[]; // Array of bytes
+}
+
+type AppEvent =
+  | { type: "SyncUpdate" } & SyncUpdateEvent
+  | { type: "SyncRequest" } & SyncRequestEvent
+  | { type: "SyncResponse" } & SyncResponseEvent
+  | { type: string; [key: string]: any };
+
+function Document({ isRunning, endpointId }: DocumentProps) {
+  const [currentTopic, setCurrentTopic] = useState<TopicInfo | null>(null);
+  const [joinInput, setJoinInput] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [loroDoc, setLoroDoc] = useState<LoroDoc | null>(null);
+
+  // Container name for the document
+  const CONTAINER = "main-doc";
+
+  // Initialize Loro document when topic is created/joined
+  useEffect(() => {
+    if (currentTopic && !loroDoc) {
+      logger.log("[DocumentLoro] Initializing new Loro document for topic:", currentTopic.topic_id);
+      const doc = new LoroDoc();
+
+      // Subscribe to LOCAL changes only and send updates
+      // Using subscribeLocalUpdates() ensures we only send sync updates for local edits,
+      // not for remote changes imported from other peers
+      doc.subscribeLocalUpdates((event) => {
+        if (!currentTopic) return;
+
+        logger.log("[DocumentLoro] Local change detected:", event);
+
+        // Export all operations as update
+        // Loro handles deduplication automatically on import
+        const delta = doc.export({ mode: "update" });
+
+        logger.log("[DocumentLoro] Update size:", delta.length, "bytes");
+
+        if (delta.length > 0) {
+          logger.log("[DocumentLoro] Sending sync update to Harbor...");
+          // Send update to Harbor
+          invoke("sync_send_update", {
+            topicId: currentTopic.topic_id,
+            data: Array.from(delta),
+          }).then(() => {
+            logger.log("[DocumentLoro] ✓ Sync update sent successfully");
+          }).catch((e) => {
+            logger.error("[DocumentLoro] ✗ Failed to send sync update:", e);
+          });
+        } else {
+          logger.log("[DocumentLoro] No delta to send (empty)");
+        }
+      });
+
+      setLoroDoc(doc);
+
+      // Request initial sync if joining existing topic
+      logger.log("[DocumentLoro] Requesting initial sync...");
+      invoke("sync_request", { topicId: currentTopic.topic_id }).then(() => {
+        logger.log("[DocumentLoro] ✓ Sync request sent");
+      }).catch((e) => {
+        logger.error("[DocumentLoro] ✗ Failed to request sync:", e);
+      });
+    }
+  }, [currentTopic, loroDoc]);
+
+  // Poll for Harbor events
+  useEffect(() => {
+    if (!isRunning || !currentTopic || !loroDoc) return;
+
+    logger.log("[DocumentLoro] Starting event polling for topic:", currentTopic.topic_id);
+
+    const interval = setInterval(async () => {
+      try {
+        const events = await invoke<AppEvent[]>("poll_events");
+
+        if (events.length > 0) {
+          logger.log("[DocumentLoro] ========================================");
+          logger.log("[DocumentLoro] Polled", events.length, "events");
+          logger.log("[DocumentLoro] ========================================");
+        }
+
+        for (const event of events) {
+          logger.log("[DocumentLoro] Processing event:", event.type);
+
+          if (event.type === "SyncUpdate" && event.topic_id === currentTopic.topic_id) {
+            logger.log("[DocumentLoro] Received SyncUpdate from:", event.sender_id);
+            logger.log("[DocumentLoro] Update data size:", event.data.length, "bytes");
+
+            // Apply the update to our Loro document
+            try {
+              const updateBytes = new Uint8Array(event.data);
+              logger.log("[DocumentLoro] Importing update into Loro doc...");
+              logger.log("[DocumentLoro] Version BEFORE import:", loroDoc.oplogVersion());
+              loroDoc.import(updateBytes);
+              logger.log("[DocumentLoro] Version AFTER import:", loroDoc.oplogVersion());
+              logger.log("[DocumentLoro] Document state:", loroDoc.toJSON());
+              logger.log("[DocumentLoro] ✓ Update imported successfully");
+            } catch (e) {
+              logger.error("[DocumentLoro] ✗ Failed to import update:", e);
+            }
+
+          } else if (event.type === "SyncRequest" && event.topic_id === currentTopic.topic_id) {
+            logger.log("[DocumentLoro] Received SyncRequest from:", event.sender_id);
+
+            // Someone is requesting our state - export all operations as update
+            logger.log("[DocumentLoro] Exporting full state as update...");
+            const update = loroDoc.export({ mode: "update" });
+            logger.log("[DocumentLoro] Update size:", update.length, "bytes");
+
+            logger.log("[DocumentLoro] Sending sync response...");
+            await invoke("sync_respond", {
+              topicId: event.topic_id,
+              requesterId: event.sender_id,
+              data: Array.from(update),
+            });
+            logger.log("[DocumentLoro] ✓ Sync response sent");
+
+          } else if (event.type === "SyncResponse" && event.topic_id === currentTopic.topic_id) {
+            logger.log("[DocumentLoro] Received SyncResponse");
+            logger.log("[DocumentLoro] Response data size:", event.data.length, "bytes");
+
+            // Received full state in response to our request
+            try {
+              const updateBytes = new Uint8Array(event.data);
+              logger.log("[DocumentLoro] Importing initial state into Loro doc...");
+              logger.log("[DocumentLoro] Version BEFORE import:", loroDoc.oplogVersion());
+              logger.log("[DocumentLoro] State BEFORE import:", loroDoc.toJSON());
+              loroDoc.import(updateBytes);
+              logger.log("[DocumentLoro] Version AFTER import:", loroDoc.oplogVersion());
+              logger.log("[DocumentLoro] State AFTER import:", loroDoc.toJSON());
+              logger.log("[DocumentLoro] ✓ Initial state imported successfully");
+            } catch (e) {
+              logger.error("[DocumentLoro] ✗ Failed to import initial state:", e);
+            }
+
+          } else if (event.topic_id === currentTopic.topic_id) {
+            logger.log("[DocumentLoro] Ignoring event type:", event.type);
+          }
+        }
+      } catch (e) {
+        logger.error("[DocumentLoro] Event poll error:", e);
+      }
+    }, 200); // Poll every 200ms
+
+    return () => {
+      logger.log("[DocumentLoro] Stopping event polling");
+      clearInterval(interval);
+    };
+  }, [isRunning, currentTopic, loroDoc]);
+
+  const createTopic = async () => {
+    try {
+      setError(null);
+      logger.log("[DocumentLoro] Creating new topic...");
+      const topic = await invoke<TopicInfo>("create_topic");
+      logger.log("[DocumentLoro] ✓ Topic created:", topic.topic_id);
+      logger.log("[DocumentLoro] Members:", topic.members);
+      setCurrentTopic(topic);
+      setLoroDoc(null); // Will be recreated in useEffect
+    } catch (e) {
+      logger.error("[DocumentLoro] ✗ Failed to create topic:", e);
+      setError(String(e));
+    }
+  };
+
+  const joinTopic = async () => {
+    if (!joinInput.trim()) return;
+    try {
+      setError(null);
+      logger.log("[DocumentLoro] Joining topic with invite...");
+      const topic = await invoke<TopicInfo>("join_topic", {
+        inviteHex: joinInput.trim(),
+      });
+      logger.log("[DocumentLoro] ✓ Topic joined:", topic.topic_id);
+      logger.log("[DocumentLoro] Members:", topic.members);
+      setCurrentTopic(topic);
+      setJoinInput("");
+      setLoroDoc(null); // Will be recreated in useEffect
+    } catch (e) {
+      logger.error("[DocumentLoro] ✗ Failed to join topic:", e);
+      setError(String(e));
+    }
+  };
+
+  const leaveTopic = async () => {
+    if (!currentTopic) return;
+    try {
+      await invoke("leave_topic", { topicId: currentTopic.topic_id });
+      setCurrentTopic(null);
+      setLoroDoc(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const copyInvite = () => {
+    if (currentTopic) {
+      navigator.clipboard.writeText(currentTopic.invite_hex);
+    }
+  };
+
+  const shortId = (id: string) => id.slice(0, 8) + "...";
+
+  return (
+    <div className="document-page">
+      {error && <div className="error">{error}</div>}
+
+      <aside className="sidebar">
+        <div className="info-section">
+          <label>Your ID</label>
+          <code>{shortId(endpointId || "")}</code>
+        </div>
+
+        <div className="topic-section">
+          <h3>Document Topic</h3>
+          {currentTopic ? (
+            <div className="current-topic">
+              <div className="topic-id">
+                <label>Topic ID</label>
+                <code>{shortId(currentTopic.topic_id)}</code>
+              </div>
+              <div className="topic-actions">
+                <button className="btn small" onClick={copyInvite}>
+                  Copy Invite
+                </button>
+                <button className="btn small danger" onClick={leaveTopic}>
+                  Leave
+                </button>
+              </div>
+              <div className="members">
+                <label>Members ({currentTopic.members.length})</label>
+                {currentTopic.members.map((m) => (
+                  <div key={m} className="member">
+                    {shortId(m)}
+                    {m === endpointId && " (you)"}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="no-topic">
+              <button className="btn" onClick={createTopic}>
+                Create Document
+              </button>
+              <div className="divider">or</div>
+              <input
+                type="text"
+                placeholder="Paste invite..."
+                value={joinInput}
+                onChange={(e) => setJoinInput(e.target.value)}
+              />
+              <button className="btn" onClick={joinTopic}>
+                Join
+              </button>
+            </div>
+          )}
+        </div>
+      </aside>
+
+      <main className="editor-area">
+        {currentTopic && loroDoc ? (
+          <div className="editor-container">
+            <div className="editor-header">
+              <h2>📝 Collaborative Document</h2>
+            </div>
+            <LoroEditor doc={loroDoc} containerName={CONTAINER} />
+            <div className="editor-footer">
+              <span className="info">Syncing via Harbor Protocol with Loro CRDT</span>
+            </div>
+          </div>
+        ) : (
+          <div className="no-document">
+            <div className="no-document-content">
+              <span className="icon">📄</span>
+              <h2>No Document Open</h2>
+              <p>Create a new document or join an existing one to start collaborating</p>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+export default Document;

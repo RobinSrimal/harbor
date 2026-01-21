@@ -68,6 +68,9 @@ pub use protocol::{
     FileAnnouncedEvent,
     FileProgressEvent,
     FileCompleteEvent,
+    SyncUpdateEvent,
+    SyncRequestEvent,
+    SyncResponseEvent,
     // Stats types
     ProtocolStats,
     IdentityStats,

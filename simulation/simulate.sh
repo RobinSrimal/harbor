@@ -48,10 +48,17 @@
 #     share-retry-source    - Retry when source goes offline
 #     share-retry-recipient - Retry when recipient goes offline
 #
+#   CRDT Sync:
+#     sync-basic       - Basic collaborative text sync
+#     sync-concurrent  - Concurrent edits from multiple nodes
+#     sync-offline     - Offline node receives sync updates
+#     sync-initial     - New member gets full document state
+#
 #   Suites:
 #     membership       - Run all membership scenarios
 #     advanced         - Run all advanced scenarios
 #     share            - Run all file sharing scenarios
+#     sync             - Run all CRDT sync scenarios
 #     full             - Run all scenarios (default)
 
 set -e
@@ -94,6 +101,10 @@ source "$SCRIPT_DIR/scenarios/share_few_peers.sh"
 source "$SCRIPT_DIR/scenarios/share_large_file.sh"
 source "$SCRIPT_DIR/scenarios/share_retry_source.sh"
 source "$SCRIPT_DIR/scenarios/share_retry_recipient.sh"
+source "$SCRIPT_DIR/scenarios/sync_basic.sh"
+source "$SCRIPT_DIR/scenarios/sync_concurrent.sh"
+source "$SCRIPT_DIR/scenarios/sync_offline.sh"
+source "$SCRIPT_DIR/scenarios/sync_initial.sh"
 source "$SCRIPT_DIR/scenarios/suites.sh"
 
 # ============================================================================
@@ -218,6 +229,22 @@ case $SCENARIO in
     share)
         run_share_suite
         ;;
+    # CRDT Sync scenarios
+    sync-basic)
+        scenario_sync_basic
+        ;;
+    sync-concurrent)
+        scenario_sync_concurrent
+        ;;
+    sync-offline)
+        scenario_sync_offline
+        ;;
+    sync-initial)
+        scenario_sync_initial
+        ;;
+    sync)
+        run_sync_suite
+        ;;
     advanced)
         run_advanced_suite
         ;;
@@ -235,7 +262,8 @@ case $SCENARIO in
         echo "              harbor-sync, harbor-churn, race-join, flap, dht-pool"
         echo "  Share:      share-basic, share-peer-offline, share-few-peers, share-large-file,"
         echo "              share-retry-source, share-retry-recipient"
-        echo "  Suites:     membership, advanced, share, full"
+        echo "  Sync:       sync-basic, sync-concurrent, sync-offline, sync-initial"
+        echo "  Suites:     membership, advanced, share, sync, full"
         echo ""
         exit 1
         ;;

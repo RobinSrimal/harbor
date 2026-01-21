@@ -242,14 +242,14 @@ impl ProtocolConfig {
             db_key: None,
             bootstrap_nodes: vec![],
             max_storage_bytes: 10 * 1024 * 1024, // 10 MB
-            harbor_sync_interval_secs: 10,
-            harbor_sync_candidates: 5,
-            harbor_pull_interval_secs: 5,
+            harbor_sync_interval_secs: 5,    // Faster for testing
+            harbor_sync_candidates: 8,       // Store on more nodes
+            harbor_pull_interval_secs: 3,    // Faster pulls
             replication_check_interval_secs: 5,
             replication_factor: 5,           // Higher for testing reliability
             max_replication_attempts: 10,    // Try more nodes
-            harbor_pull_max_nodes: 8,        // Pull from more nodes
-            harbor_pull_early_stop: 3,       // Be more thorough
+            harbor_pull_max_nodes: 12,       // Pull from more nodes
+            harbor_pull_early_stop: 10,      // Much more thorough
             harbor_connect_timeout_secs: 5,  // Same as default
             harbor_response_timeout_secs: 30, // Same as default
             dht_bootstrap_delay_secs: 5,     // Same as default
@@ -429,15 +429,15 @@ mod tests {
         assert!(!config.enable_pow);
         assert!(config.bootstrap_nodes.is_empty());
         assert_eq!(config.max_storage_bytes, 10 * 1024 * 1024); // 10 MB
-        assert_eq!(config.harbor_sync_interval_secs, 10);
-        assert_eq!(config.harbor_sync_candidates, 5);
-        assert_eq!(config.harbor_pull_interval_secs, 5);
+        assert_eq!(config.harbor_sync_interval_secs, 5);
+        assert_eq!(config.harbor_sync_candidates, 8);
+        assert_eq!(config.harbor_pull_interval_secs, 3);
         assert_eq!(config.replication_check_interval_secs, 5);
         // Testing config has higher replication for reliability
         assert_eq!(config.replication_factor, 5);
         assert_eq!(config.max_replication_attempts, 10);
-        assert_eq!(config.harbor_pull_max_nodes, 8);
-        assert_eq!(config.harbor_pull_early_stop, 3);
+        assert_eq!(config.harbor_pull_max_nodes, 12);
+        assert_eq!(config.harbor_pull_early_stop, 10);
     }
 
     #[test]

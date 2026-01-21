@@ -286,3 +286,88 @@ verify_file_hash() {
     fi
 }
 
+# ============================================================================
+# SYNC API HELPERS (Transport layer - raw CRDT bytes)
+# ============================================================================
+
+# Send a sync update (CRDT delta) to all topic members
+# Usage: api_sync_update <node> <topic_hex> <data_hex>
+api_sync_update() {
+    local n=$1
+    local topic=$2
+    local data_hex=$3
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/sync/update" \
+        -H "Content-Type: application/json" \
+        -d "{\"topic\":\"$topic\",\"data\":\"$data_hex\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/sync/update"
+    echo "$result"
+}
+
+# Request sync state from topic members
+# Usage: api_sync_request <node> <topic_hex>
+api_sync_request() {
+    local n=$1
+    local topic=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/sync/request" \
+        -H "Content-Type: application/json" \
+        -d "{\"topic\":\"$topic\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/sync/request"
+    echo "$result"
+}
+
+# Respond to a sync request with full state (direct SYNC_ALPN)
+# Usage: api_sync_respond <node> <topic_hex> <requester_hex> <data_hex>
+api_sync_respond() {
+    local n=$1
+    local topic=$2
+    local requester=$3
+    local data_hex=$4
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/sync/respond" \
+        -H "Content-Type: application/json" \
+        -d "{\"topic\":\"$topic\",\"requester\":\"$requester\",\"data\":\"$data_hex\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/sync/respond"
+    echo "$result"
+}
+
+# Generate mock CRDT update bytes (hex-encoded)
+# Usage: mock_crdt_update <text>
+# Returns: Hex string representing mock CRDT update
+mock_crdt_update() {
+    local text="$1"
+    # Simple mock: just hex-encode the text with a version prefix
+    echo -n "01" # Version byte
+    echo -n "$text" | xxd -p | tr -d '\n'
+}
+
+# Generate mock CRDT snapshot bytes (hex-encoded)
+# Usage: mock_crdt_snapshot <text>
+# Returns: Hex string representing mock CRDT full state
+mock_crdt_snapshot() {
+    local text="$1"
+    # Simple mock: hex-encode the text with a snapshot prefix
+    echo -n "02" # Snapshot byte
+    echo -n "$text" | xxd -p | tr -d '\n'
+}
+extract_sync_text() {
+    local json=$1
+    echo "$json" | grep -o '"text":"[^"]*"' | cut -d'"' -f4
+}
+
+# Get a node's endpoint ID
+# Usage: api_get_endpoint_id <node>
+# Returns: 64-char hex endpoint ID
+api_get_endpoint_id() {
+    local n=$1
+    local stats=$(api_stats $n)
+    echo "$stats" | grep -o '"endpoint_id":"[^"]*"' | cut -d'"' -f4
+}
+

@@ -235,11 +235,28 @@ impl Protocol {
                                                     }
                                                 }
                                                 TopicMessage::Content(_) => {}
+                                                TopicMessage::SyncUpdate(sync_update) => {
+                                                    // Emit SyncUpdate event for app to handle
+                                                    let event = ProtocolEvent::SyncUpdate(crate::protocol::SyncUpdateEvent {
+                                                        topic_id,
+                                                        sender_id: packet_info.sender_id,
+                                                        data: sync_update.data.clone(),
+                                                    });
+                                                    let _ = event_tx.send(event).await;
+                                                }
+                                                TopicMessage::SyncRequest => {
+                                                    // Emit SyncRequest event for app to handle
+                                                    let event = ProtocolEvent::SyncRequest(crate::protocol::SyncRequestEvent {
+                                                        topic_id,
+                                                        sender_id: packet_info.sender_id,
+                                                    });
+                                                    let _ = event_tx.send(event).await;
+                                                }
                                             }
                                         }
 
                                         // Only forward Content messages to the app
-                                        // Join/Leave are internal control messages, not user content
+                                        // Join/Leave/SyncUpdate are internal control messages, not user content
                                         if let Some(TopicMessage::Content(data)) = topic_msg {
                                             let event = ProtocolEvent::Message(IncomingMessage {
                                                 topic_id,

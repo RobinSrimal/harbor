@@ -24,7 +24,7 @@ use tracing::{debug, error, info, trace};
 
 use super::api::{ApiClient, ApiMessage, WeakApiClient};
 use super::distance::{Distance, Id};
-use super::pool::{DhtPool, DialInfo, PoolError};
+use super::pool::{DhtPool, DhtPoolError as PoolError, DialInfo};
 use super::routing::{AddNodeResult, Buckets, RoutingTable, K, ALPHA, BUCKET_COUNT};
 use super::rpc::{FindNode, FindNodeResponse, NodeInfo, RpcClient, RpcMessage};
 

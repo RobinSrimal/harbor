@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "core",
-    "sync",
     "stream",
     "test-app/src-tauri",
 ]

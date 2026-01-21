@@ -32,7 +32,7 @@ impl Protocol {
     pub(crate) async fn start_background_tasks(&self, _shutdown_rx: mpsc::Receiver<()>) {
         let mut tasks = self.tasks.write().await;
 
-        // 1. Incoming message handler (handles Send, DHT, Harbor, Share protocols)
+        // 1. Incoming message handler (handles Send, DHT, Harbor, Share, Sync protocols)
         let endpoint = self.endpoint.clone();
         let db = self.db.clone();
         let event_tx = self.event_tx.clone();
@@ -51,7 +51,9 @@ impl Protocol {
         };
 
         let incoming_task = tokio::spawn(async move {
-            Self::run_incoming_handler(endpoint, db, event_tx, our_id, running, dht_client, blob_store).await;
+            Self::run_incoming_handler(
+                endpoint, db, event_tx, our_id, running, dht_client, blob_store,
+            ).await;
         });
         tasks.push(incoming_task);
 

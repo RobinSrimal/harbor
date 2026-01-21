@@ -100,7 +100,7 @@ impl Protocol {
         our_id: [u8; 32],
         packet: crate::security::SendPacket,
     ) -> Result<(), ProtocolError> {
-        trace!(harbor_id = %hex::encode(packet.harbor_id), "processing packet");
+        info!(harbor_id = %hex::encode(packet.harbor_id), sender = %hex::encode(&sender_id[..8]), "processing incoming packet");
         
         // Find which topic this packet belongs to
         let topics = {
@@ -109,7 +109,7 @@ impl Protocol {
                 .map_err(|e| ProtocolError::Database(e.to_string()))?
         };
 
-        trace!(topic_count = topics.len(), "member of topics");
+        info!(topic_count = topics.len(), "member of topics");
 
         // Try each topic we're subscribed to
         let mut processed = false;
@@ -118,7 +118,7 @@ impl Protocol {
             if packet.harbor_id != harbor_id {
                 continue;
             }
-            trace!(topic = %hex::encode(topic_id), "found matching topic");
+            info!(topic = %hex::encode(&topic_id[..8]), "found matching topic for packet");
 
             // Determine verification mode from payload prefix
             let mode = crate::network::membership::messages::get_verification_mode_from_payload(
@@ -128,8 +128,94 @@ impl Protocol {
             // Verify and decrypt
             match verify_and_decrypt_packet_with_mode(&packet, &topic_id, mode) {
                 Ok(plaintext) => {
+                    info!(plaintext_len = plaintext.len(), "packet decrypted successfully");
+                    
                     // Parse topic message
-                    let topic_msg = TopicMessage::decode(&plaintext).ok();
+                    let topic_msg = match TopicMessage::decode(&plaintext) {
+                        Ok(msg) => {
+                            info!(msg_type = ?msg.message_type(), "decoded TopicMessage");
+                            Some(msg)
+                        }
+                        Err(e) => {
+                            warn!(
+                                topic = %hex::encode(&topic_id[..8]),
+                                error = %e,
+                                plaintext_len = plaintext.len(),
+                                first_byte = ?plaintext.first(),
+                                "failed to decode TopicMessage"
+                            );
+                            None
+                        }
+                    };
+
+                    // Handle SyncUpdate - emit event for app to handle
+                    if let Some(TopicMessage::SyncUpdate(ref sync_msg)) = topic_msg {
+                        info!(
+                            topic = %hex::encode(&topic_id[..8]),
+                            sender = %hex::encode(&sender_id[..8]),
+                            size = sync_msg.data.len(),
+                            "SYNC: received update from peer"
+                        );
+                        
+                        // Emit event for app to handle
+                        let event = ProtocolEvent::SyncUpdate(crate::protocol::SyncUpdateEvent {
+                            topic_id,
+                            sender_id,
+                            data: sync_msg.data.clone(),
+                        });
+                        let _ = event_tx.send(event).await;
+                        
+                        // Mark packet as seen (dedup)
+                        {
+                            let db_lock = db.lock().await;
+                            let _ = mark_pulled(&db_lock, &topic_id, &packet.packet_id);
+                        }
+                        
+                        // Send receipt back
+                        let receipt = Receipt::new(packet.packet_id, our_id);
+                        let reply = SendMessage::Receipt(receipt);
+                        if let Ok(mut send) = conn.open_uni().await {
+                            let _ = tokio::io::AsyncWriteExt::write_all(&mut send, &reply.encode()).await;
+                            let _ = send.finish();
+                        }
+                        
+                        processed = true;
+                        break;
+                    }
+
+                    // Handle SyncRequest - emit event for app to respond
+                    if let Some(TopicMessage::SyncRequest) = topic_msg {
+                        info!(
+                            topic = %hex::encode(&topic_id[..8]),
+                            sender = %hex::encode(&sender_id[..8]),
+                            "SYNC: received sync request from peer"
+                        );
+                        
+                        // Emit event for app to handle
+                        let event = ProtocolEvent::SyncRequest(crate::protocol::SyncRequestEvent {
+                            topic_id,
+                            sender_id,
+                        });
+                        let _ = event_tx.send(event).await;
+                        
+                        // Mark packet as seen (dedup)
+                        {
+                            let db_lock = db.lock().await;
+                            let _ = mark_pulled(&db_lock, &topic_id, &packet.packet_id);
+                        }
+                        
+                        // Send receipt back
+                        let receipt = Receipt::new(packet.packet_id, our_id);
+                        let reply = SendMessage::Receipt(receipt);
+                        if let Ok(mut send) = conn.open_uni().await {
+                            let _ = tokio::io::AsyncWriteExt::write_all(&mut send, &reply.encode()).await;
+                            let _ = send.finish();
+                        }
+                        
+                        processed = true;
+                        break;
+                    }
+
 
                     // Handle control messages
                     if let Some(ref msg) = topic_msg {
@@ -282,11 +368,13 @@ impl Protocol {
                                 }
                             }
                             TopicMessage::Content(_) => {}
+                            TopicMessage::SyncUpdate(_) => {} // Handled above, before db lock
+                            TopicMessage::SyncRequest => {} // Handled above, before db lock
                         }
                     }
 
                     // Only forward Content messages to the app
-                    // Control messages (Join/Leave/FileAnnouncement/CanSeed) are internal
+                    // Control messages (Join/Leave/FileAnnouncement/CanSeed/SyncUpdate) are internal
                     if let Some(TopicMessage::Content(data)) = topic_msg {
                         let event = ProtocolEvent::Message(IncomingMessage {
                             topic_id,
@@ -428,6 +516,75 @@ impl Protocol {
                 Ok(plaintext) => {
                     // Parse topic message
                     let topic_msg = TopicMessage::decode(&plaintext).ok();
+
+                    // Handle SyncUpdate - emit event for app to handle
+                    if let Some(TopicMessage::SyncUpdate(ref sync_msg)) = topic_msg {
+                        info!(
+                            topic = %hex::encode(&topic_id[..8]),
+                            sender = %hex::encode(&sender_id[..8]),
+                            size = sync_msg.data.len(),
+                            "SYNC: received update from peer (with PoW)"
+                        );
+                        
+                        // Emit event for app to handle
+                        let event = ProtocolEvent::SyncUpdate(crate::protocol::SyncUpdateEvent {
+                            topic_id,
+                            sender_id,
+                            data: sync_msg.data.clone(),
+                        });
+                        let _ = event_tx.send(event).await;
+                        
+                        // Mark packet as seen (dedup)
+                        {
+                            let db_lock = db.lock().await;
+                            let _ = mark_pulled(&db_lock, &topic_id, &packet.packet_id);
+                        }
+                        
+                        // Send receipt back
+                        let receipt = Receipt::new(packet.packet_id, our_id);
+                        let reply = SendMessage::Receipt(receipt);
+                        if let Ok(mut send) = conn.open_uni().await {
+                            let _ = tokio::io::AsyncWriteExt::write_all(&mut send, &reply.encode()).await;
+                            let _ = send.finish();
+                        }
+                        
+                        processed = true;
+                        break;
+                    }
+
+                    // Handle SyncRequest - emit event for app to respond (with PoW)
+                    if let Some(TopicMessage::SyncRequest) = topic_msg {
+                        info!(
+                            topic = %hex::encode(&topic_id[..8]),
+                            sender = %hex::encode(&sender_id[..8]),
+                            "SYNC: received sync request from peer (with PoW)"
+                        );
+                        
+                        // Emit event for app to handle
+                        let event = ProtocolEvent::SyncRequest(crate::protocol::SyncRequestEvent {
+                            topic_id,
+                            sender_id,
+                        });
+                        let _ = event_tx.send(event).await;
+                        
+                        // Mark packet as seen (dedup)
+                        {
+                            let db_lock = db.lock().await;
+                            let _ = mark_pulled(&db_lock, &topic_id, &packet.packet_id);
+                        }
+                        
+                        // Send receipt back
+                        let receipt = Receipt::new(packet.packet_id, our_id);
+                        let reply = SendMessage::Receipt(receipt);
+                        if let Ok(mut send) = conn.open_uni().await {
+                            let _ = tokio::io::AsyncWriteExt::write_all(&mut send, &reply.encode()).await;
+                            let _ = send.finish();
+                        }
+                        
+                        processed = true;
+                        break;
+                    }
+
 
                     // Handle control messages
                     if let Some(ref msg) = topic_msg {
@@ -571,11 +728,13 @@ impl Protocol {
                                 }
                             }
                             TopicMessage::Content(_) => {}
+                            TopicMessage::SyncUpdate(_) => {} // Handled above, before db lock
+                            TopicMessage::SyncRequest => {} // Handled above, before db lock
                         }
                     }
 
                     // Only forward Content messages to the app
-                    // Control messages (Join/Leave/FileAnnouncement/CanSeed) are internal
+                    // Control messages (Join/Leave/FileAnnouncement/CanSeed/SyncUpdate) are internal
                     if let Some(TopicMessage::Content(data)) = topic_msg {
                         let event = ProtocolEvent::Message(IncomingMessage {
                             topic_id,

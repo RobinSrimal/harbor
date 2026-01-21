@@ -124,6 +124,34 @@ run_share_suite() {
     log "=========================================="
 }
 
+# Run CRDT sync suite
+run_sync_suite() {
+    log "=========================================="
+    log "CRDT SYNC TEST SUITE"
+    log "=========================================="
+    
+    scenario_sync_basic
+    echo ""
+    sleep 5
+    clear_data
+    
+    scenario_sync_concurrent
+    echo ""
+    sleep 5
+    clear_data
+    
+    scenario_sync_offline
+    echo ""
+    sleep 5
+    clear_data
+    
+    scenario_sync_initial
+    
+    log "=========================================="
+    log "CRDT SYNC TEST SUITE COMPLETE"
+    log "=========================================="
+}
+
 # Run full basic suite
 run_full_suite() {
     scenario_basic
