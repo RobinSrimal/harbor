@@ -252,14 +252,6 @@ impl Protocol {
                                                     });
                                                     let _ = event_tx.send(event).await;
                                                 }
-                                                TopicMessage::SyncResponse(sync_response) => {
-                                                    // Emit SyncResponse event for app to handle
-                                                    let event = ProtocolEvent::SyncResponse(crate::protocol::SyncResponseEvent {
-                                                        topic_id,
-                                                        data: sync_response.data.clone(),
-                                                    });
-                                                    let _ = event_tx.send(event).await;
-                                                }
                                             }
                                         }
 

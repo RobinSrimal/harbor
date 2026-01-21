@@ -287,93 +287,87 @@ verify_file_hash() {
 }
 
 # ============================================================================
-# SYNC API HELPERS (CRDT collaboration)
+# SYNC API HELPERS (Transport layer - raw CRDT bytes)
 # ============================================================================
 
-# Enable sync for a topic
-# Usage: api_sync_enable <node> <topic_hex>
-api_sync_enable() {
+# Send a sync update (CRDT delta) to all topic members
+# Usage: api_sync_update <node> <topic_hex> <data_hex>
+api_sync_update() {
+    local n=$1
+    local topic=$2
+    local data_hex=$3
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/sync/update" \
+        -H "Content-Type: application/json" \
+        -d "{\"topic\":\"$topic\",\"data\":\"$data_hex\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/sync/update"
+    echo "$result"
+}
+
+# Request sync state from topic members
+# Usage: api_sync_request <node> <topic_hex>
+api_sync_request() {
     local n=$1
     local topic=$2
     local port=$(api_port $n)
     local result
-    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/sync/enable" \
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/sync/request" \
         -H "Content-Type: application/json" \
         -d "{\"topic\":\"$topic\"}")
     local exit_code=$?
-    log_api_error $exit_code $n "POST /api/sync/enable"
+    log_api_error $exit_code $n "POST /api/sync/request"
     echo "$result"
 }
 
-# Insert text into a sync document
-# Usage: api_sync_text_insert <node> <topic_hex> <container> <index> <text>
-api_sync_text_insert() {
+# Respond to a sync request with full state (direct SYNC_ALPN)
+# Usage: api_sync_respond <node> <topic_hex> <requester_hex> <data_hex>
+api_sync_respond() {
     local n=$1
     local topic=$2
-    local container=$3
-    local index=$4
-    local text=$5
+    local requester=$3
+    local data_hex=$4
     local port=$(api_port $n)
     local result
-    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/sync/text/insert" \
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/sync/respond" \
         -H "Content-Type: application/json" \
-        -d "{\"topic\":\"$topic\",\"container\":\"$container\",\"index\":$index,\"text\":\"$text\"}")
+        -d "{\"topic\":\"$topic\",\"requester\":\"$requester\",\"data\":\"$data_hex\"}")
     local exit_code=$?
-    log_api_error $exit_code $n "POST /api/sync/text/insert"
+    log_api_error $exit_code $n "POST /api/sync/respond"
     echo "$result"
 }
 
-# Delete text from a sync document
-# Usage: api_sync_text_delete <node> <topic_hex> <container> <index> <len>
-api_sync_text_delete() {
-    local n=$1
-    local topic=$2
-    local container=$3
-    local index=$4
-    local len=$5
-    local port=$(api_port $n)
-    local result
-    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/sync/text/delete" \
-        -H "Content-Type: application/json" \
-        -d "{\"topic\":\"$topic\",\"container\":\"$container\",\"index\":$index,\"len\":$len}")
-    local exit_code=$?
-    log_api_error $exit_code $n "POST /api/sync/text/delete"
-    echo "$result"
+# Generate mock CRDT update bytes (hex-encoded)
+# Usage: mock_crdt_update <text>
+# Returns: Hex string representing mock CRDT update
+mock_crdt_update() {
+    local text="$1"
+    # Simple mock: just hex-encode the text with a version prefix
+    echo -n "01" # Version byte
+    echo -n "$text" | xxd -p | tr -d '\n'
 }
 
-# Get text from a sync document
-# Usage: api_sync_get_text <node> <topic_hex> <container>
-# Returns: JSON with text field
-api_sync_get_text() {
-    local n=$1
-    local topic=$2
-    local container=$3
-    local port=$(api_port $n)
-    local result
-    result=$(curl -s --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/api/sync/text/$topic/$container")
-    local exit_code=$?
-    log_api_error $exit_code $n "GET /api/sync/text"
-    echo "$result"
+# Generate mock CRDT snapshot bytes (hex-encoded)
+# Usage: mock_crdt_snapshot <text>
+# Returns: Hex string representing mock CRDT full state
+mock_crdt_snapshot() {
+    local text="$1"
+    # Simple mock: hex-encode the text with a snapshot prefix
+    echo -n "02" # Snapshot byte
+    echo -n "$text" | xxd -p | tr -d '\n'
 }
-
-# Get sync status for a topic
-# Usage: api_sync_status <node> <topic_hex>
-# Returns: JSON with enabled, has_pending_changes, version
-api_sync_status() {
-    local n=$1
-    local topic=$2
-    local port=$(api_port $n)
-    local result
-    result=$(curl -s --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/api/sync/status/$topic")
-    local exit_code=$?
-    log_api_error $exit_code $n "GET /api/sync/status"
-    echo "$result"
-}
-
-# Extract text value from sync API response
-# Usage: extract_sync_text <json_response>
 extract_sync_text() {
     local json=$1
     echo "$json" | grep -o '"text":"[^"]*"' | cut -d'"' -f4
+}
+
+# Get a node's endpoint ID
+# Usage: api_get_endpoint_id <node>
+# Returns: 64-char hex endpoint ID
+api_get_endpoint_id() {
+    local n=$1
+    local stats=$(api_stats $n)
+    echo "$stats" | grep -o '"endpoint_id":"[^"]*"' | cut -d'"' -f4
 }
 

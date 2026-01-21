@@ -216,39 +216,6 @@ impl Protocol {
                         break;
                     }
 
-                    // Handle SyncResponse - emit event for app to process
-                    if let Some(TopicMessage::SyncResponse(ref sync_response)) = topic_msg {
-                        info!(
-                            topic = %hex::encode(&topic_id[..8]),
-                            sender = %hex::encode(&sender_id[..8]),
-                            size = sync_response.data.len(),
-                            "SYNC: received sync response from peer"
-                        );
-                        
-                        // Emit event for app to handle
-                        let event = ProtocolEvent::SyncResponse(crate::protocol::SyncResponseEvent {
-                            topic_id,
-                            data: sync_response.data.clone(),
-                        });
-                        let _ = event_tx.send(event).await;
-                        
-                        // Mark packet as seen (dedup)
-                        {
-                            let db_lock = db.lock().await;
-                            let _ = mark_pulled(&db_lock, &topic_id, &packet.packet_id);
-                        }
-                        
-                        // Send receipt back
-                        let receipt = Receipt::new(packet.packet_id, our_id);
-                        let reply = SendMessage::Receipt(receipt);
-                        if let Ok(mut send) = conn.open_uni().await {
-                            let _ = tokio::io::AsyncWriteExt::write_all(&mut send, &reply.encode()).await;
-                            let _ = send.finish();
-                        }
-                        
-                        processed = true;
-                        break;
-                    }
 
                     // Handle control messages
                     if let Some(ref msg) = topic_msg {
@@ -403,7 +370,6 @@ impl Protocol {
                             TopicMessage::Content(_) => {}
                             TopicMessage::SyncUpdate(_) => {} // Handled above, before db lock
                             TopicMessage::SyncRequest => {} // Handled above, before db lock
-                            TopicMessage::SyncResponse(_) => {} // Handled above, before db lock
                         }
                     }
 
@@ -619,39 +585,6 @@ impl Protocol {
                         break;
                     }
 
-                    // Handle SyncResponse - emit event for app to process (with PoW)
-                    if let Some(TopicMessage::SyncResponse(ref sync_response)) = topic_msg {
-                        info!(
-                            topic = %hex::encode(&topic_id[..8]),
-                            sender = %hex::encode(&sender_id[..8]),
-                            size = sync_response.data.len(),
-                            "SYNC: received sync response from peer (with PoW)"
-                        );
-                        
-                        // Emit event for app to handle
-                        let event = ProtocolEvent::SyncResponse(crate::protocol::SyncResponseEvent {
-                            topic_id,
-                            data: sync_response.data.clone(),
-                        });
-                        let _ = event_tx.send(event).await;
-                        
-                        // Mark packet as seen (dedup)
-                        {
-                            let db_lock = db.lock().await;
-                            let _ = mark_pulled(&db_lock, &topic_id, &packet.packet_id);
-                        }
-                        
-                        // Send receipt back
-                        let receipt = Receipt::new(packet.packet_id, our_id);
-                        let reply = SendMessage::Receipt(receipt);
-                        if let Ok(mut send) = conn.open_uni().await {
-                            let _ = tokio::io::AsyncWriteExt::write_all(&mut send, &reply.encode()).await;
-                            let _ = send.finish();
-                        }
-                        
-                        processed = true;
-                        break;
-                    }
 
                     // Handle control messages
                     if let Some(ref msg) = topic_msg {
@@ -797,7 +730,6 @@ impl Protocol {
                             TopicMessage::Content(_) => {}
                             TopicMessage::SyncUpdate(_) => {} // Handled above, before db lock
                             TopicMessage::SyncRequest => {} // Handled above, before db lock
-                            TopicMessage::SyncResponse(_) => {} // Handled above, before db lock
                         }
                     }
 

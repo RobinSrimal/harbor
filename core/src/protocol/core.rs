@@ -6,13 +6,14 @@
 //! - `handlers/`: Connection handling (incoming/outgoing)
 //! - `tasks/`: Background automation
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::Endpoint;
 use rusqlite::Connection;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::data::{get_or_create_identity, start_db, LocalIdentity};
 use crate::network::dht::{
@@ -490,63 +491,57 @@ impl Protocol {
     /// Respond to a sync request with current state
     ///
     /// Call this when you receive `ProtocolEvent::SyncRequest`.
-    /// Uses direct connection - no size limit.
+    /// Uses direct SYNC_ALPN connection - no size limit.
     pub async fn respond_sync(
         &self,
         topic_id: &[u8; 32],
         requester_id: &[u8; 32],
         data: Vec<u8>,
     ) -> Result<(), ProtocolError> {
-        use crate::network::membership::messages::{TopicMessage, SyncResponseMessage};
-        use crate::network::send::protocol::{SendMessage, SEND_ALPN};
-        use crate::security::create_packet;
-        
         self.check_running().await?;
-        
-        // Encode as SyncResponse message
-        let msg = TopicMessage::SyncResponse(SyncResponseMessage { data });
-        let encoded = msg.encode();
-        
-        // Create packet
-        let packet = create_packet(
-            topic_id,
-            &self.identity.private_key,
-            &self.identity.public_key,
-            &encoded,
-        ).map_err(|e| ProtocolError::Network(e.to_string()))?;
-        
-        // Encode for wire
-        let wire_msg = SendMessage::Packet(packet);
-        let wire_bytes = wire_msg.encode();
-        
-        // Connect to requester
+
+        // Build raw SYNC_ALPN message format:
+        // [32 bytes topic_id][1 byte type = 0x02][data]
+        let mut message = Vec::with_capacity(32 + 1 + data.len());
+        message.extend_from_slice(topic_id);
+        message.push(0x02); // SyncResponse type
+        message.extend_from_slice(&data);
+
+        // Connect to requester via SYNC_ALPN
         let node_id = iroh::NodeId::from_bytes(requester_id)
             .map_err(|e| ProtocolError::Network(format!("invalid node id: {}", e)))?;
-        
+
         let conn = self.endpoint
-            .connect(node_id, SEND_ALPN)
+            .connect(node_id, SYNC_ALPN)
             .await
             .map_err(|e| ProtocolError::Network(format!("connection failed: {}", e)))?;
-        
+
         let mut send = conn
             .open_uni()
             .await
             .map_err(|e| ProtocolError::Network(format!("failed to open stream: {}", e)))?;
-        
-        tokio::io::AsyncWriteExt::write_all(&mut send, &wire_bytes)
+
+        tokio::io::AsyncWriteExt::write_all(&mut send, &message)
             .await
             .map_err(|e| ProtocolError::Network(format!("failed to write: {}", e)))?;
-        
+
+        // Finish the stream - this signals we're done sending
         send.finish()
             .map_err(|e| ProtocolError::Network(format!("failed to finish: {}", e)))?;
-        
+
+        // Wait for the stream to actually be transmitted before dropping connection
+        // stopped() completes when the peer has received and acknowledged the data
+        send.stopped()
+            .await
+            .map_err(|e| ProtocolError::Network(format!("stream error: {}", e)))?;
+
         info!(
             topic = %hex::encode(&topic_id[..8]),
             requester = %hex::encode(&requester_id[..8]),
-            size = encoded.len(),
-            "Sent sync response"
+            size = data.len(),
+            "Sent sync response via SYNC_ALPN"
         );
-        
+
         Ok(())
     }
 

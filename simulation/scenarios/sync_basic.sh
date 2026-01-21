@@ -1,40 +1,40 @@
 #!/bin/bash
 #
-# Scenario: Basic CRDT Sync
+# Scenario: Basic Sync Transport
 #
-# Tests basic collaborative text editing between topic members.
-# One node makes edits, verifies other nodes receive them via sync.
-# Verification: Check sync text values match across nodes.
+# Tests basic sync transport layer between topic members:
+# - Sync updates (deltas) broadcast via Send protocol
+# - Sync updates pulled from Harbor nodes
+# Verification: Check that sync update events are delivered to all members.
 #
 
 scenario_sync_basic() {
     log "=========================================="
-    log "SCENARIO: Basic CRDT Sync"
+    log "SCENARIO: Basic Sync Transport"
     log "=========================================="
-    
+
     local TEST_NODES=20
     local TOPIC_MEMBERS=3  # Keep small for sync testing
-    local CONTAINER="doc1"
-    local TEST_TEXT="SYNC-BASIC-TEST"
-    
+    local TEST_DATA="SYNC-UPDATE-TEST"
+
     # Start bootstrap node
     start_bootstrap_node
-    
+
     # Start other nodes
     log "Phase 1: Starting nodes 2-$TEST_NODES..."
     for i in $(seq 2 $TEST_NODES); do
         start_node $i
         sleep 0.3
     done
-    
+
     for i in $(seq 2 $TEST_NODES); do
         wait_for_api $i
     done
-    
+
     # Wait for DHT convergence
     log "Phase 2: DHT convergence (75s)..."
     sleep 75
-    
+
     # Create topic and join members
     log "Phase 3: Creating topic on node-1..."
     INVITE=$(api_create_topic 1)
@@ -43,79 +43,65 @@ scenario_sync_basic() {
     fi
     TOPIC_ID="${INVITE:0:64}"
     info "Topic ID: ${TOPIC_ID:0:16}..."
-    
+
     log "Phase 3b: Nodes 2-$TOPIC_MEMBERS joining topic..."
     local current_invite="$INVITE"
     for i in $(seq 2 $TOPIC_MEMBERS); do
         local result=$(api_join_topic $i "$current_invite")
         info "  Node-$i joined: $result"
-        sleep 2  # Wait for JOIN message to propagate to all members
+        sleep 2  # Wait for JOIN message to propagate
         current_invite=$(api_get_invite 1 "$TOPIC_ID")
     done
-    
-    # Wait for member list to sync across all nodes
+
+    # Wait for member list to sync
     log "Phase 3c: Waiting for member list propagation (10s)..."
     sleep 10
-    
-    # Enable sync on all members
-    log "Phase 4: Enabling sync on all members..."
-    for i in $(seq 1 $TOPIC_MEMBERS); do
-        local result=$(api_sync_enable $i "$TOPIC_ID")
-        info "  Node-$i sync enable: $result"
-    done
-    sleep 2
-    
-    # Node 1 makes an edit
-    log "Phase 5: Node-1 inserting text..."
-    local insert_result=$(api_sync_text_insert 1 "$TOPIC_ID" "$CONTAINER" 0 "$TEST_TEXT")
-    info "Insert result: $insert_result"
-    
-    # Verify local state immediately
-    local local_text=$(api_sync_get_text 1 "$TOPIC_ID" "$CONTAINER")
-    local local_value=$(extract_sync_text "$local_text")
-    info "Node-1 local text: $local_value"
-    
-    # Wait for sync propagation (batched sending ~1 second + network)
-    log "Phase 6: Waiting for sync propagation (15s)..."
+
+    # Node 1 sends a sync update
+    log "Phase 4: Node-1 sending sync update..."
+    local update_data=$(mock_crdt_update "$TEST_DATA")
+    info "Update data (hex): ${update_data:0:32}... (${#update_data} chars)"
+    local result=$(api_sync_update 1 "$TOPIC_ID" "$update_data")
+    info "Send result: $result"
+
+    # Wait for sync propagation via Harbor
+    log "Phase 5: Waiting for sync propagation (15s)..."
     sleep 15
-    
-    # Verify all members have the same text
-    log "Phase 7: Verifying sync state across members..."
-    local sync_success=0
-    for i in $(seq 1 $TOPIC_MEMBERS); do
-        local text_json=$(api_sync_get_text $i "$TOPIC_ID" "$CONTAINER")
-        local text_value=$(extract_sync_text "$text_json")
-        
-        if [ "$text_value" = "$TEST_TEXT" ]; then
-            log "  ✅ Node-$i: text matches ($text_value)"
-            sync_success=$((sync_success + 1))
+
+    # Check logs for sync events on receiver nodes (not the sender)
+    log "Phase 6: Checking for SyncUpdate events in logs (receivers only)..."
+    local sync_received=0
+    for i in $(seq 2 $TOPIC_MEMBERS); do
+        local log_file="$NODES_DIR/node-$i/output.log"
+        if [ -f "$log_file" ]; then
+            local sync_count=$(grep -c "SyncUpdate" "$log_file" 2>/dev/null || echo "0")
+            sync_count=$(echo "$sync_count" | head -1)
+            if [ "$sync_count" -gt 0 ] 2>/dev/null; then
+                log "  ✅ Node-$i: received SyncUpdate event(s) ($sync_count)"
+                sync_received=$((sync_received + 1))
+            else
+                warn "  ⚠️  Node-$i: no SyncUpdate events found"
+            fi
         else
-            warn "  ⚠️  Node-$i: text mismatch (got: '$text_value', expected: '$TEST_TEXT')"
+            warn "  ⚠️  Node-$i: log file not found"
         fi
     done
-    
-    # Check sync status
-    log "Phase 8: Sync status..."
-    for i in $(seq 1 $TOPIC_MEMBERS); do
-        local status=$(api_sync_status $i "$TOPIC_ID")
-        info "  Node-$i: $status"
-    done
-    
+
     # Summary
     log ""
     log "Verification Summary:"
-    log "  Nodes with correct text: $sync_success/$TOPIC_MEMBERS"
-    
-    if [ $sync_success -eq $TOPIC_MEMBERS ]; then
-        log "✅ PASSED: Basic CRDT sync working"
-    elif [ $sync_success -gt 0 ]; then
-        warn "⚠️  PARTIAL: Some nodes synced ($sync_success/$TOPIC_MEMBERS)"
+    local expected_receivers=$((TOPIC_MEMBERS - 1))  # Sender doesn't receive own update
+    log "  Receiver nodes that got sync updates: $sync_received/$expected_receivers"
+
+    if [ $sync_received -eq $expected_receivers ]; then
+        log "✅ PASSED: Sync transport working (all receivers got updates)"
+    elif [ $sync_received -gt 0 ]; then
+        warn "⚠️  PARTIAL: Some receivers got updates ($sync_received/$expected_receivers)"
     else
-        warn "❌ FAILED: No nodes received sync update"
+        warn "❌ FAILED: Sync updates not propagating"
     fi
-    
+
     log "=========================================="
-    log "SCENARIO COMPLETE: Basic CRDT Sync"
+    log "SCENARIO COMPLETE: Basic Sync Transport"
     log "=========================================="
 }
-

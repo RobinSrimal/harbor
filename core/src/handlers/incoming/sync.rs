@@ -9,8 +9,6 @@
 //! - Maintaining its own CRDT state
 //! - Responding to SyncRequest events via Protocol::respond_sync()
 
-use std::sync::Arc;
-
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 

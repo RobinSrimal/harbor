@@ -106,9 +106,9 @@ harbor/
 
 ---
 
-## Testing
+## Testing & Simulations
 
-### Running Tests
+### Unit Tests
 
 ```bash
 # Run all core protocol tests
@@ -119,6 +119,17 @@ cargo test -p harbor-core -- --nocapture
 
 # Run a specific test
 cargo test -p harbor-core test_name
+```
+
+### Integration Tests
+
+For detailed information on running simulations and integration tests, see [SIMULATIONS.md](SIMULATIONS.md).
+
+Quick start:
+```bash
+# Build and run all simulations
+cargo build -p harbor-core
+cd simulation && ./simulate.sh
 ```
 
 ---
