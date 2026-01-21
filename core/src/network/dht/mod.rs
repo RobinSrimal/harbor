@@ -39,7 +39,7 @@ pub use actor::{create_dht_node, create_dht_node_with_buckets, DhtConfig};
 pub use api::ApiClient;
 pub use bootstrap::{BootstrapConfig, BootstrapNode, default_bootstrap_nodes, bootstrap_node_ids, bootstrap_dial_info};
 pub use distance::{Distance, Id};
-pub use pool::{DhtPool, DialInfo, PoolConfig, DHT_ALPN};
+pub use pool::{DhtPool, DhtPoolConfig, DhtPoolError, DialInfo, DHT_ALPN};
 pub use routing::{Buckets, RoutingTable, K, ALPHA, BUCKET_COUNT};
 pub use rpc::RpcClient;
 

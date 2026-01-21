@@ -10,6 +10,7 @@
 //!
 //! Each protocol has its own ALPN and connection pool.
 
+pub mod pool;
 pub mod dht;
 pub mod harbor;
 pub mod membership;

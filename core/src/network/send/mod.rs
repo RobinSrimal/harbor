@@ -25,9 +25,11 @@
 //!   [type=0x02][packet_id:16][sender:32]
 //! ```
 
+pub mod pool;
 pub mod protocol;
 pub mod service;
 
+pub use pool::{SendPool, SendPoolConfig, SendPoolError, SendConnectionRef, SendPoolStats, SEND_ALPN as SEND_ALPN_FROM_POOL};
 pub use protocol::{SEND_ALPN, SendMessage, Receipt};
 pub use service::{SendService, SendConfig};
 

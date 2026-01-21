@@ -18,10 +18,10 @@ use tracing::info;
 use crate::data::{get_or_create_identity, start_db, LocalIdentity};
 use crate::network::dht::{
     bootstrap_dial_info, bootstrap_node_ids, create_dht_node_with_buckets, ApiClient as DhtApiClient,
-    Buckets, DhtConfig, DhtPool, DialInfo, PoolConfig, RpcClient as DhtRpcClient, DHT_ALPN,
+    Buckets, DhtConfig, DhtPool, DhtPoolConfig, DialInfo, RpcClient as DhtRpcClient, DHT_ALPN,
 };
 use crate::network::harbor::protocol::HARBOR_ALPN;
-use crate::network::send::protocol::SEND_ALPN;
+use crate::network::send::{SendPool, SendPoolConfig, protocol::SEND_ALPN};
 use crate::network::sync::protocol::SYNC_ALPN;
 
 use super::config::ProtocolConfig;
@@ -58,6 +58,8 @@ pub struct Protocol {
     dht_rpc_client: Option<DhtRpcClient>,
     /// DHT client for finding Harbor Nodes
     pub(crate) dht_client: Option<DhtApiClient>,
+    /// Send protocol connection pool
+    pub(crate) send_pool: SendPool,
     /// Event sender (for app notifications: messages, file events, etc.)
     pub(crate) event_tx: mpsc::Sender<ProtocolEvent>,
     /// Event receiver (cloneable via Arc)
@@ -127,7 +129,7 @@ impl Protocol {
 
         // Initialize DHT
         let local_dht_id = crate::network::dht::Id::new(identity.public_key);
-        let dht_pool = DhtPool::new(endpoint.clone(), PoolConfig::default());
+        let dht_pool = DhtPool::new(endpoint.clone(), DhtPoolConfig::default());
 
         // Parse and register bootstrap nodes from config
         let mut bootstrap_ids: Vec<crate::network::dht::Id> = Vec::new();
@@ -263,6 +265,9 @@ impl Protocol {
         let dht_rpc_client = Some(dht_rpc_client);
         let dht_client = Some(dht_client);
 
+        // Initialize Send connection pool
+        let send_pool = SendPool::new(endpoint.clone(), SendPoolConfig::default());
+
         let protocol = Self {
             config,
             endpoint,
@@ -270,6 +275,7 @@ impl Protocol {
             db: Arc::new(Mutex::new(db)),
             dht_rpc_client,
             dht_client,
+            send_pool,
             event_tx,
             event_rx: Arc::new(RwLock::new(Some(event_rx))),
             running: Arc::new(RwLock::new(true)),

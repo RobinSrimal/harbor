@@ -55,11 +55,13 @@ function Document({ isRunning, endpointId }: DocumentProps) {
       console.log("[DocumentLoro] Initializing new Loro document for topic:", currentTopic.topic_id);
       const doc = new LoroDoc();
 
-      // Subscribe to local changes and send updates
-      doc.subscribe((event) => {
+      // Subscribe to LOCAL changes only and send updates
+      // Using subscribeLocalUpdates() ensures we only send sync updates for local edits,
+      // not for remote changes imported from other peers
+      doc.subscribeLocalUpdates((event) => {
         if (!currentTopic) return;
 
-        console.log("[DocumentLoro] Loro doc change detected:", event);
+        console.log("[DocumentLoro] Local change detected:", event);
 
         // Export delta since last sent version
         const currentVersion = doc.oplogVersion();

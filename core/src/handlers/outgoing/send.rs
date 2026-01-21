@@ -6,8 +6,6 @@
 //! - send_raw_with_info: Send using MemberInfo (includes relay URLs)
 //! - send_to_member: Low-level send to a member with relay info
 
-use std::time::Duration;
-
 use futures::future::join_all;
 use iroh::{NodeId, NodeAddr};
 use tracing::{debug, trace, info};
@@ -15,7 +13,7 @@ use tracing::{debug, trace, info};
 use crate::data::send::store_outgoing_packet;
 use crate::data::WILDCARD_RECIPIENT;
 use crate::network::harbor::protocol::HarborPacketType;
-use crate::network::send::protocol::{SEND_ALPN, SendMessage};
+use crate::network::send::protocol::SendMessage;
 use crate::security::{create_packet, harbor_id_from_topic};
 
 use crate::protocol::{Protocol, MemberInfo, ProtocolError};
@@ -132,17 +130,13 @@ impl Protocol {
 
         let node_addr: NodeAddr = node_id.into();
 
-        // Connect with timeout
-        let conn = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.endpoint.connect(node_addr, SEND_ALPN),
-        )
-        .await
-        .map_err(|_| ProtocolError::Network("connect timeout".to_string()))?
-        .map_err(|e| ProtocolError::Network(e.to_string()))?;
+        // Get pooled connection
+        let conn_ref = self.send_pool.get_connection(node_addr)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
         // Open stream and send
-        let mut send_stream = conn
+        let mut send_stream = conn_ref.connection()
             .open_uni()
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))?;
@@ -302,17 +296,13 @@ impl Protocol {
             "connecting to member"
         );
 
-        // Connect with timeout
-        let conn = tokio::time::timeout(
-            Duration::from_secs(10), // Longer timeout for relay connections
-            self.endpoint.connect(node_addr, SEND_ALPN),
-        )
-        .await
-        .map_err(|_| ProtocolError::Network("connect timeout".to_string()))?
-        .map_err(|e| ProtocolError::Network(e.to_string()))?;
+        // Get pooled connection
+        let conn_ref = self.send_pool.get_connection(node_addr)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
         // Open stream and send
-        let mut send_stream = conn
+        let mut send_stream = conn_ref.connection()
             .open_uni()
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))?;
