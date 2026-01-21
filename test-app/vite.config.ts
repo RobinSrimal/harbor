@@ -6,6 +6,9 @@ import topLevelAwait from "vite-plugin-top-level-await";
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 
+// @ts-expect-error process is a nodejs global
+const port = process.env.VITE_PORT ? parseInt(process.env.VITE_PORT) : 1420;
+
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [react(), wasm(), topLevelAwait()],
@@ -16,19 +19,19 @@ export default defineConfig(async () => ({
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
-    port: 1420,
+    port: port,
     strictPort: true,
     host: host || false,
     hmr: host
       ? {
           protocol: "ws",
           host,
-          port: 1421,
+          port: port + 1,
         }
       : undefined,
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      ignored: ["**/src-tauri/**", "**/test-data/**"],
     },
   },
 }));

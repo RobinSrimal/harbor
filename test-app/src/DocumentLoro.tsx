@@ -1,7 +1,8 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LoroDoc } from "loro-crdt";
 import { LoroEditor } from "./LoroEditor";
+import { logger } from "./logger";
 import "./Document.css";
 
 interface DocumentProps {
@@ -46,13 +47,10 @@ function Document({ isRunning, endpointId }: DocumentProps) {
   // Container name for the document
   const CONTAINER = "main-doc";
 
-  // Store version vector before sending updates
-  const lastSentVersionRef = useRef<any>(null);
-
   // Initialize Loro document when topic is created/joined
   useEffect(() => {
     if (currentTopic && !loroDoc) {
-      console.log("[DocumentLoro] Initializing new Loro document for topic:", currentTopic.topic_id);
+      logger.log("[DocumentLoro] Initializing new Loro document for topic:", currentTopic.topic_id);
       const doc = new LoroDoc();
 
       // Subscribe to LOCAL changes only and send updates
@@ -61,49 +59,38 @@ function Document({ isRunning, endpointId }: DocumentProps) {
       doc.subscribeLocalUpdates((event) => {
         if (!currentTopic) return;
 
-        console.log("[DocumentLoro] Local change detected:", event);
+        logger.log("[DocumentLoro] Local change detected:", event);
 
-        // Export delta since last sent version
-        const currentVersion = doc.oplogVersion();
-        console.log("[DocumentLoro] Current version:", currentVersion);
-        console.log("[DocumentLoro] Last sent version:", lastSentVersionRef.current);
+        // Export all operations as update
+        // Loro handles deduplication automatically on import
+        const delta = doc.export({ mode: "update" });
 
-        // Export delta - if lastSentVersion is null, export full snapshot as update
-        const exportOptions = lastSentVersionRef.current
-          ? { mode: "update" as const, from: lastSentVersionRef.current }
-          : { mode: "update" as const };
-
-        console.log("[DocumentLoro] Export options:", exportOptions);
-        const delta = doc.export(exportOptions);
-        console.log("[DocumentLoro] Delta size:", delta.length, "bytes");
+        logger.log("[DocumentLoro] Update size:", delta.length, "bytes");
 
         if (delta.length > 0) {
-          console.log("[DocumentLoro] Sending sync update to Harbor...");
+          logger.log("[DocumentLoro] Sending sync update to Harbor...");
           // Send update to Harbor
           invoke("sync_send_update", {
             topicId: currentTopic.topic_id,
             data: Array.from(delta),
           }).then(() => {
-            console.log("[DocumentLoro] ✓ Sync update sent successfully");
+            logger.log("[DocumentLoro] ✓ Sync update sent successfully");
           }).catch((e) => {
-            console.error("[DocumentLoro] ✗ Failed to send sync update:", e);
+            logger.error("[DocumentLoro] ✗ Failed to send sync update:", e);
           });
-
-          // Update last sent version
-          lastSentVersionRef.current = currentVersion;
         } else {
-          console.log("[DocumentLoro] No delta to send (empty)");
+          logger.log("[DocumentLoro] No delta to send (empty)");
         }
       });
 
       setLoroDoc(doc);
 
       // Request initial sync if joining existing topic
-      console.log("[DocumentLoro] Requesting initial sync...");
+      logger.log("[DocumentLoro] Requesting initial sync...");
       invoke("sync_request", { topicId: currentTopic.topic_id }).then(() => {
-        console.log("[DocumentLoro] ✓ Sync request sent");
+        logger.log("[DocumentLoro] ✓ Sync request sent");
       }).catch((e) => {
-        console.error("[DocumentLoro] ✗ Failed to request sync:", e);
+        logger.error("[DocumentLoro] ✗ Failed to request sync:", e);
       });
     }
   }, [currentTopic, loroDoc]);
@@ -112,80 +99,83 @@ function Document({ isRunning, endpointId }: DocumentProps) {
   useEffect(() => {
     if (!isRunning || !currentTopic || !loroDoc) return;
 
-    console.log("[DocumentLoro] Starting event polling for topic:", currentTopic.topic_id);
+    logger.log("[DocumentLoro] Starting event polling for topic:", currentTopic.topic_id);
 
     const interval = setInterval(async () => {
       try {
         const events = await invoke<AppEvent[]>("poll_events");
 
         if (events.length > 0) {
-          console.log("[DocumentLoro] Polled", events.length, "events");
+          logger.log("[DocumentLoro] ========================================");
+          logger.log("[DocumentLoro] Polled", events.length, "events");
+          logger.log("[DocumentLoro] ========================================");
         }
 
         for (const event of events) {
-          console.log("[DocumentLoro] Processing event:", event.type);
+          logger.log("[DocumentLoro] Processing event:", event.type);
 
           if (event.type === "SyncUpdate" && event.topic_id === currentTopic.topic_id) {
-            console.log("[DocumentLoro] Received SyncUpdate from:", event.sender_id);
-            console.log("[DocumentLoro] Update data size:", event.data.length, "bytes");
+            logger.log("[DocumentLoro] Received SyncUpdate from:", event.sender_id);
+            logger.log("[DocumentLoro] Update data size:", event.data.length, "bytes");
 
             // Apply the update to our Loro document
             try {
               const updateBytes = new Uint8Array(event.data);
-              console.log("[DocumentLoro] Importing update into Loro doc...");
-              console.log("[DocumentLoro] Version BEFORE import:", loroDoc.oplogVersion());
+              logger.log("[DocumentLoro] Importing update into Loro doc...");
+              logger.log("[DocumentLoro] Version BEFORE import:", loroDoc.oplogVersion());
               loroDoc.import(updateBytes);
-              console.log("[DocumentLoro] Version AFTER import:", loroDoc.oplogVersion());
-              console.log("[DocumentLoro] Document state:", loroDoc.toJSON());
-              console.log("[DocumentLoro] ✓ Update imported successfully");
+              logger.log("[DocumentLoro] Version AFTER import:", loroDoc.oplogVersion());
+              logger.log("[DocumentLoro] Document state:", loroDoc.toJSON());
+              logger.log("[DocumentLoro] ✓ Update imported successfully");
             } catch (e) {
-              console.error("[DocumentLoro] ✗ Failed to import update:", e);
+              logger.error("[DocumentLoro] ✗ Failed to import update:", e);
             }
 
           } else if (event.type === "SyncRequest" && event.topic_id === currentTopic.topic_id) {
-            console.log("[DocumentLoro] Received SyncRequest from:", event.sender_id);
+            logger.log("[DocumentLoro] Received SyncRequest from:", event.sender_id);
 
-            // Someone is requesting our state - export and send
-            console.log("[DocumentLoro] Exporting snapshot...");
-            const snapshot = loroDoc.export({ mode: "snapshot" });
-            console.log("[DocumentLoro] Snapshot size:", snapshot.length, "bytes");
+            // Someone is requesting our state - export all operations as update
+            logger.log("[DocumentLoro] Exporting full state as update...");
+            const update = loroDoc.export({ mode: "update" });
+            logger.log("[DocumentLoro] Update size:", update.length, "bytes");
 
-            console.log("[DocumentLoro] Sending sync response...");
+            logger.log("[DocumentLoro] Sending sync response...");
             await invoke("sync_respond", {
               topicId: event.topic_id,
               requesterId: event.sender_id,
-              data: Array.from(snapshot),
+              data: Array.from(update),
             });
-            console.log("[DocumentLoro] ✓ Sync response sent");
+            logger.log("[DocumentLoro] ✓ Sync response sent");
 
           } else if (event.type === "SyncResponse" && event.topic_id === currentTopic.topic_id) {
-            console.log("[DocumentLoro] Received SyncResponse");
-            console.log("[DocumentLoro] Response data size:", event.data.length, "bytes");
+            logger.log("[DocumentLoro] Received SyncResponse");
+            logger.log("[DocumentLoro] Response data size:", event.data.length, "bytes");
 
             // Received full state in response to our request
             try {
-              const snapshotBytes = new Uint8Array(event.data);
-              console.log("[DocumentLoro] Importing snapshot into Loro doc...");
-              console.log("[DocumentLoro] Version BEFORE import:", loroDoc.oplogVersion());
-              loroDoc.import(snapshotBytes);
-              console.log("[DocumentLoro] Version AFTER import:", loroDoc.oplogVersion());
-              console.log("[DocumentLoro] Document state:", loroDoc.toJSON());
-              console.log("[DocumentLoro] ✓ Snapshot imported successfully");
+              const updateBytes = new Uint8Array(event.data);
+              logger.log("[DocumentLoro] Importing initial state into Loro doc...");
+              logger.log("[DocumentLoro] Version BEFORE import:", loroDoc.oplogVersion());
+              logger.log("[DocumentLoro] State BEFORE import:", loroDoc.toJSON());
+              loroDoc.import(updateBytes);
+              logger.log("[DocumentLoro] Version AFTER import:", loroDoc.oplogVersion());
+              logger.log("[DocumentLoro] State AFTER import:", loroDoc.toJSON());
+              logger.log("[DocumentLoro] ✓ Initial state imported successfully");
             } catch (e) {
-              console.error("[DocumentLoro] ✗ Failed to import snapshot:", e);
+              logger.error("[DocumentLoro] ✗ Failed to import initial state:", e);
             }
 
           } else if (event.topic_id === currentTopic.topic_id) {
-            console.log("[DocumentLoro] Ignoring event type:", event.type);
+            logger.log("[DocumentLoro] Ignoring event type:", event.type);
           }
         }
       } catch (e) {
-        console.error("[DocumentLoro] Event poll error:", e);
+        logger.error("[DocumentLoro] Event poll error:", e);
       }
     }, 200); // Poll every 200ms
 
     return () => {
-      console.log("[DocumentLoro] Stopping event polling");
+      logger.log("[DocumentLoro] Stopping event polling");
       clearInterval(interval);
     };
   }, [isRunning, currentTopic, loroDoc]);
@@ -193,14 +183,14 @@ function Document({ isRunning, endpointId }: DocumentProps) {
   const createTopic = async () => {
     try {
       setError(null);
-      console.log("[DocumentLoro] Creating new topic...");
+      logger.log("[DocumentLoro] Creating new topic...");
       const topic = await invoke<TopicInfo>("create_topic");
-      console.log("[DocumentLoro] ✓ Topic created:", topic.topic_id);
-      console.log("[DocumentLoro] Members:", topic.members);
+      logger.log("[DocumentLoro] ✓ Topic created:", topic.topic_id);
+      logger.log("[DocumentLoro] Members:", topic.members);
       setCurrentTopic(topic);
       setLoroDoc(null); // Will be recreated in useEffect
     } catch (e) {
-      console.error("[DocumentLoro] ✗ Failed to create topic:", e);
+      logger.error("[DocumentLoro] ✗ Failed to create topic:", e);
       setError(String(e));
     }
   };
@@ -209,17 +199,17 @@ function Document({ isRunning, endpointId }: DocumentProps) {
     if (!joinInput.trim()) return;
     try {
       setError(null);
-      console.log("[DocumentLoro] Joining topic with invite...");
+      logger.log("[DocumentLoro] Joining topic with invite...");
       const topic = await invoke<TopicInfo>("join_topic", {
         inviteHex: joinInput.trim(),
       });
-      console.log("[DocumentLoro] ✓ Topic joined:", topic.topic_id);
-      console.log("[DocumentLoro] Members:", topic.members);
+      logger.log("[DocumentLoro] ✓ Topic joined:", topic.topic_id);
+      logger.log("[DocumentLoro] Members:", topic.members);
       setCurrentTopic(topic);
       setJoinInput("");
       setLoroDoc(null); // Will be recreated in useEffect
     } catch (e) {
-      console.error("[DocumentLoro] ✗ Failed to join topic:", e);
+      logger.error("[DocumentLoro] ✗ Failed to join topic:", e);
       setError(String(e));
     }
   };

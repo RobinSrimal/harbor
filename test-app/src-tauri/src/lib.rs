@@ -15,6 +15,7 @@ use harbor_core::{
 pub struct AppState {
     protocol: Arc<Mutex<Option<Protocol>>>,
     event_rx: Arc<Mutex<Option<mpsc::Receiver<ProtocolEvent>>>>,
+    frontend_log_path: Arc<Mutex<Option<std::path::PathBuf>>>,
 }
 
 impl Default for AppState {
@@ -22,6 +23,7 @@ impl Default for AppState {
         Self {
             protocol: Arc::new(Mutex::new(None)),
             event_rx: Arc::new(Mutex::new(None)),
+            frontend_log_path: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -147,9 +149,16 @@ async fn start_protocol(state: State<'_, AppState>) -> Result<StartResponse, Str
     
     // Use fixed db_key for persistent identity
     // Add bootstrap node so we can join the DHT network
-    let config = ProtocolConfig::for_testing()
+    // Check for HARBOR_DB_PATH env var to allow multiple instances
+    let mut config = ProtocolConfig::for_testing()
         .with_db_key(DB_KEY)
         .with_bootstrap_node(bootstrap_id.to_string());
+
+    // Allow overriding db path via environment variable for running multiple instances
+    if let Ok(db_path) = std::env::var("HARBOR_DB_PATH") {
+        println!("Using custom database path: {}", db_path);
+        config = config.with_db_path(db_path.into());
+    }
     
     let protocol = Protocol::start(config)
         .await
@@ -210,6 +219,16 @@ async fn start_protocol(state: State<'_, AppState>) -> Result<StartResponse, Str
     }
 
     *protocol_guard = Some(protocol);
+
+    // Set up frontend log file path if using custom db
+    if let Ok(db_path) = std::env::var("HARBOR_DB_PATH") {
+        let path = std::path::Path::new(&db_path);
+        if let Some(parent) = path.parent() {
+            let log_path = parent.join("frontend.log");
+            let mut log_guard = state.frontend_log_path.lock().await;
+            *log_guard = Some(log_path);
+        }
+    }
 
     Ok(StartResponse { endpoint_id })
 }
@@ -724,10 +743,70 @@ async fn sync_respond(
     Ok(())
 }
 
+/// Write a log message to the frontend log file
+#[tauri::command]
+async fn write_frontend_log(state: State<'_, AppState>, message: String) -> Result<(), String> {
+    let log_guard = state.frontend_log_path.lock().await;
+
+    if let Some(ref log_path) = *log_guard {
+        use std::io::Write;
+
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let log_line = format!("[{}] {}\n", timestamp, message);
+
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            let _ = file.write_all(log_line.as_bytes());
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Initialize tracing - write to file if HARBOR_DB_PATH is set
+    // Use try_init() to avoid panic if already initialized
+    if let Ok(db_path) = std::env::var("HARBOR_DB_PATH") {
+        // Extract instance directory from db path (e.g., "./test-data/instance1/harbor.db" -> "./test-data/instance1")
+        let path = std::path::Path::new(&db_path);
+        if let Some(parent) = path.parent() {
+            // Create the directory if it doesn't exist
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("Failed to create log directory: {}", e);
+                let _ = tracing_subscriber::fmt::try_init();
+            } else {
+                let log_path = parent.join("app.log");
+                println!("Logging to: {}", log_path.display());
+
+                // Create log file
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    Ok(log_file) => {
+                        // Initialize tracing with file output
+                        let _ = tracing_subscriber::fmt()
+                            .with_writer(std::sync::Mutex::new(log_file))
+                            .with_ansi(false)
+                            .try_init();
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to create log file: {}", e);
+                        let _ = tracing_subscriber::fmt::try_init();
+                    }
+                }
+            }
+        } else {
+            let _ = tracing_subscriber::fmt::try_init();
+        }
+    } else {
+        let _ = tracing_subscriber::fmt::try_init();
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -757,6 +836,8 @@ pub fn run() {
             sync_send_update,
             sync_request,
             sync_respond,
+            // Logging
+            write_frontend_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
