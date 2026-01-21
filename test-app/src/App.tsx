@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 import Dashboard from "./Dashboard";
-import Document from "./Document";
+import Document from "./DocumentLoro";
 
 interface Message {
   topic_id: string;
