@@ -130,10 +130,17 @@ function Document({ isRunning, endpointId }: DocumentProps) {
             console.log("[DocumentLoro] Update data size:", event.data.length, "bytes");
 
             // Apply the update to our Loro document
-            const updateBytes = new Uint8Array(event.data);
-            console.log("[DocumentLoro] Importing update into Loro doc...");
-            loroDoc.import(updateBytes);
-            console.log("[DocumentLoro] ✓ Update imported successfully");
+            try {
+              const updateBytes = new Uint8Array(event.data);
+              console.log("[DocumentLoro] Importing update into Loro doc...");
+              console.log("[DocumentLoro] Version BEFORE import:", loroDoc.oplogVersion());
+              loroDoc.import(updateBytes);
+              console.log("[DocumentLoro] Version AFTER import:", loroDoc.oplogVersion());
+              console.log("[DocumentLoro] Document state:", loroDoc.toJSON());
+              console.log("[DocumentLoro] ✓ Update imported successfully");
+            } catch (e) {
+              console.error("[DocumentLoro] ✗ Failed to import update:", e);
+            }
 
           } else if (event.type === "SyncRequest" && event.topic_id === currentTopic.topic_id) {
             console.log("[DocumentLoro] Received SyncRequest from:", event.sender_id);
@@ -156,10 +163,17 @@ function Document({ isRunning, endpointId }: DocumentProps) {
             console.log("[DocumentLoro] Response data size:", event.data.length, "bytes");
 
             // Received full state in response to our request
-            const snapshotBytes = new Uint8Array(event.data);
-            console.log("[DocumentLoro] Importing snapshot into Loro doc...");
-            loroDoc.import(snapshotBytes);
-            console.log("[DocumentLoro] ✓ Snapshot imported successfully");
+            try {
+              const snapshotBytes = new Uint8Array(event.data);
+              console.log("[DocumentLoro] Importing snapshot into Loro doc...");
+              console.log("[DocumentLoro] Version BEFORE import:", loroDoc.oplogVersion());
+              loroDoc.import(snapshotBytes);
+              console.log("[DocumentLoro] Version AFTER import:", loroDoc.oplogVersion());
+              console.log("[DocumentLoro] Document state:", loroDoc.toJSON());
+              console.log("[DocumentLoro] ✓ Snapshot imported successfully");
+            } catch (e) {
+              console.error("[DocumentLoro] ✗ Failed to import snapshot:", e);
+            }
 
           } else if (event.topic_id === currentTopic.topic_id) {
             console.log("[DocumentLoro] Ignoring event type:", event.type);
