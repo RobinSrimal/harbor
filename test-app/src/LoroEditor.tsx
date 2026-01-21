@@ -16,9 +16,15 @@ export function LoroEditor({ doc, containerName }: LoroEditorProps) {
   useEffect(() => {
     if (!editorRef.current || viewRef.current) return;
 
+    console.log("[LoroEditor] Initializing CodeMirror editor");
+    console.log("[LoroEditor] Container name:", containerName);
+
     // Create CodeMirror editor with Loro integration
+    const initialText = doc.getText(containerName).toString();
+    console.log("[LoroEditor] Initial text length:", initialText.length);
+
     const state = EditorState.create({
-      doc: doc.getText(containerName).toString(),
+      doc: initialText,
       extensions: [
         basicSetup,
         LoroExtensions(
@@ -35,9 +41,11 @@ export function LoroEditor({ doc, containerName }: LoroEditorProps) {
       parent: editorRef.current,
     });
 
+    console.log("[LoroEditor] ✓ CodeMirror editor created");
     viewRef.current = view;
 
     return () => {
+      console.log("[LoroEditor] Destroying editor");
       view.destroy();
       viewRef.current = null;
     };

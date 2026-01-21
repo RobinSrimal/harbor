@@ -370,6 +370,7 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
             Ok(event) => {
                 let app_event = match event {
                     ProtocolEvent::Message(msg) => {
+                        println!("[poll_events] Message event - topic: {}", hex::encode(&msg.topic_id[..4]));
                         AppEvent::Message(MessageEvent {
                             topic_id: hex::encode(msg.topic_id),
                             sender_id: hex::encode(msg.sender_id),
@@ -378,6 +379,7 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                         })
                     }
                     ProtocolEvent::FileAnnounced(ev) => {
+                        println!("[poll_events] FileAnnounced event - hash: {}", hex::encode(&ev.hash[..4]));
                         AppEvent::FileAnnounced(FileAnnouncedEventFE {
                             topic_id: hex::encode(ev.topic_id),
                             source_id: hex::encode(ev.source_id),
@@ -396,6 +398,7 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                         })
                     }
                     ProtocolEvent::FileComplete(ev) => {
+                        println!("[poll_events] FileComplete event - hash: {}", hex::encode(&ev.hash[..4]));
                         AppEvent::FileComplete(FileCompleteEventFE {
                             hash: hex::encode(ev.hash),
                             display_name: ev.display_name,
@@ -403,6 +406,11 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                         })
                     }
                     ProtocolEvent::SyncUpdate(ev) => {
+                        println!("[poll_events] SyncUpdate event - topic: {}, sender: {}, size: {} bytes",
+                            hex::encode(&ev.topic_id[..4]),
+                            hex::encode(&ev.sender_id[..4]),
+                            ev.data.len()
+                        );
                         // Pass through to frontend - it will handle with Loro
                         AppEvent::SyncUpdate(SyncUpdateEventFE {
                             topic_id: hex::encode(ev.topic_id),
@@ -411,6 +419,10 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                         })
                     }
                     ProtocolEvent::SyncRequest(ev) => {
+                        println!("[poll_events] SyncRequest event - topic: {}, sender: {}",
+                            hex::encode(&ev.topic_id[..4]),
+                            hex::encode(&ev.sender_id[..4])
+                        );
                         // Pass through to frontend - it will export and respond
                         AppEvent::SyncRequest(SyncRequestEventFE {
                             topic_id: hex::encode(ev.topic_id),
@@ -418,6 +430,10 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                         })
                     }
                     ProtocolEvent::SyncResponse(ev) => {
+                        println!("[poll_events] SyncResponse event - topic: {}, size: {} bytes",
+                            hex::encode(&ev.topic_id[..4]),
+                            ev.data.len()
+                        );
                         // Pass through to frontend - it will import the snapshot
                         AppEvent::SyncResponse(SyncResponseEventFE {
                             topic_id: hex::encode(ev.topic_id),
@@ -432,6 +448,10 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                 return Err("Event channel disconnected".to_string());
             }
         }
+    }
+
+    if !events.is_empty() {
+        println!("[poll_events] Returning {} events to frontend", events.len());
     }
 
     Ok(events)
@@ -602,6 +622,9 @@ async fn sync_send_update(
     topic_id: String,
     data: Vec<u8>,
 ) -> Result<(), String> {
+    println!("[sync_send_update] Called for topic: {}", &topic_id[..16]);
+    println!("[sync_send_update] Data size: {} bytes", data.len());
+
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
 
@@ -615,9 +638,16 @@ async fn sync_send_update(
     let mut topic_arr = [0u8; 32];
     topic_arr.copy_from_slice(&topic_bytes);
 
+    println!("[sync_send_update] Calling protocol.send_sync_update...");
     protocol.send_sync_update(&topic_arr, data)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            println!("[sync_send_update] ✗ Error: {}", e);
+            e.to_string()
+        })?;
+
+    println!("[sync_send_update] ✓ Success");
+    Ok(())
 }
 
 /// Request sync state from all topic members
@@ -626,6 +656,8 @@ async fn sync_request(
     state: State<'_, AppState>,
     topic_id: String,
 ) -> Result<(), String> {
+    println!("[sync_request] Called for topic: {}", &topic_id[..16]);
+
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
 
@@ -639,9 +671,16 @@ async fn sync_request(
     let mut topic_arr = [0u8; 32];
     topic_arr.copy_from_slice(&topic_bytes);
 
+    println!("[sync_request] Calling protocol.request_sync...");
     protocol.request_sync(&topic_arr)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            println!("[sync_request] ✗ Error: {}", e);
+            e.to_string()
+        })?;
+
+    println!("[sync_request] ✓ Success");
+    Ok(())
 }
 
 /// Respond to a sync request with full CRDT state
@@ -652,6 +691,10 @@ async fn sync_respond(
     requester_id: String,
     data: Vec<u8>,
 ) -> Result<(), String> {
+    println!("[sync_respond] Called for topic: {}", &topic_id[..16]);
+    println!("[sync_respond] Requester: {}", &requester_id[..16]);
+    println!("[sync_respond] Data size: {} bytes", data.len());
+
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
 
@@ -669,9 +712,16 @@ async fn sync_respond(
     topic_arr.copy_from_slice(&topic_bytes);
     requester_arr.copy_from_slice(&requester_bytes);
 
+    println!("[sync_respond] Calling protocol.respond_sync...");
     protocol.respond_sync(&topic_arr, &requester_arr, data)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            println!("[sync_respond] ✗ Error: {}", e);
+            e.to_string()
+        })?;
+
+    println!("[sync_respond] ✓ Success");
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
