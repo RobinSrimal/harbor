@@ -11,7 +11,7 @@ use tracing::{debug, trace};
 
 use crate::data::current_timestamp;
 use crate::network::dht::{ApiClient as DhtApiClient, Id};
-use crate::network::dht::rpc::{FindNode, FindNodeResponse, NodeInfo};
+use crate::network::dht::protocol::{FindNode, FindNodeResponse, NodeInfo};
 
 use crate::protocol::{Protocol, ProtocolError};
 

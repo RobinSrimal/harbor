@@ -20,8 +20,10 @@ use crate::network::dht::{
     bootstrap_dial_info, bootstrap_node_ids, create_dht_node_with_buckets, ApiClient as DhtApiClient,
     Buckets, DhtConfig, DhtPool, DhtPoolConfig, DialInfo, RpcClient as DhtRpcClient, DHT_ALPN,
 };
+use crate::data::BlobStore;
 use crate::network::harbor::protocol::HARBOR_ALPN;
 use crate::network::send::{SendPool, SendPoolConfig, protocol::SEND_ALPN};
+use crate::network::share::{ShareConfig, ShareService, SHARE_ALPN};
 use crate::network::sync::protocol::SYNC_ALPN;
 
 use super::config::ProtocolConfig;
@@ -60,6 +62,8 @@ pub struct Protocol {
     pub(crate) dht_client: Option<DhtApiClient>,
     /// Send protocol connection pool
     pub(crate) send_pool: SendPool,
+    /// Share service for file distribution
+    pub(crate) share_service: Arc<ShareService>,
     /// Event sender (for app notifications: messages, file events, etc.)
     pub(crate) event_tx: mpsc::Sender<ProtocolEvent>,
     /// Event receiver (cloneable via Arc)
@@ -115,7 +119,7 @@ impl Protocol {
             SEND_ALPN.to_vec(),
             HARBOR_ALPN.to_vec(),
             DHT_ALPN.to_vec(),
-            crate::network::share::SHARE_ALPN.to_vec(),
+            SHARE_ALPN.to_vec(),
             SYNC_ALPN.to_vec(),
         ];
         let endpoint = Endpoint::builder()
@@ -268,6 +272,25 @@ impl Protocol {
         // Initialize Send connection pool
         let send_pool = SendPool::new(endpoint.clone(), SendPoolConfig::default());
 
+        // Initialize Share service
+        let blob_path = if let Some(ref path) = config.blob_path {
+            path.clone()
+        } else if let Some(ref db_path) = config.db_path {
+            db_path.parent()
+                .map(|p| p.join(".harbor_blobs"))
+                .unwrap_or_else(|| PathBuf::from(".harbor_blobs"))
+        } else {
+            crate::data::default_blob_path().unwrap_or_else(|_| PathBuf::from(".harbor_blobs"))
+        };
+        let blob_store = Arc::new(BlobStore::new(&blob_path)
+            .map_err(|e| ProtocolError::StartFailed(format!("failed to create blob store: {}", e)))?);
+        let share_service = Arc::new(ShareService::new(
+            endpoint.clone(),
+            identity.public_key,
+            blob_store,
+            ShareConfig::default(),
+        ));
+
         let protocol = Self {
             config,
             endpoint,
@@ -276,6 +299,7 @@ impl Protocol {
             dht_rpc_client,
             dht_client,
             send_pool,
+            share_service,
             event_tx,
             event_rx: Arc::new(RwLock::new(Some(event_rx))),
             running: Arc::new(RwLock::new(true)),
@@ -391,7 +415,7 @@ impl Protocol {
     ) -> Result<(), ProtocolError> {
         use crate::data::get_topic_members_with_info;
         use crate::network::harbor::protocol::HarborPacketType;
-        use crate::network::membership::messages::{TopicMessage, SyncUpdateMessage};
+        use crate::network::send::topic_messages::{TopicMessage, SyncUpdateMessage};
         use super::types::MemberInfo;
         
         self.check_running().await?;
@@ -447,7 +471,7 @@ impl Protocol {
     ) -> Result<(), ProtocolError> {
         use crate::data::get_topic_members_with_info;
         use crate::network::harbor::protocol::HarborPacketType;
-        use crate::network::membership::messages::TopicMessage;
+        use crate::network::send::topic_messages::TopicMessage;
         use super::types::MemberInfo;
         
         self.check_running().await?;
@@ -488,68 +512,13 @@ impl Protocol {
             recipients = recipients.len(),
             "Broadcasting sync request"
         );
-        
+
         // Broadcast to all members
         self.send_raw_with_info(topic_id, &encoded, &recipients, HarborPacketType::Content)
             .await
     }
-    
-    /// Respond to a sync request with current state
-    ///
-    /// Call this when you receive `ProtocolEvent::SyncRequest`.
-    /// Uses direct SYNC_ALPN connection - no size limit.
-    pub async fn respond_sync(
-        &self,
-        topic_id: &[u8; 32],
-        requester_id: &[u8; 32],
-        data: Vec<u8>,
-    ) -> Result<(), ProtocolError> {
-        self.check_running().await?;
 
-        // Build raw SYNC_ALPN message format:
-        // [32 bytes topic_id][1 byte type = 0x02][data]
-        let mut message = Vec::with_capacity(32 + 1 + data.len());
-        message.extend_from_slice(topic_id);
-        message.push(0x02); // SyncResponse type
-        message.extend_from_slice(&data);
-
-        // Connect to requester via SYNC_ALPN
-        let node_id = iroh::NodeId::from_bytes(requester_id)
-            .map_err(|e| ProtocolError::Network(format!("invalid node id: {}", e)))?;
-
-        let conn = self.endpoint
-            .connect(node_id, SYNC_ALPN)
-            .await
-            .map_err(|e| ProtocolError::Network(format!("connection failed: {}", e)))?;
-
-        let mut send = conn
-            .open_uni()
-            .await
-            .map_err(|e| ProtocolError::Network(format!("failed to open stream: {}", e)))?;
-
-        tokio::io::AsyncWriteExt::write_all(&mut send, &message)
-            .await
-            .map_err(|e| ProtocolError::Network(format!("failed to write: {}", e)))?;
-
-        // Finish the stream - this signals we're done sending
-        send.finish()
-            .map_err(|e| ProtocolError::Network(format!("failed to finish: {}", e)))?;
-
-        // Wait for the stream to actually be transmitted before dropping connection
-        // stopped() completes when the peer has received and acknowledged the data
-        send.stopped()
-            .await
-            .map_err(|e| ProtocolError::Network(format!("stream error: {}", e)))?;
-
-        info!(
-            topic = %hex::encode(&topic_id[..8]),
-            requester = %hex::encode(&requester_id[..8]),
-            size = data.len(),
-            "Sent sync response via SYNC_ALPN"
-        );
-
-        Ok(())
-    }
+    // Note: respond_sync() is implemented in handlers/outgoing/sync.rs
 
     /// Save the current DHT routing table to the database
     pub(crate) async fn save_dht_routing_table(

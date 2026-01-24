@@ -8,7 +8,7 @@ use tracing::{info, trace};
 
 use crate::data::get_topic_members_with_info;
 use crate::network::harbor::protocol::HarborPacketType;
-use crate::network::membership::messages::TopicMessage;
+use crate::network::send::topic_messages::TopicMessage;
 
 use super::core::{Protocol, MAX_MESSAGE_SIZE};
 use super::error::ProtocolError;

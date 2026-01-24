@@ -10,16 +10,17 @@ use futures::future::join_all;
 use iroh::{NodeId, NodeAddr};
 use tracing::{debug, trace, info};
 
-use crate::data::send::store_outgoing_packet;
 use crate::data::WILDCARD_RECIPIENT;
 use crate::network::harbor::protocol::HarborPacketType;
-use crate::network::send::protocol::SendMessage;
-use crate::security::{create_packet, harbor_id_from_topic};
+use crate::network::send::outgoing::prepare_packet;
 
 use crate::protocol::{Protocol, MemberInfo, ProtocolError};
 
 impl Protocol {
     /// Internal: Send raw payload to specific recipients (by endpoint ID only)
+    ///
+    /// Delegates packet creation and storage to the service layer,
+    /// then handles parallel transport to all recipients.
     pub(crate) async fn send_raw(
         &self,
         topic_id: &[u8; 32],
@@ -27,36 +28,20 @@ impl Protocol {
         recipients: &[[u8; 32]],
         packet_type: HarborPacketType,
     ) -> Result<(), ProtocolError> {
-        // Create packet
-        let packet = create_packet(
-            topic_id,
-            &self.identity.private_key,
-            &self.identity.public_key,
-            payload,
-        ).map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        let packet_id = packet.packet_id;
-        let harbor_id = harbor_id_from_topic(topic_id);
-        let packet_bytes = packet.to_bytes()
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        // Store in outgoing table for tracking
-        {
+        // Delegate packet creation and storage to service layer
+        let (packet_id, encoded) = {
             let mut db = self.db.lock().await;
-            store_outgoing_packet(
-                &mut db,
-                &packet_id,
+            prepare_packet(
                 topic_id,
-                &harbor_id,
-                &packet_bytes,
+                payload,
                 recipients,
-                packet_type as u8,
-            ).map_err(|e| ProtocolError::Database(e.to_string()))?;
-        }
-
-        // Encode for wire
-        let message = SendMessage::Packet(packet);
-        let encoded = message.encode();
+                packet_type,
+                &self.identity.private_key,
+                &self.identity.public_key,
+                &mut db,
+            )
+            .map_err(|e| ProtocolError::Network(e.to_string()))?
+        };
 
         if recipients.is_empty() {
             debug!(packet_id = hex::encode(packet_id), "no recipients");
@@ -69,7 +54,7 @@ impl Protocol {
             "sending to recipients in parallel"
         );
 
-        // Send to ALL recipients in parallel
+        // Send to ALL recipients in parallel (transport layer)
         let send_futures = recipients.iter().map(|recipient| {
             let encoded = encoded.clone();
             let recipient_id = *recipient;
@@ -108,18 +93,16 @@ impl Protocol {
             "parallel send complete"
         );
 
-        // If all sends failed, return error
         if delivered == 0 && failed > 0 {
             return Err(ProtocolError::Network("all sends failed".to_string()));
         }
-
-        // Receipts will be handled by incoming handler
-        // Harbor replication will be handled by background task if receipts don't arrive
 
         Ok(())
     }
 
     /// Send encoded data to a single node (by endpoint ID only)
+    ///
+    /// Pure transport function - no business logic.
     pub(crate) async fn send_to_node(
         &self,
         recipient: &[u8; 32],
@@ -160,6 +143,9 @@ impl Protocol {
     }
 
     /// Send raw payload to members using their connection info (with relay URLs)
+    ///
+    /// Delegates packet creation and storage to the service layer,
+    /// then handles parallel transport to all members.
     pub(crate) async fn send_raw_with_info(
         &self,
         topic_id: &[u8; 32],
@@ -167,39 +153,23 @@ impl Protocol {
         members: &[MemberInfo],
         packet_type: HarborPacketType,
     ) -> Result<(), ProtocolError> {
-        // Create packet
-        let packet = create_packet(
-            topic_id,
-            &self.identity.private_key,
-            &self.identity.public_key,
-            payload,
-        ).map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        let packet_id = packet.packet_id;
-        let harbor_id = harbor_id_from_topic(topic_id);
-        let packet_bytes = packet.to_bytes()
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
         // Get recipient IDs for storage
         let recipient_ids: Vec<[u8; 32]> = members.iter().map(|m| m.endpoint_id).collect();
 
-        // Store in outgoing table for tracking
-        {
+        // Delegate packet creation and storage to service layer
+        let (packet_id, encoded) = {
             let mut db = self.db.lock().await;
-            store_outgoing_packet(
-                &mut db,
-                &packet_id,
+            prepare_packet(
                 topic_id,
-                &harbor_id,
-                &packet_bytes,
+                payload,
                 &recipient_ids,
-                packet_type as u8,
-            ).map_err(|e| ProtocolError::Database(e.to_string()))?;
-        }
-
-        // Encode for wire
-        let message = SendMessage::Packet(packet);
-        let encoded = message.encode();
+                packet_type,
+                &self.identity.private_key,
+                &self.identity.public_key,
+                &mut db,
+            )
+            .map_err(|e| ProtocolError::Network(e.to_string()))?
+        };
 
         // Filter out self and wildcard (wildcard is only for Harbor storage, not actual sending)
         let our_id = self.identity.public_key;
@@ -219,7 +189,7 @@ impl Protocol {
             "sending to recipients in parallel"
         );
 
-        // Send to ALL recipients in parallel
+        // Send to ALL recipients in parallel (transport layer)
         let send_futures = recipients.iter().map(|member| {
             let encoded = encoded.clone();
             let endpoint_id = member.endpoint_id;
@@ -259,7 +229,6 @@ impl Protocol {
             "parallel send complete"
         );
 
-        // If all sends failed, return error
         if delivered == 0 && failed > 0 {
             return Err(ProtocolError::Network("all sends failed".to_string()));
         }
@@ -268,6 +237,8 @@ impl Protocol {
     }
 
     /// Send data to a member using their connection info (includes relay URL if available)
+    ///
+    /// Pure transport function - no business logic.
     pub(crate) async fn send_to_member(
         &self,
         member: &MemberInfo,
@@ -312,13 +283,11 @@ impl Protocol {
             .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
         // Finish the stream - this signals we're done sending
-        // In iroh 0.93+, finish() is sync but we need stopped() to wait for transmission
         send_stream
             .finish()
             .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
         // Wait for the stream to actually be transmitted before dropping connection
-        // stopped() completes when the peer has received and acknowledged the data
         send_stream
             .stopped()
             .await
@@ -360,9 +329,9 @@ mod tests {
             MemberInfo::new(make_id(2)),
             MemberInfo::new(make_id(3)),
         ];
-        
+
         let recipient_ids: Vec<[u8; 32]> = members.iter().map(|m| m.endpoint_id).collect();
-        
+
         assert_eq!(recipient_ids.len(), 3);
         assert_eq!(recipient_ids[0], make_id(1));
         assert_eq!(recipient_ids[1], make_id(2));
@@ -377,12 +346,12 @@ mod tests {
             MemberInfo::new(make_id(2)),
             MemberInfo::new(make_id(3)),
         ];
-        
+
         let filtered: Vec<_> = members
             .into_iter()
             .filter(|m| m.endpoint_id != our_id)
             .collect();
-        
+
         assert_eq!(filtered.len(), 2);
         assert!(filtered.iter().all(|m| m.endpoint_id != our_id));
     }
@@ -391,7 +360,6 @@ mod tests {
     fn test_node_id_from_bytes() {
         let id = make_id(42);
         let result = iroh::NodeId::from_bytes(&id);
-        // This should succeed for any valid 32-byte array
         assert!(result.is_ok());
     }
 
@@ -409,4 +377,3 @@ mod tests {
         assert!(parsed.is_err());
     }
 }
-

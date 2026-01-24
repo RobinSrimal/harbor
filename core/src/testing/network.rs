@@ -4,8 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::network::dht::distance::Id;
-use crate::network::dht::routing::K;
+use crate::network::dht::{Id, K};
 
 use super::node::{TestNode, IncomingMessage, OutgoingMessage};
 

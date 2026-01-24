@@ -65,7 +65,7 @@ harbor-core/
 │   ├── membership/ # Topic join/leave messages
 │   ├── send/       # Direct message sending (includes CRDT sync messages)
 │   ├── share/      # P2P file sharing protocol
-│   └── sync/       # CRDT sync protocol (direct peer-to-peer, no size limit)
+│   └── sync/       # CRDT sync protocol (direct peer-to-peer, for initial sync)
 ├── protocol/       # Core Protocol struct 
 ├── resilience/     # Rate limiting, PoW, storage limits
 ├── security/       # Cryptographic operations

@@ -12,7 +12,7 @@ use irpc::rpc_requests;
 use serde::{Deserialize, Serialize};
 
 use super::distance::Id;
-use super::rpc::NodeInfo;
+use crate::network::dht::protocol::NodeInfo;
 
 /// DHT API protocol definition
 #[rpc_requests(message = ApiMessage)]

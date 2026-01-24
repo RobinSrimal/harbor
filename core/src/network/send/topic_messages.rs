@@ -1,9 +1,3 @@
-//! Topic control messages
-//!
-//! These messages are sent as Send packet payloads to notify topic members
-//! of membership changes.
-
-
 use serde::{Deserialize, Serialize};
 
 use crate::security::send::packet::VerificationMode;

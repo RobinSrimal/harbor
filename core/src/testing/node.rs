@@ -4,8 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::network::dht::distance::Id;
-use crate::network::dht::routing::RoutingTable;
+use crate::network::dht::{Id, RoutingTable};
 use crate::security::create_key_pair::{generate_key_pair, KeyPair};
 use crate::security::send::packet::SendPacket;
 use crate::security::topic_keys::TopicKeys;

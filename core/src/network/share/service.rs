@@ -18,13 +18,13 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, trace, warn};
 
 use crate::data::{
-    BlobState, BlobStore, CHUNK_SIZE,
-    add_blob_recipient, get_blob, get_section_peer_suggestion, get_section_traces,
-    init_blob_sections, insert_blob, mark_blob_complete,
+    BlobMetadata, BlobState, BlobStore, CHUNK_SIZE, SectionTrace,
+    add_blob_recipient, get_blob, get_blobs_for_topic, get_section_peer_suggestion, get_section_traces,
+    get_topic_members_with_info, init_blob_sections, insert_blob, mark_blob_complete,
     record_section_received,
 };
 use super::protocol::{
-    BitfieldMessage, ChunkMapResponse, ChunkResponse,
+    BitfieldMessage, ChunkAck, ChunkMapRequest, ChunkMapResponse, ChunkRequest, ChunkResponse,
     FileAnnouncement, InitialRecipient, PeerChunks, PeerSuggestion, ShareMessage, SHARE_ALPN,
 };
 
@@ -94,6 +94,58 @@ impl From<std::io::Error> for ShareError {
         ShareError::Io(e)
     }
 }
+
+/// Status of a file share operation
+#[derive(Debug, Clone)]
+pub struct ShareStatus {
+    /// Blob hash
+    pub hash: [u8; 32],
+    /// Display name
+    pub display_name: String,
+    /// Total size in bytes
+    pub total_size: u64,
+    /// Total number of chunks
+    pub total_chunks: u32,
+    /// Number of sections
+    pub num_sections: u8,
+    /// Current state
+    pub state: BlobState,
+    /// Chunks we have locally (bitfield)
+    pub local_chunks: Vec<bool>,
+    /// Number of chunks we have
+    pub chunks_complete: u32,
+    /// Section traces (who has what sections)
+    pub section_traces: Vec<SectionTrace>,
+}
+
+/// Calculate number of sections based on chunk count
+fn calculate_num_sections(total_chunks: u32) -> u8 {
+    // Use min(5, chunks) sections, at least 1
+    std::cmp::min(5, std::cmp::max(1, total_chunks)) as u8
+}
+
+/// Error during incoming share message processing
+#[derive(Debug)]
+pub enum ProcessShareError {
+    /// Database error
+    Database(String),
+    /// Blob not found
+    BlobNotFound,
+    /// IO error (chunk read/write)
+    Io(String),
+}
+
+impl std::fmt::Display for ProcessShareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProcessShareError::Database(e) => write!(f, "database error: {}", e),
+            ProcessShareError::BlobNotFound => write!(f, "blob not found"),
+            ProcessShareError::Io(e) => write!(f, "IO error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for ProcessShareError {}
 
 /// Active transfer state
 #[derive(Debug)]
@@ -518,6 +570,438 @@ impl ShareService {
     pub fn blob_store(&self) -> &BlobStore {
         &self.blob_store
     }
+
+    /// Get recipient IDs for a can-seed announcement
+    ///
+    /// Returns the endpoint IDs of all topic members to broadcast the announcement to.
+    pub async fn get_can_seed_recipients(
+        &self,
+        topic_id: &[u8; 32],
+        db: &Mutex<DbConnection>,
+    ) -> Result<Vec<[u8; 32]>, ShareError> {
+        let db_lock = db.lock().await;
+        let members = get_topic_members_with_info(&db_lock, topic_id)
+            .map_err(|e| ShareError::Database(e.to_string()))?;
+
+        Ok(members.iter().map(|m| m.endpoint_id).collect())
+    }
+
+    // ========================================================================
+    // High-level operations (moved from protocol/share.rs)
+    // ========================================================================
+
+    /// Get the status of a shared file
+    pub async fn get_status(
+        &self,
+        hash: &[u8; 32],
+        db: &Mutex<DbConnection>,
+    ) -> Result<ShareStatus, ShareError> {
+        let (metadata, section_traces) = {
+            let db_lock = db.lock().await;
+
+            let metadata = get_blob(&db_lock, hash)
+                .map_err(|e| ShareError::Database(e.to_string()))?
+                .ok_or(ShareError::BlobNotFound)?;
+
+            let traces = get_section_traces(&db_lock, hash)
+                .map_err(|e| ShareError::Database(e.to_string()))?;
+
+            (metadata, traces)
+        };
+
+        // Get local chunk bitfield
+        let local_chunks = self.blob_store.get_chunk_bitfield(hash, metadata.total_chunks)?;
+        let chunks_complete = local_chunks.iter().filter(|&&b| b).count() as u32;
+
+        Ok(ShareStatus {
+            hash: *hash,
+            display_name: metadata.display_name,
+            total_size: metadata.total_size,
+            total_chunks: metadata.total_chunks,
+            num_sections: metadata.num_sections,
+            state: metadata.state,
+            local_chunks,
+            chunks_complete,
+            section_traces,
+        })
+    }
+
+    /// List all shared files for a topic
+    pub async fn list_blobs(
+        &self,
+        topic_id: &[u8; 32],
+        db: &Mutex<DbConnection>,
+    ) -> Result<Vec<BlobMetadata>, ShareError> {
+        let db_lock = db.lock().await;
+        get_blobs_for_topic(&db_lock, topic_id)
+            .map_err(|e| ShareError::Database(e.to_string()))
+    }
+
+    /// Export a completed blob to a file
+    pub fn export_blob(
+        &self,
+        hash: &[u8; 32],
+        dest_path: &Path,
+        db: &Mutex<DbConnection>,
+    ) -> Result<(), ShareError> {
+        // Check blob is complete (synchronous check via try_lock for simplicity)
+        // In practice, caller should use async version
+        let metadata = {
+            // Use blocking lock since we're in a sync context
+            let db_lock = futures::executor::block_on(db.lock());
+            get_blob(&db_lock, hash)
+                .map_err(|e| ShareError::Database(e.to_string()))?
+                .ok_or(ShareError::BlobNotFound)?
+        };
+
+        if metadata.state != BlobState::Complete {
+            return Err(ShareError::Protocol("Cannot export incomplete blob".to_string()));
+        }
+
+        self.blob_store.export_file(hash, dest_path)?;
+        Ok(())
+    }
+
+    /// Export a completed blob to a file (async version)
+    pub async fn export_blob_async(
+        &self,
+        hash: &[u8; 32],
+        dest_path: &Path,
+        db: &Mutex<DbConnection>,
+    ) -> Result<(), ShareError> {
+        // Check blob is complete
+        let metadata = {
+            let db_lock = db.lock().await;
+            get_blob(&db_lock, hash)
+                .map_err(|e| ShareError::Database(e.to_string()))?
+                .ok_or(ShareError::BlobNotFound)?
+        };
+
+        if metadata.state != BlobState::Complete {
+            return Err(ShareError::Protocol("Cannot export incomplete blob".to_string()));
+        }
+
+        self.blob_store.export_file(hash, dest_path)?;
+        Ok(())
+    }
+
+    /// Share a file with topic members
+    ///
+    /// This is the main share workflow:
+    /// 1. Import file to blob store
+    /// 2. Store metadata in database
+    /// 3. Return hash for announcement (caller sends via send_raw)
+    pub async fn share_file(
+        &self,
+        file_path: &Path,
+        topic_id: &[u8; 32],
+        db: &Mutex<DbConnection>,
+    ) -> Result<([u8; 32], u64, u32, u8, String), ShareError> {
+        // Check file exists and is large enough
+        let file_metadata = std::fs::metadata(file_path)
+            .map_err(|_| ShareError::FileNotFound(file_path.display().to_string()))?;
+
+        if file_metadata.len() < CHUNK_SIZE {
+            return Err(ShareError::FileTooSmall(file_metadata.len()));
+        }
+
+        info!(
+            file = %file_path.display(),
+            size = file_metadata.len(),
+            topic = hex::encode(&topic_id[..8]),
+            "Starting file share"
+        );
+
+        // Import the file
+        let (hash, size) = self.blob_store.import_file(file_path)?;
+
+        let total_chunks = ((size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
+        let num_sections = calculate_num_sections(total_chunks);
+
+        let display_name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unnamed")
+            .to_string();
+
+        // Store metadata in database
+        {
+            let db_lock = db.lock().await;
+            insert_blob(
+                &db_lock,
+                &hash,
+                topic_id,
+                &self.our_id,
+                &display_name,
+                size,
+                num_sections,
+            )
+            .map_err(|e| ShareError::Database(e.to_string()))?;
+
+            // Mark as complete since we have the full file
+            mark_blob_complete(&db_lock, &hash)
+                .map_err(|e| ShareError::Database(e.to_string()))?;
+        }
+
+        info!(
+            hash = hex::encode(&hash[..8]),
+            size = size,
+            chunks = total_chunks,
+            sections = num_sections,
+            "File imported for sharing"
+        );
+
+        Ok((hash, size, total_chunks, num_sections, display_name))
+    }
+}
+
+// Note: pull_blob and push_section_to_peer are implemented in protocol/share.rs
+// since they require transport (Protocol's request_chunks, connect_for_share, etc.)
+
+/// Process an incoming share message - handles all business logic
+///
+/// This function:
+/// 1. Routes the message to the appropriate handler
+/// 2. Performs database operations
+/// 3. Reads/writes chunks as needed
+/// 4. Returns response messages to send back
+///
+/// # Arguments
+/// * `message` - The incoming ShareMessage
+/// * `sender_id` - The sender's EndpointID (from connection)
+/// * `our_id` - Our EndpointID
+/// * `db` - Database connection
+/// * `blob_store` - Blob storage
+///
+/// # Returns
+/// * Vec of response ShareMessages to send back (may be empty)
+pub async fn process_incoming_share_message(
+    message: ShareMessage,
+    sender_id: [u8; 32],
+    our_id: [u8; 32],
+    db: &Mutex<DbConnection>,
+    blob_store: &BlobStore,
+) -> Vec<ShareMessage> {
+    match message {
+        ShareMessage::ChunkMapRequest(req) => {
+            handle_chunk_map_request(db, blob_store, our_id, req)
+                .await
+                .into_iter()
+                .collect()
+        }
+        ShareMessage::ChunkRequest(req) => {
+            handle_chunk_request(db, blob_store, sender_id, req).await
+        }
+        ShareMessage::Bitfield(bitfield) => {
+            handle_bitfield(sender_id, bitfield);
+            Vec::new()
+        }
+        ShareMessage::ChunkResponse(resp) => {
+            handle_chunk_response(db, blob_store, sender_id, resp)
+                .await
+                .into_iter()
+                .collect()
+        }
+        ShareMessage::PeerSuggestion(suggestion) => {
+            debug!(
+                hash = %hex::encode(&suggestion.hash[..8]),
+                section = suggestion.section_id,
+                suggested = %hex::encode(&suggestion.suggested_peer[..8]),
+                "received peer suggestion"
+            );
+            Vec::new()
+        }
+        ShareMessage::ChunkAck(ack) => {
+            trace!(
+                hash = %hex::encode(&ack.hash[..8]),
+                chunk = ack.chunk_index,
+                "received chunk ack"
+            );
+            Vec::new()
+        }
+        ShareMessage::ChunkMapResponse(_) => {
+            // Response message, shouldn't receive this as a request
+            Vec::new()
+        }
+    }
+}
+
+/// Handle ChunkMapRequest - respond with who has what
+async fn handle_chunk_map_request(
+    db: &Mutex<DbConnection>,
+    _blob_store: &BlobStore,
+    our_id: [u8; 32],
+    req: ChunkMapRequest,
+) -> Option<ShareMessage> {
+    let db_lock = db.lock().await;
+
+    // Get blob metadata
+    let blob = match get_blob(&db_lock, &req.hash) {
+        Ok(Some(b)) => b,
+        _ => return None,
+    };
+
+    // Get section traces
+    let traces = match get_section_traces(&db_lock, &req.hash) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+
+    let mut peers = Vec::new();
+
+    // Add peers from traces
+    for trace in traces {
+        if let Some(peer_id) = trace.received_from {
+            peers.push(PeerChunks {
+                endpoint_id: peer_id,
+                chunk_start: trace.chunk_start,
+                chunk_end: trace.chunk_end,
+            });
+        }
+    }
+
+    // Add ourselves if we're the source and complete
+    if blob.source_id == our_id && blob.state == BlobState::Complete {
+        peers.push(PeerChunks {
+            endpoint_id: our_id,
+            chunk_start: 0,
+            chunk_end: blob.total_chunks,
+        });
+    }
+
+    Some(ShareMessage::ChunkMapResponse(ChunkMapResponse {
+        hash: req.hash,
+        peers,
+    }))
+}
+
+/// Handle ChunkRequest - send requested chunks
+///
+/// Returns all requested chunks as multiple ChunkResponse messages
+async fn handle_chunk_request(
+    db: &Mutex<DbConnection>,
+    blob_store: &BlobStore,
+    sender_id: [u8; 32],
+    req: ChunkRequest,
+) -> Vec<ShareMessage> {
+    // Check if we have this blob
+    {
+        let db_lock = db.lock().await;
+        match get_blob(&db_lock, &req.hash) {
+            Ok(Some(_)) => {}
+            _ => return Vec::new(),
+        }
+    };
+
+    // Send all requested chunks
+    let mut responses = Vec::with_capacity(req.chunks.len());
+
+    for &chunk_index in &req.chunks {
+        match blob_store.read_chunk(&req.hash, chunk_index) {
+            Ok(data) => {
+                trace!(
+                    hash = %hex::encode(&req.hash[..8]),
+                    chunk = chunk_index,
+                    to = %hex::encode(&sender_id[..8]),
+                    "sending chunk"
+                );
+
+                responses.push(ShareMessage::ChunkResponse(ChunkResponse {
+                    hash: req.hash,
+                    chunk_index,
+                    data,
+                }));
+            }
+            Err(e) => {
+                debug!(error = %e, chunk = chunk_index, "failed to read chunk");
+                // Continue with other chunks even if one fails
+            }
+        }
+    }
+
+    if !responses.is_empty() {
+        debug!(
+            hash = %hex::encode(&req.hash[..8]),
+            chunks = responses.len(),
+            to = %hex::encode(&sender_id[..8]),
+            "sending {} chunks",
+            responses.len()
+        );
+    }
+
+    responses
+}
+
+/// Handle incoming Bitfield - log for tracking
+fn handle_bitfield(sender_id: [u8; 32], bitfield: BitfieldMessage) {
+    let chunk_count = bitfield.bitfield.len() * 8;
+    trace!(
+        hash = %hex::encode(&bitfield.hash[..8]),
+        from = %hex::encode(&sender_id[..8]),
+        chunks = chunk_count,
+        "received bitfield"
+    );
+}
+
+/// Handle incoming ChunkResponse - store the chunk
+async fn handle_chunk_response(
+    db: &Mutex<DbConnection>,
+    blob_store: &BlobStore,
+    sender_id: [u8; 32],
+    resp: ChunkResponse,
+) -> Option<ShareMessage> {
+    // Get blob metadata for total_size
+    let blob = {
+        let db_lock = db.lock().await;
+        match get_blob(&db_lock, &resp.hash) {
+            Ok(Some(b)) => b,
+            _ => return None,
+        }
+    };
+
+    // Write chunk to storage
+    if let Err(e) = blob_store.write_chunk(
+        &resp.hash,
+        resp.chunk_index,
+        &resp.data,
+        blob.total_size,
+    ) {
+        warn!(error = %e, "failed to write chunk");
+        return None;
+    }
+
+    debug!(
+        hash = %hex::encode(&resp.hash[..8]),
+        chunk = resp.chunk_index,
+        total = blob.total_chunks,
+        from = %hex::encode(&sender_id[..8]),
+        "SHARE: Received chunk"
+    );
+
+    // Check if blob is now complete
+    if blob_store.is_complete(&resp.hash, blob.total_chunks).unwrap_or(false) {
+        // Mark as complete in database
+        {
+            let db_lock = db.lock().await;
+            if let Err(e) = mark_blob_complete(&db_lock, &resp.hash) {
+                warn!(error = %e, "failed to mark blob complete");
+            }
+        }
+
+        info!(
+            hash = hex::encode(&resp.hash[..8]),
+            name = blob.display_name,
+            size = blob.total_size,
+            chunks = blob.total_chunks,
+            "SHARE: File complete"
+        );
+    }
+
+    // Send acknowledgment
+    Some(ShareMessage::ChunkAck(ChunkAck {
+        hash: resp.hash,
+        chunk_index: resp.chunk_index,
+    }))
 }
 
 #[cfg(test)]

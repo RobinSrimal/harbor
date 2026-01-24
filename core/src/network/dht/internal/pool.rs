@@ -15,8 +15,8 @@ use tokio::sync::RwLock;
 use crate::data::dht::{PeerInfo, ADDRESS_FRESHNESS_THRESHOLD_SECS};
 use crate::network::pool::{ConnectionPool, PoolConfig, PoolError, ConnectionRef};
 
-// Re-export ALPN from rpc module for consistency
-pub use super::rpc::RPC_ALPN as DHT_ALPN;
+// Re-export ALPN from protocol module for consistency
+pub use crate::network::dht::protocol::RPC_ALPN as DHT_ALPN;
 
 // Re-export common types from generic pool
 pub use crate::network::pool::{PoolConfig as DhtPoolConfig, PoolError as DhtPoolError, ConnectionRef as DhtConnectionRef, PoolStats};

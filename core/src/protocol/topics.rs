@@ -14,7 +14,7 @@ use crate::data::{
     get_topic_members_with_info, remove_topic_member, subscribe_topic, unsubscribe_topic,
 };
 use crate::network::harbor::protocol::HarborPacketType;
-use crate::network::membership::messages::{JoinMessage, LeaveMessage, TopicMessage};
+use crate::network::send::topic_messages::{JoinMessage, LeaveMessage, TopicMessage};
 
 use super::core::Protocol;
 use super::error::ProtocolError;
@@ -103,7 +103,7 @@ impl Protocol {
 
         // Build recipient list: existing members + WILDCARD for future member discovery
         // WILDCARD ensures JOIN packets are stored on Harbor for members who join later
-        use crate::network::membership::WILDCARD_RECIPIENT;
+        use crate::data::WILDCARD_RECIPIENT;
         let mut members_with_wildcard = invite.get_member_info().to_vec();
         members_with_wildcard.push(MemberInfo {
             endpoint_id: WILDCARD_RECIPIENT,
@@ -147,7 +147,7 @@ impl Protocol {
         let leave_msg = LeaveMessage::new(our_id);
         let payload = TopicMessage::Leave(leave_msg).encode();
 
-        use crate::network::membership::WILDCARD_RECIPIENT;
+        use crate::data::WILDCARD_RECIPIENT;
         let mut remaining_members: Vec<[u8; 32]> =
             members.into_iter().filter(|m| *m != our_id).collect();
         remaining_members.push(WILDCARD_RECIPIENT);

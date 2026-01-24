@@ -4,7 +4,6 @@
 //! - DHT: Kademlia-style distributed hash table for peer discovery
 //! - Send: Core messaging protocol for packet delivery and receipts
 //! - Harbor: Offline message storage and retrieval
-//! - Membership: Topic membership, member discovery, Join/Leave messages
 //! - Share: P2P file sharing for files ≥512 KB
 //! - Sync: CRDT synchronization for collaborative documents
 //!
@@ -13,7 +12,6 @@
 pub mod pool;
 pub mod dht;
 pub mod harbor;
-pub mod membership;
 pub mod send;
 pub mod share;
 pub mod sync;
@@ -29,20 +27,19 @@ pub use sync::{
     DecodeError as SyncDecodeError, SYNC_MESSAGE_PREFIX, SYNC_ALPN,
 };
 
-// Membership module re-exports (Tier 1: Join/Leave/FileAnnouncement/CanSeed messages, discovery)
-pub use membership::{
-    // Messages
+// Topic message types (payload format for Send packets)
+pub use send::{
     get_verification_mode_from_payload,
     JoinMessage,
     LeaveMessage,
     TopicMessage,
-    // Share-related control messages (proper TopicMessage variants)
+    TopicMessageType,
+    TopicMessageDecodeError,
     FileAnnouncementMessage,
     CanSeedMessage,
-    // Wildcard for membership sync
-    is_wildcard_recipient,
-    WILDCARD_RECIPIENT,
+    SyncUpdateMessage,
 };
+
 
 // Sample files are kept for reference but not compiled
 // See src/network/connection_pool_sample.rs.bak and src/network/dht/dht_sample.rs.bak

@@ -18,7 +18,7 @@ use crate::data::{
 };
 use crate::network::dht::ApiClient as DhtApiClient;
 use crate::network::harbor::protocol::HarborPacketType;
-use crate::network::membership::messages::TopicMessage;
+use crate::network::send::topic_messages::TopicMessage;
 use crate::security::{
     verify_and_decrypt_packet_with_mode, harbor_id_from_topic,
     VerificationMode, SendPacket,

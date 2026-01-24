@@ -1,8 +1,9 @@
-//! DHT RPC protocol using irpc
+//! DHT protocol wire format
 //!
-//! Defines the low-level RPC operations between DHT nodes:
+//! Defines the wire protocol for DHT communication:
 //! - FindNode: Query routing table for closest nodes to a target
-//! - Ping: Basic liveness check (implemented as FindNode with random ID)
+//! - FindNodeResponse: Response with closest known nodes
+//! - NodeInfo: Information about a discovered node
 
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use irpc::channel::oneshot;
 use irpc::rpc_requests;
 use serde::{Deserialize, Serialize};
 
-use super::distance::Id;
+use super::internal::distance::Id;
 
 /// DHT RPC protocol version in ALPN
 pub const RPC_ALPN: &[u8] = b"harbor/dht/0";
