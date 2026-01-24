@@ -4,13 +4,14 @@
 //! - request_chunks: Request chunks from a peer
 //! - request_chunk_map: Ask source who has what
 //! - announce_can_seed: Announce seeding capability
+//! - push_section_to_peer: Push a section of chunks to a peer
 
 use std::time::Duration;
 
 use iroh::{NodeAddr, NodeId};
-use tracing::info;
+use tracing::{debug, info};
 
-use crate::data::CHUNK_SIZE;
+use crate::data::{BlobStore, CHUNK_SIZE};
 use crate::network::share::protocol::{
     ChunkMapRequest, ChunkMapResponse, ChunkRequest, ChunkResponse,
     ShareMessage, SHARE_ALPN,
@@ -140,4 +141,146 @@ impl Protocol {
         .map_err(|_| ProtocolError::Network("connect timeout".to_string()))?
         .map_err(|e| ProtocolError::Network(e.to_string()))
     }
+
+    /// Push a section of chunks to a peer
+    ///
+    /// Opens a connection and sends all chunks in the range [chunk_start, chunk_end).
+    pub async fn push_section_to_peer(
+        &self,
+        peer_id: &[u8; 32],
+        hash: &[u8; 32],
+        chunk_start: u32,
+        chunk_end: u32,
+    ) -> Result<(), ProtocolError> {
+        let node_id = NodeId::from_bytes(peer_id)
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+        let node_addr: NodeAddr = node_id.into();
+
+        // Connect to peer
+        let conn = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.endpoint.connect(node_addr, SHARE_ALPN),
+        )
+        .await
+        .map_err(|_| ProtocolError::Network("connect timeout".to_string()))?
+        .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        info!(
+            peer = hex::encode(&peer_id[..8]),
+            hash = hex::encode(&hash[..8]),
+            chunks = format!("{}-{}", chunk_start, chunk_end),
+            "Pushing section to peer"
+        );
+
+        let blob_store = self.share_service.blob_store();
+
+        // Send each chunk in the section
+        for chunk_index in chunk_start..chunk_end {
+            // Read chunk from storage
+            let data = blob_store.read_chunk(hash, chunk_index)
+                .map_err(|e| ProtocolError::Database(format!("Failed to read chunk: {}", e)))?;
+
+            // Create response message (we're pushing, so we send as response)
+            let msg = ShareMessage::ChunkResponse(ChunkResponse {
+                hash: *hash,
+                chunk_index,
+                data,
+            });
+
+            // Open stream and send
+            let mut send = conn.open_uni().await
+                .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+            tokio::io::AsyncWriteExt::write_all(&mut send, &msg.encode()).await
+                .map_err(|e| ProtocolError::Network(e.to_string()))?;
+            send.finish()
+                .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+            tracing::debug!(
+                chunk = chunk_index,
+                peer = hex::encode(&peer_id[..8]),
+                "Pushed chunk"
+            );
+        }
+
+        info!(
+            peer = hex::encode(&peer_id[..8]),
+            hash = hex::encode(&hash[..8]),
+            chunks = chunk_end - chunk_start,
+            "Section push complete"
+        );
+
+        Ok(())
+    }
+}
+
+/// Push a section of chunks to a peer (standalone version for spawned tasks)
+///
+/// This function doesn't require a Protocol reference, making it suitable for
+/// use in spawned tasks where we can't easily pass `&self`.
+pub async fn push_section_to_peer_standalone(
+    endpoint: &iroh::Endpoint,
+    blob_store: &BlobStore,
+    peer_id: &[u8; 32],
+    hash: &[u8; 32],
+    chunk_start: u32,
+    chunk_end: u32,
+) -> Result<(), ProtocolError> {
+    let node_id = NodeId::from_bytes(peer_id)
+        .map_err(|e| ProtocolError::Network(e.to_string()))?;
+    let node_addr: NodeAddr = node_id.into();
+
+    // Connect to peer
+    let conn = tokio::time::timeout(
+        Duration::from_secs(15),
+        endpoint.connect(node_addr, SHARE_ALPN),
+    )
+    .await
+    .map_err(|_| ProtocolError::Network("connect timeout".to_string()))?
+    .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+    info!(
+        peer = hex::encode(&peer_id[..8]),
+        hash = hex::encode(&hash[..8]),
+        chunks = format!("{}-{}", chunk_start, chunk_end),
+        "Pushing section to peer"
+    );
+
+    // Send each chunk in the section
+    for chunk_index in chunk_start..chunk_end {
+        // Read chunk from storage
+        let data = blob_store.read_chunk(hash, chunk_index)
+            .map_err(|e| ProtocolError::Database(format!("Failed to read chunk: {}", e)))?;
+
+        // Create response message (we're pushing, so we send as response)
+        let msg = ShareMessage::ChunkResponse(ChunkResponse {
+            hash: *hash,
+            chunk_index,
+            data,
+        });
+
+        // Open stream and send
+        let mut send = conn.open_uni().await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        tokio::io::AsyncWriteExt::write_all(&mut send, &msg.encode()).await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+        send.finish()
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        debug!(
+            chunk = chunk_index,
+            peer = hex::encode(&peer_id[..8]),
+            "Pushed chunk"
+        );
+    }
+
+    info!(
+        peer = hex::encode(&peer_id[..8]),
+        hash = hex::encode(&hash[..8]),
+        chunks = chunk_end - chunk_start,
+        "Section push complete"
+    );
+
+    Ok(())
 }

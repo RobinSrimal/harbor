@@ -95,6 +95,59 @@ impl From<std::io::Error> for ShareError {
     }
 }
 
+/// Plan for pulling a blob from peers
+#[derive(Debug, Clone)]
+pub struct PullPlan {
+    /// Chunks we're missing
+    pub missing_chunks: Vec<u32>,
+    /// Which peers have which chunks
+    pub peer_assignments: Vec<PeerAssignment>,
+    /// Total chunks in the blob
+    pub total_chunks: u32,
+}
+
+/// Assignment of chunks to request from a specific peer
+#[derive(Debug, Clone)]
+pub struct PeerAssignment {
+    /// Peer to request from
+    pub peer_id: [u8; 32],
+    /// Chunks this peer has that we need
+    pub chunks: Vec<u32>,
+}
+
+/// Plan for announcing a file to topic members
+#[derive(Debug, Clone)]
+pub struct AnnouncementPlan {
+    /// The encoded topic message to broadcast
+    pub message_bytes: Vec<u8>,
+    /// Recipients for the announcement
+    pub recipient_ids: Vec<[u8; 32]>,
+    /// Section push assignments (peer_id, section_id, chunk_start, chunk_end)
+    pub section_pushes: Vec<SectionPush>,
+}
+
+/// A section to push to a peer
+#[derive(Debug, Clone)]
+pub struct SectionPush {
+    /// Peer to push to
+    pub peer_id: [u8; 32],
+    /// Section ID
+    pub section_id: u8,
+    /// First chunk in section
+    pub chunk_start: u32,
+    /// Last chunk (exclusive) in section
+    pub chunk_end: u32,
+}
+
+/// Result of processing a received chunk
+#[derive(Debug, Clone)]
+pub struct ChunkProcessResult {
+    /// Whether the chunk was valid and stored
+    pub stored: bool,
+    /// Whether the blob is now complete
+    pub blob_complete: bool,
+}
+
 /// Status of a file share operation
 #[derive(Debug, Clone)]
 pub struct ShareStatus {
@@ -753,10 +806,219 @@ impl ShareService {
 
         Ok((hash, size, total_chunks, num_sections, display_name))
     }
-}
 
-// Note: pull_blob and push_section_to_peer are implemented in protocol/share.rs
-// since they require transport (Protocol's request_chunks, connect_for_share, etc.)
+    // ========================================================================
+    // Pull coordination (business logic only - transport is in handlers/outgoing)
+    // ========================================================================
+
+    /// Create a pull plan for fetching a blob
+    ///
+    /// Determines which chunks we're missing and which peers have them.
+    /// The caller (protocol layer) handles the actual transport.
+    pub fn plan_blob_pull(
+        &self,
+        hash: &[u8; 32],
+        metadata: &BlobMetadata,
+        peers_with_chunks: &[PeerChunks],
+    ) -> Result<PullPlan, ShareError> {
+        // Get our current bitfield
+        let local_bitfield = self.blob_store.get_chunk_bitfield(hash, metadata.total_chunks)?;
+
+        // Find missing chunks
+        let missing_chunks: Vec<u32> = local_bitfield
+            .iter()
+            .enumerate()
+            .filter(|&(_, have)| !have)
+            .map(|(i, _)| i as u32)
+            .collect();
+
+        if missing_chunks.is_empty() {
+            return Ok(PullPlan {
+                missing_chunks: Vec::new(),
+                peer_assignments: Vec::new(),
+                total_chunks: metadata.total_chunks,
+            });
+        }
+
+        // Assign chunks to peers based on who has what
+        let mut peer_assignments = Vec::new();
+
+        for peer_info in peers_with_chunks {
+            let chunks_from_peer: Vec<u32> = missing_chunks
+                .iter()
+                .filter(|&&c| c >= peer_info.chunk_start && c < peer_info.chunk_end)
+                .copied()
+                .collect();
+
+            if !chunks_from_peer.is_empty() {
+                peer_assignments.push(PeerAssignment {
+                    peer_id: peer_info.endpoint_id,
+                    chunks: chunks_from_peer,
+                });
+            }
+        }
+
+        info!(
+            hash = hex::encode(&hash[..8]),
+            missing = missing_chunks.len(),
+            peers = peer_assignments.len(),
+            "Created pull plan"
+        );
+
+        Ok(PullPlan {
+            missing_chunks,
+            peer_assignments,
+            total_chunks: metadata.total_chunks,
+        })
+    }
+
+    /// Process a received chunk during pull
+    ///
+    /// Verifies and stores the chunk, returns whether it was stored and if blob is complete.
+    pub fn process_pull_chunk(
+        &self,
+        hash: &[u8; 32],
+        chunk_index: u32,
+        data: &[u8],
+        total_size: u64,
+        total_chunks: u32,
+    ) -> Result<ChunkProcessResult, ShareError> {
+        // Verify chunk
+        let valid = self.blob_store.verify_chunk(hash, chunk_index, data)
+            .unwrap_or(false);
+
+        if !valid {
+            return Ok(ChunkProcessResult {
+                stored: false,
+                blob_complete: false,
+            });
+        }
+
+        // Store chunk
+        self.blob_store.write_chunk(hash, chunk_index, data, total_size)?;
+
+        // Check if complete
+        let blob_complete = self.blob_store.is_complete(hash, total_chunks)?;
+
+        Ok(ChunkProcessResult {
+            stored: true,
+            blob_complete,
+        })
+    }
+
+    /// Mark a blob as complete in the database
+    pub async fn mark_complete(
+        &self,
+        hash: &[u8; 32],
+        db: &Mutex<DbConnection>,
+    ) -> Result<(), ShareError> {
+        let db_lock = db.lock().await;
+        mark_blob_complete(&db_lock, hash)
+            .map_err(|e| ShareError::Database(e.to_string()))
+    }
+
+    /// Record that we received a section from a peer
+    pub async fn record_section_trace(
+        &self,
+        hash: &[u8; 32],
+        section_id: u8,
+        from_peer: &[u8; 32],
+        db: &Mutex<DbConnection>,
+    ) -> Result<(), ShareError> {
+        let db_lock = db.lock().await;
+        record_section_received(&db_lock, hash, section_id, from_peer)
+            .map_err(|e| ShareError::Database(e.to_string()))
+    }
+
+    /// Calculate section ID from chunk index
+    pub fn calculate_section_id(&self, chunk_index: u32, total_chunks: u32) -> u8 {
+        let num_sections = calculate_num_sections(total_chunks);
+        let chunks_per_section = (total_chunks + num_sections as u32 - 1) / num_sections as u32;
+        (chunk_index / chunks_per_section) as u8
+    }
+
+    // ========================================================================
+    // Announcement coordination (business logic only - transport is in protocol layer)
+    // ========================================================================
+
+    /// Prepare an announcement for sharing a file with topic members
+    ///
+    /// Returns the message to broadcast and the section push plan.
+    /// The caller (protocol layer) handles the actual transport.
+    pub async fn prepare_announcement(
+        &self,
+        topic_id: &[u8; 32],
+        hash: &[u8; 32],
+        total_size: u64,
+        total_chunks: u32,
+        num_sections: u8,
+        display_name: &str,
+        db: &Mutex<DbConnection>,
+    ) -> Result<AnnouncementPlan, ShareError> {
+        use crate::network::send::topic_messages::{FileAnnouncementMessage, TopicMessage};
+
+        // Get topic members
+        let members = {
+            let db_lock = db.lock().await;
+            get_topic_members_with_info(&db_lock, topic_id)
+                .map_err(|e| ShareError::Database(e.to_string()))?
+        };
+
+        // Filter out self
+        let other_members: Vec<_> = members
+            .iter()
+            .filter(|m| m.endpoint_id != self.our_id)
+            .collect();
+
+        // Create the FileAnnouncement message
+        let topic_msg = TopicMessage::FileAnnouncement(FileAnnouncementMessage::new(
+            *hash,
+            self.our_id,
+            total_size,
+            total_chunks,
+            num_sections,
+            display_name.to_string(),
+        ));
+
+        let message_bytes = topic_msg.encode();
+        let recipient_ids: Vec<[u8; 32]> = members.iter().map(|m| m.endpoint_id).collect();
+
+        // Calculate section pushes (up to 5 initial recipients)
+        let mut section_pushes = Vec::new();
+        let initial_count = std::cmp::min(5, other_members.len());
+        let chunks_per_section = (total_chunks + num_sections as u32 - 1) / num_sections as u32;
+
+        for (i, member) in other_members.iter().take(initial_count).enumerate() {
+            let section_id = i as u8 % num_sections;
+            let chunk_start = section_id as u32 * chunks_per_section;
+            let chunk_end = std::cmp::min(chunk_start + chunks_per_section, total_chunks);
+
+            section_pushes.push(SectionPush {
+                peer_id: member.endpoint_id,
+                section_id,
+                chunk_start,
+                chunk_end,
+            });
+        }
+
+        if other_members.is_empty() {
+            warn!("No other members in topic to share with");
+        }
+
+        info!(
+            hash = hex::encode(&hash[..8]),
+            members = other_members.len(),
+            pushes = section_pushes.len(),
+            "Prepared announcement plan"
+        );
+
+        Ok(AnnouncementPlan {
+            message_bytes,
+            recipient_ids,
+            section_pushes,
+        })
+    }
+}
 
 /// Process an incoming share message - handles all business logic
 ///
