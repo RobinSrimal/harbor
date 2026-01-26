@@ -91,7 +91,7 @@ impl Protocol {
         let encoded_payload = content_msg.encode();
 
         // Send to all recipients with relay info
-        self.send_raw_with_info(topic_id, &encoded_payload, &recipients, HarborPacketType::Content)
+        self.send_raw(topic_id, &encoded_payload, &recipients, HarborPacketType::Content)
             .await
     }
 

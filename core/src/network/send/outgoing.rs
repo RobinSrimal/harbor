@@ -11,13 +11,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use iroh::{Endpoint, NodeId, NodeAddr};
-use zeroize::{Zeroize, ZeroizeOnDrop};
 use iroh::endpoint::Connection;
-use tokio::sync::RwLock;
+use rusqlite::Connection as DbConnection;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, trace};
 
 use crate::data::send::store_outgoing_packet;
+use crate::data::LocalIdentity;
 use crate::network::harbor::protocol::HarborPacketType;
+use crate::protocol::MemberInfo;
 use crate::resilience::{PoWChallenge, compute_pow};
 use crate::security::{
     PacketError, create_packet, harbor_id_from_topic, send_target_id,
@@ -73,22 +75,20 @@ pub struct SendResult {
 
 /// Send service for outgoing packets
 ///
-/// The private key is zeroized on drop to prevent key material
-/// from lingering in memory after the service is shut down.
-#[derive(Zeroize, ZeroizeOnDrop)]
+/// Follows the standard service pattern:
+/// - Takes Arc<LocalIdentity> for signing/encryption
+/// - Takes Arc<Mutex<DbConnection>> for persistence
+/// - Takes Endpoint for network operations
 pub struct SendService {
     /// Iroh endpoint
-    #[zeroize(skip)]
     endpoint: Endpoint,
-    /// Local node's private key (zeroized on drop)
-    private_key: [u8; 32],
-    /// Local node's public key (EndpointID)
-    public_key: [u8; 32],
+    /// Local identity (shared with Protocol)
+    identity: Arc<LocalIdentity>,
+    /// Database connection (shared with Protocol)
+    db: Arc<Mutex<DbConnection>>,
     /// Configuration
-    #[zeroize(skip)]
     config: SendConfig,
     /// Active connections cache
-    #[zeroize(skip)]
     connections: Arc<RwLock<HashMap<NodeId, Connection>>>,
 }
 
@@ -96,14 +96,14 @@ impl SendService {
     /// Create a new Send service
     pub fn new(
         endpoint: Endpoint,
-        private_key: [u8; 32],
-        public_key: [u8; 32],
+        identity: Arc<LocalIdentity>,
+        db: Arc<Mutex<DbConnection>>,
         config: SendConfig,
     ) -> Self {
         Self {
             endpoint,
-            private_key,
-            public_key,
+            identity,
+            db,
             config,
             connections: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -111,7 +111,12 @@ impl SendService {
 
     /// Get our EndpointID
     pub fn endpoint_id(&self) -> [u8; 32] {
-        self.public_key
+        self.identity.public_key
+    }
+
+    /// Get the identity (for signing/encryption operations)
+    pub fn identity(&self) -> &LocalIdentity {
+        &self.identity
     }
 
     /// Get the PoW configuration
@@ -123,9 +128,8 @@ impl SendService {
     ///
     /// # Arguments
     /// * `topic_id` - The topic to send on
-    /// * `recipients` - EndpointIDs of topic members to send to
+    /// * `recipients` - MemberInfo for topic members to send to (includes relay URLs)
     /// * `plaintext` - The message payload
-    /// * `conn` - Database connection for tracking (mutable for transaction)
     /// * `packet_type` - Type of packet (Content, SyncUpdate, etc.)
     ///
     /// # Returns
@@ -137,20 +141,22 @@ impl SendService {
     pub async fn send(
         &self,
         topic_id: &[u8; 32],
-        recipients: &[[u8; 32]],
+        recipients: &[MemberInfo],
         plaintext: &[u8],
-        conn: &mut rusqlite::Connection,
         packet_type: HarborPacketType,
     ) -> Result<SendResult, SendError> {
         if recipients.is_empty() {
             return Err(SendError::NoRecipients);
         }
 
+        // Extract endpoint IDs for storage
+        let recipient_ids: Vec<[u8; 32]> = recipients.iter().map(|m| m.endpoint_id).collect();
+
         // Create the packet
         let packet = create_packet(
             topic_id,
-            &self.private_key,
-            &self.public_key,
+            &self.identity.private_key,
+            &self.identity.public_key,
             plaintext,
         )?;
 
@@ -160,29 +166,32 @@ impl SendService {
             .map_err(SendError::PacketCreation)?;
 
         // Store in outgoing table for tracking
-        store_outgoing_packet(
-            conn,
-            &packet_id,
-            topic_id,
-            &harbor_id,
-            &packet_bytes,
-            recipients,
-            packet_type as u8,
-        ).map_err(|e| SendError::Database(e.to_string()))?;
+        {
+            let mut db = self.db.lock().await;
+            store_outgoing_packet(
+                &mut db,
+                &packet_id,
+                topic_id,
+                &harbor_id,
+                &packet_bytes,
+                &recipient_ids,
+                packet_type as u8,
+            ).map_err(|e| SendError::Database(e.to_string()))?;
+        }
 
         let mut delivered_to = Vec::new();
         let mut failed = Vec::new();
 
-        for recipient in recipients {
+        for member in recipients {
             // Skip self
-            if *recipient == self.public_key {
-                delivered_to.push(*recipient);
+            if member.endpoint_id == self.identity.public_key {
+                delivered_to.push(member.endpoint_id);
                 continue;
             }
 
             // Compute PoW for this specific recipient
             // send_target_id = hash(topic_id || recipient_id)
-            let target_id = send_target_id(topic_id, recipient);
+            let target_id = send_target_id(topic_id, &member.endpoint_id);
             let challenge = PoWChallenge::new(target_id, packet_id, self.config.pow_config.difficulty_bits);
             let pow = compute_pow(&challenge);
 
@@ -193,15 +202,15 @@ impl SendService {
             };
             let encoded = message.encode();
 
-            match self.send_to_recipient(recipient, &encoded).await {
+            match self.send_to_member(member, &encoded).await {
                 Ok(()) => {
-                    delivered_to.push(*recipient);
-                    trace!(recipient = hex::encode(recipient), "packet delivered");
+                    delivered_to.push(member.endpoint_id);
+                    trace!(recipient = hex::encode(&member.endpoint_id), "packet delivered");
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
-                    failed.push((*recipient, err_msg.clone()));
-                    debug!(recipient = hex::encode(recipient), error = %err_msg, "delivery failed");
+                    failed.push((member.endpoint_id, err_msg.clone()));
+                    debug!(recipient = hex::encode(&member.endpoint_id), error = %err_msg, "delivery failed");
                 }
             }
         }
@@ -213,17 +222,33 @@ impl SendService {
         })
     }
 
-    /// Send encoded message to a single recipient
-    async fn send_to_recipient(
+    /// Send encoded message to a single member (with relay URL support)
+    ///
+    /// This is a low-level transport function that handles:
+    /// - Building NodeAddr with relay URL if available
+    /// - Getting/creating connections from the cache
+    /// - Sending data over a unidirectional QUIC stream
+    pub async fn send_to_member(
         &self,
-        recipient: &[u8; 32],
+        member: &MemberInfo,
         encoded: &[u8],
     ) -> Result<(), SendError> {
-        let node_id = NodeId::from_bytes(recipient)
+        let node_id = NodeId::from_bytes(&member.endpoint_id)
             .map_err(|e| SendError::Connection(e.to_string()))?;
 
+        // Build NodeAddr with relay URL if available
+        let node_addr = if let Some(ref relay_url) = member.relay_url {
+            if let Ok(relay) = relay_url.parse::<iroh::RelayUrl>() {
+                NodeAddr::new(node_id).with_relay_url(relay)
+            } else {
+                NodeAddr::from(node_id)
+            }
+        } else {
+            NodeAddr::from(node_id)
+        };
+
         // Get or create connection
-        let conn = self.get_connection(node_id).await?;
+        let conn = self.get_connection(node_id, node_addr).await?;
 
         // Open unidirectional stream and send
         let mut send_stream = conn
@@ -244,7 +269,7 @@ impl SendService {
     }
 
     /// Get or create a connection to a node
-    async fn get_connection(&self, node_id: NodeId) -> Result<Connection, SendError> {
+    async fn get_connection(&self, node_id: NodeId, node_addr: NodeAddr) -> Result<Connection, SendError> {
         // Check cache
         {
             let connections = self.connections.read().await;
@@ -255,8 +280,7 @@ impl SendService {
             }
         }
 
-        // Create new connection
-        let node_addr: NodeAddr = node_id.into();
+        // Create new connection using provided NodeAddr (which may include relay URL)
         let conn = tokio::time::timeout(
             self.config.send_timeout,
             self.endpoint.connect(node_addr, SEND_ALPN),
@@ -282,7 +306,9 @@ impl SendService {
     ) -> Result<(), SendError> {
         let message = SendMessage::Receipt(receipt.clone());
         let encoded = message.encode();
-        self.send_to_recipient(sender, &encoded).await
+        // Create MemberInfo without relay (receipts go to whoever sent us the packet)
+        let member = MemberInfo::new(*sender);
+        self.send_to_member(&member, &encoded).await
     }
 
     /// Close connection to a node

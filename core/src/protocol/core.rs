@@ -22,7 +22,7 @@ use crate::network::dht::{
 };
 use crate::data::BlobStore;
 use crate::network::harbor::protocol::HARBOR_ALPN;
-use crate::network::send::{SendPool, SendPoolConfig, protocol::SEND_ALPN};
+use crate::network::send::{SendConfig, SendService, protocol::SEND_ALPN};
 use crate::network::share::{ShareConfig, ShareService, SHARE_ALPN};
 use crate::network::sync::protocol::SYNC_ALPN;
 
@@ -51,8 +51,8 @@ pub struct Protocol {
     pub(crate) config: ProtocolConfig,
     /// Iroh endpoint
     pub(crate) endpoint: Endpoint,
-    /// Local identity
-    pub(crate) identity: LocalIdentity,
+    /// Local identity (shared with services)
+    pub(crate) identity: Arc<LocalIdentity>,
     /// Database connection (wrapped for thread safety)
     pub(crate) db: Arc<Mutex<Connection>>,
     /// DHT RPC client (must be kept alive to keep actor running)
@@ -60,8 +60,8 @@ pub struct Protocol {
     dht_rpc_client: Option<DhtRpcClient>,
     /// DHT client for finding Harbor Nodes
     pub(crate) dht_client: Option<DhtApiClient>,
-    /// Send protocol connection pool
-    pub(crate) send_pool: SendPool,
+    /// Send service for message delivery
+    pub(crate) send_service: Arc<SendService>,
     /// Share service for file distribution
     pub(crate) share_service: Arc<ShareService>,
     /// Event sender (for app notifications: messages, file events, etc.)
@@ -103,9 +103,10 @@ impl Protocol {
 
         let db = start_db(&db_path, &passphrase).map_err(|e| ProtocolError::Database(e.to_string()))?;
 
-        // Get or create identity
-        let identity =
-            get_or_create_identity(&db).map_err(|e| ProtocolError::Database(e.to_string()))?;
+        // Get or create identity (wrapped in Arc for sharing with services)
+        let identity = Arc::new(
+            get_or_create_identity(&db).map_err(|e| ProtocolError::Database(e.to_string()))?
+        );
 
         info!(
             endpoint_id = hex::encode(identity.public_key),
@@ -269,8 +270,16 @@ impl Protocol {
         let dht_rpc_client = Some(dht_rpc_client);
         let dht_client = Some(dht_client);
 
-        // Initialize Send connection pool
-        let send_pool = SendPool::new(endpoint.clone(), SendPoolConfig::default());
+        // Wrap db in Arc<Mutex<>> for sharing with services
+        let db = Arc::new(Mutex::new(db));
+
+        // Initialize Send service
+        let send_service = Arc::new(SendService::new(
+            endpoint.clone(),
+            identity.clone(),
+            db.clone(),
+            SendConfig::default(),
+        ));
 
         // Initialize Share service
         let blob_path = if let Some(ref path) = config.blob_path {
@@ -284,9 +293,11 @@ impl Protocol {
         };
         let blob_store = Arc::new(BlobStore::new(&blob_path)
             .map_err(|e| ProtocolError::StartFailed(format!("failed to create blob store: {}", e)))?);
+
         let share_service = Arc::new(ShareService::new(
             endpoint.clone(),
-            identity.public_key,
+            identity.clone(),
+            db.clone(),
             blob_store,
             ShareConfig::default(),
         ));
@@ -295,10 +306,10 @@ impl Protocol {
             config,
             endpoint,
             identity,
-            db: Arc::new(Mutex::new(db)),
+            db,
             dht_rpc_client,
             dht_client,
-            send_pool,
+            send_service,
             share_service,
             event_tx,
             event_rx: Arc::new(RwLock::new(Some(event_rx))),
@@ -457,7 +468,7 @@ impl Protocol {
         let encoded = msg.encode();
         
         // Broadcast to all members
-        self.send_raw_with_info(topic_id, &encoded, &recipients, HarborPacketType::Content)
+        self.send_raw(topic_id, &encoded, &recipients, HarborPacketType::Content)
             .await
     }
     
@@ -514,7 +525,7 @@ impl Protocol {
         );
 
         // Broadcast to all members
-        self.send_raw_with_info(topic_id, &encoded, &recipients, HarborPacketType::Content)
+        self.send_raw(topic_id, &encoded, &recipients, HarborPacketType::Content)
             .await
     }
 

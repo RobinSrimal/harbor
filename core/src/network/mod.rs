@@ -6,10 +6,12 @@
 //! - Harbor: Offline message storage and retrieval
 //! - Share: P2P file sharing for files ≥512 KB
 //! - Sync: CRDT synchronization for collaborative documents
+//! - Service: Common trait and dependencies for all services
 //!
 //! Each protocol has its own ALPN and connection pool.
 
 pub mod pool;
+pub mod service;
 pub mod dht;
 pub mod harbor;
 pub mod send;
@@ -17,6 +19,7 @@ pub mod share;
 pub mod sync;
 
 // Re-export commonly used items
+pub use service::ServiceDeps;
 pub use harbor::{HarborError, HarborMessage, HarborService, HARBOR_ALPN};
 pub use send::{Receipt, SendConfig, SendMessage, SendService, SEND_ALPN};
 pub use share::{

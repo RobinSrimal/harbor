@@ -10,7 +10,7 @@
 use tracing::{debug, info, trace};
 
 use crate::data::{
-    add_topic_member, cleanup_pulled_for_topic, get_all_topics, get_topic_members,
+    add_topic_member, cleanup_pulled_for_topic, get_all_topics,
     get_topic_members_with_info, remove_topic_member, subscribe_topic, unsubscribe_topic,
 };
 use crate::network::harbor::protocol::HarborPacketType;
@@ -113,7 +113,7 @@ impl Protocol {
         // Send to all existing members using their connection info (best effort)
         // The WILDCARD recipient is filtered out for direct sending but kept for Harbor storage
         let send_result = self
-            .send_raw_with_info(
+            .send_raw(
                 &invite.topic_id,
                 &payload,
                 &members_with_wildcard,
@@ -135,22 +135,30 @@ impl Protocol {
 
         let our_id = self.endpoint_id();
 
-        // Get current members before we leave
-        let members: Vec<[u8; 32]>;
-        {
+        // Get current members with relay info before we leave
+        let members_with_info = {
             let db = self.db.lock().await;
-            members = get_topic_members(&db, topic_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?;
-        }
+            get_topic_members_with_info(&db, topic_id)
+                .map_err(|e| ProtocolError::Database(e.to_string()))?
+        };
 
         // Send leave announcement to remaining members + WILDCARD for future member discovery
         let leave_msg = LeaveMessage::new(our_id);
         let payload = TopicMessage::Leave(leave_msg).encode();
 
         use crate::data::WILDCARD_RECIPIENT;
-        let mut remaining_members: Vec<[u8; 32]> =
-            members.into_iter().filter(|m| *m != our_id).collect();
-        remaining_members.push(WILDCARD_RECIPIENT);
+        let mut remaining_members: Vec<MemberInfo> = members_with_info
+            .into_iter()
+            .filter(|m| m.endpoint_id != our_id)
+            .map(|m| MemberInfo {
+                endpoint_id: m.endpoint_id,
+                relay_url: m.relay_url,
+            })
+            .collect();
+        remaining_members.push(MemberInfo {
+            endpoint_id: WILDCARD_RECIPIENT,
+            relay_url: None,
+        });
 
         let send_result = self
             .send_raw(topic_id, &payload, &remaining_members, HarborPacketType::Leave)

@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, trace, warn};
 
 use crate::data::{
-    BlobMetadata, BlobState, BlobStore, CHUNK_SIZE, SectionTrace,
+    BlobMetadata, BlobState, BlobStore, CHUNK_SIZE, LocalIdentity, SectionTrace,
     add_blob_recipient, get_blob, get_blobs_for_topic, get_section_peer_suggestion, get_section_traces,
     get_topic_members_with_info, init_blob_sections, insert_blob, mark_blob_complete,
     record_section_received,
@@ -120,8 +120,8 @@ pub struct PeerAssignment {
 pub struct AnnouncementPlan {
     /// The encoded topic message to broadcast
     pub message_bytes: Vec<u8>,
-    /// Recipients for the announcement
-    pub recipient_ids: Vec<[u8; 32]>,
+    /// Recipients for the announcement (with relay URLs)
+    pub recipients: Vec<crate::protocol::MemberInfo>,
     /// Section push assignments (peer_id, section_id, chunk_start, chunk_end)
     pub section_pushes: Vec<SectionPush>,
 }
@@ -216,8 +216,10 @@ struct ActiveTransfer {
 pub struct ShareService {
     /// Iroh endpoint
     endpoint: Endpoint,
-    /// Local node's endpoint ID
-    our_id: [u8; 32],
+    /// Local identity (shared with Protocol)
+    identity: Arc<LocalIdentity>,
+    /// Database connection (shared with Protocol)
+    db: Arc<Mutex<DbConnection>>,
     /// Blob file storage
     blob_store: Arc<BlobStore>,
     /// Configuration
@@ -232,13 +234,15 @@ impl ShareService {
     /// Create a new Share service
     pub fn new(
         endpoint: Endpoint,
-        our_id: [u8; 32],
+        identity: Arc<LocalIdentity>,
+        db: Arc<Mutex<DbConnection>>,
         blob_store: Arc<BlobStore>,
         config: ShareConfig,
     ) -> Self {
         Self {
             endpoint,
-            our_id,
+            identity,
+            db,
             blob_store,
             config,
             outgoing_transfers: Arc::new(RwLock::new(HashMap::new())),
@@ -246,49 +250,53 @@ impl ShareService {
         }
     }
 
-    /// Get our endpoint ID
+    /// Get our endpoint ID (public key)
     pub fn endpoint_id(&self) -> [u8; 32] {
-        self.our_id
+        self.identity.public_key
+    }
+
+    /// Get the identity (for signing/encryption operations)
+    pub fn identity(&self) -> &LocalIdentity {
+        &self.identity
     }
 
     /// Import a file for sharing
-    /// 
+    ///
     /// Returns (hash, FileAnnouncement) to be broadcast via Send
     pub async fn import_file(
         &self,
         source_path: impl AsRef<Path>,
         topic_id: &[u8; 32],
-        db: &Mutex<DbConnection>,
     ) -> Result<([u8; 32], FileAnnouncement), ShareError> {
         let source_path = source_path.as_ref();
-        
+
         // Check file exists and is large enough
         let metadata = std::fs::metadata(source_path)
             .map_err(|_| ShareError::FileNotFound(source_path.display().to_string()))?;
-        
+
         if metadata.len() < CHUNK_SIZE {
             return Err(ShareError::FileTooSmall(metadata.len()));
         }
-        
+
         // Import to blob store
         let (hash, total_size) = self.blob_store.import_file(source_path)?;
-        
+
         let total_chunks = ((total_size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
         let display_name = source_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        
+
         // Store metadata in database
         let num_sections = self.config.max_connections.min(total_chunks as usize).max(1) as u8;
-        
+
         {
-            let db_lock = db.lock().await;
+            let db_lock = self.db.lock().await;
             insert_blob(
                 &db_lock,
                 &hash,
                 topic_id,
-                &self.our_id,
+                &self.identity.public_key,
                 &display_name,
                 total_size,
                 num_sections,
@@ -306,7 +314,7 @@ impl ShareService {
         // Create announcement (initial_recipients will be filled when connections are made)
         let announcement = FileAnnouncement {
             hash,
-            source_id: self.our_id,
+            source_id: self.identity.public_key,
             total_size,
             total_chunks,
             num_sections,
@@ -327,7 +335,7 @@ impl ShareService {
     }
 
     /// Start initial distribution to peers
-    /// 
+    ///
     /// Connects to up to max_connections peers and assigns sections.
     /// Returns updated FileAnnouncement with initial_recipients.
     pub async fn start_distribution(
@@ -335,28 +343,27 @@ impl ShareService {
         hash: &[u8; 32],
         announcement: &mut FileAnnouncement,
         peers: &[[u8; 32]],
-        db: &Mutex<DbConnection>,
     ) -> Result<(), ShareError> {
         let num_peers = peers.len().min(self.config.max_connections);
         if num_peers == 0 {
             return Ok(());
         }
-        
+
         let total_chunks = announcement.total_chunks;
         let num_sections = num_peers as u8;
         let chunks_per_section = (total_chunks + num_sections as u32 - 1) / num_sections as u32;
-        
+
         let mut initial_recipients = Vec::new();
-        
+
         for (i, peer_id) in peers.iter().take(num_peers).enumerate() {
             let section_id = i as u8;
             let chunk_start = section_id as u32 * chunks_per_section;
             let chunk_end = ((section_id as u32 + 1) * chunks_per_section).min(total_chunks);
-            
+
             // Try to connect to peer
             let node_id = NodeId::from_bytes(peer_id)
                 .map_err(|e| ShareError::Connection(e.to_string()))?;
-            
+
             match self.connect_to_peer(node_id).await {
                 Ok(conn) => {
                     // Add to initial recipients
@@ -366,10 +373,10 @@ impl ShareService {
                         chunk_start,
                         chunk_end,
                     });
-                    
+
                     // Track recipient in database
                     {
-                        let db_lock = db.lock().await;
+                        let db_lock = self.db.lock().await;
                         add_blob_recipient(&db_lock, hash, peer_id)
                             .map_err(|e| ShareError::Database(e.to_string()))?;
                     }
@@ -456,37 +463,36 @@ impl ShareService {
         data: &[u8],
         total_size: u64,
         from_peer: &[u8; 32],
-        db: &Mutex<DbConnection>,
     ) -> Result<bool, ShareError> {
         // Verify chunk (simplified - would use bao-tree for full verification)
         // For now just verify it's not empty and not too large
         if data.is_empty() || data.len() > CHUNK_SIZE as usize {
             return Err(ShareError::Protocol("invalid chunk size".to_string()));
         }
-        
+
         // Write to storage
         self.blob_store.write_chunk(hash, chunk_index, data, total_size)?;
-        
+
         trace!(
             hash = %hex::encode(&hash[..8]),
             chunk = chunk_index,
             from = %hex::encode(&from_peer[..8]),
             "received chunk"
         );
-        
+
         // Check if this completes a section (for trace recording)
         let total_chunks = ((total_size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
         let bitfield = self.blob_store.get_chunk_bitfield(hash, total_chunks)?;
-        
+
         // Check which sections are complete
         {
-            let db_lock = db.lock().await;
+            let db_lock = self.db.lock().await;
             if let Ok(traces) = get_section_traces(&db_lock, hash) {
                 for trace in traces {
                     // Check if all chunks in section are present
                     let section_complete = (trace.chunk_start..trace.chunk_end)
                         .all(|i| bitfield.get(i as usize).copied().unwrap_or(false));
-                    
+
                     if section_complete && trace.received_from.is_none() {
                         // Record trace
                         let _ = record_section_received(&db_lock, hash, trace.section_id, from_peer);
@@ -500,21 +506,21 @@ impl ShareService {
                 }
             }
         }
-        
+
         // Check if blob is complete
         let is_complete = self.blob_store.is_complete(hash, total_chunks)?;
-        
+
         if is_complete {
-            let db_lock = db.lock().await;
+            let db_lock = self.db.lock().await;
             mark_blob_complete(&db_lock, hash)
                 .map_err(|e| ShareError::Database(e.to_string()))?;
-            
+
             info!(
                 hash = %hex::encode(&hash[..8]),
                 "blob complete"
             );
         }
-        
+
         Ok(is_complete)
     }
 
@@ -522,9 +528,8 @@ impl ShareService {
     pub async fn get_chunk_map(
         &self,
         hash: &[u8; 32],
-        db: &Mutex<DbConnection>,
     ) -> Result<ChunkMapResponse, ShareError> {
-        let db_lock = db.lock().await;
+        let db_lock = self.db.lock().await;
         
         // Get section traces (who has what)
         let traces = get_section_traces(&db_lock, hash)
@@ -544,9 +549,9 @@ impl ShareService {
         
         // Add ourselves if we're the source
         if let Ok(Some(blob)) = get_blob(&db_lock, hash) {
-            if blob.source_id == self.our_id && blob.state == BlobState::Complete {
+            if blob.source_id == self.identity.public_key && blob.state == BlobState::Complete {
                 peers.push(PeerChunks {
-                    endpoint_id: self.our_id,
+                    endpoint_id: self.identity.public_key,
                     chunk_start: 0,
                     chunk_end: blob.total_chunks,
                 });
@@ -564,9 +569,8 @@ impl ShareService {
         &self,
         hash: &[u8; 32],
         section_id: u8,
-        db: &Mutex<DbConnection>,
     ) -> Result<Option<PeerSuggestion>, ShareError> {
-        let db_lock = db.lock().await;
+        let db_lock = self.db.lock().await;
         
         if let Some(suggested_peer) = get_section_peer_suggestion(&db_lock, hash, section_id)
             .map_err(|e| ShareError::Database(e.to_string()))?
@@ -630,13 +634,20 @@ impl ShareService {
     pub async fn get_can_seed_recipients(
         &self,
         topic_id: &[u8; 32],
-        db: &Mutex<DbConnection>,
-    ) -> Result<Vec<[u8; 32]>, ShareError> {
-        let db_lock = db.lock().await;
+    ) -> Result<Vec<crate::protocol::MemberInfo>, ShareError> {
+        use crate::protocol::MemberInfo;
+
+        let db_lock = self.db.lock().await;
         let members = get_topic_members_with_info(&db_lock, topic_id)
             .map_err(|e| ShareError::Database(e.to_string()))?;
 
-        Ok(members.iter().map(|m| m.endpoint_id).collect())
+        Ok(members
+            .into_iter()
+            .map(|m| MemberInfo {
+                endpoint_id: m.endpoint_id,
+                relay_url: m.relay_url,
+            })
+            .collect())
     }
 
     // ========================================================================
@@ -647,10 +658,9 @@ impl ShareService {
     pub async fn get_status(
         &self,
         hash: &[u8; 32],
-        db: &Mutex<DbConnection>,
     ) -> Result<ShareStatus, ShareError> {
         let (metadata, section_traces) = {
-            let db_lock = db.lock().await;
+            let db_lock = self.db.lock().await;
 
             let metadata = get_blob(&db_lock, hash)
                 .map_err(|e| ShareError::Database(e.to_string()))?
@@ -683,9 +693,8 @@ impl ShareService {
     pub async fn list_blobs(
         &self,
         topic_id: &[u8; 32],
-        db: &Mutex<DbConnection>,
     ) -> Result<Vec<BlobMetadata>, ShareError> {
-        let db_lock = db.lock().await;
+        let db_lock = self.db.lock().await;
         get_blobs_for_topic(&db_lock, topic_id)
             .map_err(|e| ShareError::Database(e.to_string()))
     }
@@ -695,13 +704,12 @@ impl ShareService {
         &self,
         hash: &[u8; 32],
         dest_path: &Path,
-        db: &Mutex<DbConnection>,
     ) -> Result<(), ShareError> {
         // Check blob is complete (synchronous check via try_lock for simplicity)
         // In practice, caller should use async version
         let metadata = {
             // Use blocking lock since we're in a sync context
-            let db_lock = futures::executor::block_on(db.lock());
+            let db_lock = futures::executor::block_on(self.db.lock());
             get_blob(&db_lock, hash)
                 .map_err(|e| ShareError::Database(e.to_string()))?
                 .ok_or(ShareError::BlobNotFound)?
@@ -720,11 +728,10 @@ impl ShareService {
         &self,
         hash: &[u8; 32],
         dest_path: &Path,
-        db: &Mutex<DbConnection>,
     ) -> Result<(), ShareError> {
         // Check blob is complete
         let metadata = {
-            let db_lock = db.lock().await;
+            let db_lock = self.db.lock().await;
             get_blob(&db_lock, hash)
                 .map_err(|e| ShareError::Database(e.to_string()))?
                 .ok_or(ShareError::BlobNotFound)?
@@ -748,7 +755,6 @@ impl ShareService {
         &self,
         file_path: &Path,
         topic_id: &[u8; 32],
-        db: &Mutex<DbConnection>,
     ) -> Result<([u8; 32], u64, u32, u8, String), ShareError> {
         // Check file exists and is large enough
         let file_metadata = std::fs::metadata(file_path)
@@ -779,12 +785,12 @@ impl ShareService {
 
         // Store metadata in database
         {
-            let db_lock = db.lock().await;
+            let db_lock = self.db.lock().await;
             insert_blob(
                 &db_lock,
                 &hash,
                 topic_id,
-                &self.our_id,
+                &self.identity.public_key,
                 &display_name,
                 size,
                 num_sections,
@@ -910,9 +916,8 @@ impl ShareService {
     pub async fn mark_complete(
         &self,
         hash: &[u8; 32],
-        db: &Mutex<DbConnection>,
     ) -> Result<(), ShareError> {
-        let db_lock = db.lock().await;
+        let db_lock = self.db.lock().await;
         mark_blob_complete(&db_lock, hash)
             .map_err(|e| ShareError::Database(e.to_string()))
     }
@@ -923,9 +928,8 @@ impl ShareService {
         hash: &[u8; 32],
         section_id: u8,
         from_peer: &[u8; 32],
-        db: &Mutex<DbConnection>,
     ) -> Result<(), ShareError> {
-        let db_lock = db.lock().await;
+        let db_lock = self.db.lock().await;
         record_section_received(&db_lock, hash, section_id, from_peer)
             .map_err(|e| ShareError::Database(e.to_string()))
     }
@@ -953,13 +957,13 @@ impl ShareService {
         total_chunks: u32,
         num_sections: u8,
         display_name: &str,
-        db: &Mutex<DbConnection>,
     ) -> Result<AnnouncementPlan, ShareError> {
         use crate::network::send::topic_messages::{FileAnnouncementMessage, TopicMessage};
+        use crate::protocol::MemberInfo;
 
         // Get topic members
         let members = {
-            let db_lock = db.lock().await;
+            let db_lock = self.db.lock().await;
             get_topic_members_with_info(&db_lock, topic_id)
                 .map_err(|e| ShareError::Database(e.to_string()))?
         };
@@ -967,13 +971,13 @@ impl ShareService {
         // Filter out self
         let other_members: Vec<_> = members
             .iter()
-            .filter(|m| m.endpoint_id != self.our_id)
+            .filter(|m| m.endpoint_id != self.identity.public_key)
             .collect();
 
         // Create the FileAnnouncement message
         let topic_msg = TopicMessage::FileAnnouncement(FileAnnouncementMessage::new(
             *hash,
-            self.our_id,
+            self.identity.public_key,
             total_size,
             total_chunks,
             num_sections,
@@ -981,7 +985,15 @@ impl ShareService {
         ));
 
         let message_bytes = topic_msg.encode();
-        let recipient_ids: Vec<[u8; 32]> = members.iter().map(|m| m.endpoint_id).collect();
+
+        // Convert to MemberInfo with relay URLs
+        let recipients: Vec<MemberInfo> = members
+            .iter()
+            .map(|m| MemberInfo {
+                endpoint_id: m.endpoint_id,
+                relay_url: m.relay_url.clone(),
+            })
+            .collect();
 
         // Calculate section pushes (up to 5 initial recipients)
         let mut section_pushes = Vec::new();
@@ -1014,7 +1026,7 @@ impl ShareService {
 
         Ok(AnnouncementPlan {
             message_bytes,
-            recipient_ids,
+            recipients,
             section_pushes,
         })
     }

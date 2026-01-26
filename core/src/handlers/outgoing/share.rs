@@ -17,7 +17,7 @@ use crate::network::share::protocol::{
     ShareMessage, SHARE_ALPN,
 };
 use crate::network::send::topic_messages::{TopicMessage, CanSeedMessage};
-use crate::protocol::{Protocol, ProtocolError};
+use crate::protocol::{MemberInfo, Protocol, ProtocolError};
 
 impl Protocol {
     /// Request chunks from a peer
@@ -107,7 +107,7 @@ impl Protocol {
         &self,
         topic_id: &[u8; 32],
         hash: &[u8; 32],
-        recipient_ids: &[[u8; 32]],
+        recipients: &[MemberInfo],
     ) -> Result<(), ProtocolError> {
         let topic_msg = TopicMessage::CanSeed(CanSeedMessage::new(
             *hash,
@@ -117,7 +117,7 @@ impl Protocol {
         self.send_raw(
             topic_id,
             &topic_msg.encode(),
-            recipient_ids,
+            recipients,
             crate::network::harbor::protocol::HarborPacketType::Content,
         ).await?;
 

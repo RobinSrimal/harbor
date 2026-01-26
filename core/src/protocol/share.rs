@@ -43,7 +43,7 @@ impl Protocol {
         // Delegate to share service for import and metadata storage
         let (hash, total_size, total_chunks, num_sections, display_name) = self
             .share_service
-            .share_file(file_path, topic_id, &self.db)
+            .share_file(file_path, topic_id)
             .await
             .map_err(|e| ProtocolError::Database(e.to_string()))?;
 
@@ -65,7 +65,6 @@ impl Protocol {
                 total_chunks,
                 num_sections,
                 &display_name,
-                &self.db,
             )
             .await
             .map_err(|e| ProtocolError::Database(e.to_string()))?;
@@ -74,14 +73,14 @@ impl Protocol {
         self.send_raw(
             topic_id,
             &plan.message_bytes,
-            &plan.recipient_ids,
+            &plan.recipients,
             crate::network::harbor::protocol::HarborPacketType::Content,
         )
         .await?;
 
         info!(
             hash = hex::encode(&hash[..8]),
-            members = plan.recipient_ids.len(),
+            members = plan.recipients.len(),
             "File announced to topic"
         );
 
@@ -118,7 +117,7 @@ impl Protocol {
     /// Get the status of a shared file
     pub async fn get_share_status(&self, hash: &[u8; 32]) -> Result<ShareStatus, ProtocolError> {
         self.share_service
-            .get_status(hash, &self.db)
+            .get_status(hash)
             .await
             .map_err(|e| ProtocolError::Database(e.to_string()))
     }
@@ -129,7 +128,7 @@ impl Protocol {
         topic_id: &[u8; 32],
     ) -> Result<Vec<BlobMetadata>, ProtocolError> {
         self.share_service
-            .list_blobs(topic_id, &self.db)
+            .list_blobs(topic_id)
             .await
             .map_err(|e| ProtocolError::Database(e.to_string()))
     }
@@ -170,7 +169,7 @@ impl Protocol {
         dest_path: impl AsRef<Path>,
     ) -> Result<(), ProtocolError> {
         self.share_service
-            .export_blob_async(hash, dest_path.as_ref(), &self.db)
+            .export_blob_async(hash, dest_path.as_ref())
             .await
             .map_err(|e| ProtocolError::Database(e.to_string()))
     }
@@ -274,7 +273,7 @@ impl Protocol {
                     .calculate_section_id(assignment.chunks[0], metadata.total_chunks);
                 let _ = self
                     .share_service
-                    .record_section_trace(hash, section_id, &assignment.peer_id, &self.db)
+                    .record_section_trace(hash, section_id, &assignment.peer_id)
                     .await;
             }
         }
@@ -286,7 +285,7 @@ impl Protocol {
             .unwrap_or(false)
         {
             self.share_service
-                .mark_complete(hash, &self.db)
+                .mark_complete(hash)
                 .await
                 .map_err(|e| ProtocolError::Database(e.to_string()))?;
 
@@ -299,7 +298,7 @@ impl Protocol {
             // Announce we can seed (transport operation)
             match self
                 .share_service
-                .get_can_seed_recipients(&metadata.topic_id, &self.db)
+                .get_can_seed_recipients(&metadata.topic_id)
                 .await
             {
                 Ok(recipients) => {
