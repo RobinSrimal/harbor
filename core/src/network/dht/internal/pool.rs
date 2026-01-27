@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use iroh::{Endpoint, NodeId, NodeAddr};
+use iroh::{Endpoint, EndpointId, EndpointAddr};
 use tokio::sync::RwLock;
 
 use crate::data::dht::{PeerInfo, ADDRESS_FRESHNESS_THRESHOLD_SECS};
@@ -25,7 +25,7 @@ pub use crate::network::pool::{PoolConfig as DhtPoolConfig, PoolError as DhtPool
 #[derive(Debug, Clone)]
 pub struct DialInfo {
     /// The node ID (required)
-    pub node_id: NodeId,
+    pub node_id: EndpointId,
     /// Optional direct address (IP:port)
     pub address: Option<String>,
     /// When the address was last updated
@@ -35,8 +35,8 @@ pub struct DialInfo {
 }
 
 impl DialInfo {
-    /// Create dial info from just a NodeId
-    pub fn from_node_id(node_id: NodeId) -> Self {
+    /// Create dial info from just a EndpointId
+    pub fn from_node_id(node_id: EndpointId) -> Self {
         Self {
             node_id,
             address: None,
@@ -46,7 +46,7 @@ impl DialInfo {
     }
 
     /// Create dial info with relay URL
-    pub fn from_node_id_with_relay(node_id: NodeId, relay_url: String) -> Self {
+    pub fn from_node_id_with_relay(node_id: EndpointId, relay_url: String) -> Self {
         Self {
             node_id,
             address: None,
@@ -57,9 +57,9 @@ impl DialInfo {
 
     /// Create dial info from PeerInfo
     ///
-    /// Returns `None` if the peer's endpoint_id is not a valid NodeId
+    /// Returns `None` if the peer's endpoint_id is not a valid EndpointId
     pub fn from_peer_info(peer: &PeerInfo) -> Option<Self> {
-        let node_id = NodeId::from_bytes(&peer.endpoint_id).ok()?;
+        let node_id = EndpointId::from_bytes(&peer.endpoint_id).ok()?;
         Some(Self {
             node_id,
             address: peer.endpoint_address.clone(),
@@ -84,9 +84,9 @@ impl DialInfo {
         }
     }
 
-    /// Convert to NodeAddr for iroh dialing
-    pub fn to_node_addr(&self) -> NodeAddr {
-        let mut addr: NodeAddr = self.node_id.into();
+    /// Convert to EndpointAddr for iroh dialing
+    pub fn to_node_addr(&self) -> EndpointAddr {
+        let mut addr: EndpointAddr = self.node_id.into();
 
         // Add relay URL if available
         if let Some(ref relay_url) = self.relay_url {
@@ -99,7 +99,7 @@ impl DialInfo {
         if self.has_fresh_address() {
             if let Some(address) = &self.address {
                 if let Ok(socket_addr) = address.parse() {
-                    addr = addr.with_direct_addresses([socket_addr]);
+                    addr = addr.with_ip_addr(socket_addr);
                 }
             }
         }
@@ -116,7 +116,7 @@ pub struct DhtPool {
     /// Iroh endpoint (needed for helper methods)
     endpoint: Endpoint,
     /// Pre-registered dial info (e.g., for bootstrap nodes)
-    known_nodes: Arc<RwLock<HashMap<NodeId, DialInfo>>>,
+    known_nodes: Arc<RwLock<HashMap<EndpointId, DialInfo>>>,
 }
 
 impl DhtPool {
@@ -131,7 +131,7 @@ impl DhtPool {
 
     /// Get our home relay URL (if connected to a relay)
     pub fn home_relay_url(&self) -> Option<String> {
-        self.endpoint.node_addr().relay_url.map(|url| url.to_string())
+        self.endpoint.addr().relay_urls().next().map(|url| url.to_string())
     }
 
     /// Register dial info for a node (used for bootstrap nodes with relay URLs)
@@ -166,7 +166,7 @@ impl DhtPool {
     }
 
     /// Close a specific connection
-    pub async fn close(&self, node_id: NodeId) {
+    pub async fn close(&self, node_id: EndpointId) {
         self.pool.close(node_id).await;
     }
 
@@ -230,8 +230,8 @@ mod tests {
         // Without address
         let info = DialInfo::from_node_id(node_id);
         let addr = info.to_node_addr();
-        assert_eq!(addr.node_id, node_id);
-        assert!(addr.direct_addresses.is_empty());
+        assert_eq!(addr.id, node_id);
+        assert!(addr.ip_addrs().next().is_none());
 
         // With fresh address
         let info_with_addr = DialInfo {
@@ -241,8 +241,8 @@ mod tests {
             relay_url: None,
         };
         let addr = info_with_addr.to_node_addr();
-        assert_eq!(addr.node_id, node_id);
-        assert!(!addr.direct_addresses.is_empty());
+        assert_eq!(addr.id, node_id);
+        assert!(!addr.ip_addrs().next().is_none());
     }
 
     #[test]
@@ -309,10 +309,10 @@ mod tests {
         assert_eq!(info.address_timestamp, Some(12345));
     }
 
-    // Note: We cannot reliably test invalid NodeId bytes because iroh's
-    // NodeId::from_bytes() is permissive and accepts many byte patterns
+    // Note: We cannot reliably test invalid EndpointId bytes because iroh's
+    // EndpointId::from_bytes() is permissive and accepts many byte patterns
     // that are not valid Ed25519 public keys (e.g., all zeros).
-    // See DEPENDENCIES.md "Iroh NodeId Validation" note.
+    // See DEPENDENCIES.md "Iroh EndpointId Validation" note.
     // The from_peer_info() returns Option<Self> to handle the case where
     // from_bytes() does fail, but this is defensive coding rather than
     // something we can easily test.
@@ -349,7 +349,7 @@ mod tests {
         };
 
         let addr = info.to_node_addr();
-        assert_eq!(addr.node_id, node_id);
+        assert_eq!(addr.id, node_id);
         // Relay URL should be set (we can't easily inspect it, but it shouldn't panic)
     }
 
@@ -367,7 +367,7 @@ mod tests {
         };
 
         let addr = info.to_node_addr();
-        assert_eq!(addr.node_id, node_id);
+        assert_eq!(addr.id, node_id);
         // Should not panic even with invalid URL
     }
 
@@ -389,8 +389,8 @@ mod tests {
         };
 
         let addr = info.to_node_addr();
-        assert_eq!(addr.node_id, node_id);
-        assert!(addr.direct_addresses.is_empty()); // Invalid address not added
+        assert_eq!(addr.id, node_id);
+        assert!(addr.ip_addrs().next().is_none()); // Invalid address not added
     }
 
     // Note: Integration tests that actually create connections require

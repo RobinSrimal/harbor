@@ -12,7 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::{Endpoint, NodeId, NodeAddr};
+use iroh::{Endpoint, EndpointId, EndpointAddr};
 use iroh::endpoint::Connection;
 use tokio::sync::{oneshot, RwLock};
 use tracing::{debug, trace, warn};
@@ -70,9 +70,9 @@ pub struct ConnectionRef {
     /// The underlying connection
     connection: Connection,
     /// Node ID this connection is for
-    node_id: NodeId,
+    node_id: EndpointId,
     /// Sender to notify pool when dropped
-    _drop_notify: Option<oneshot::Sender<NodeId>>,
+    _drop_notify: Option<oneshot::Sender<EndpointId>>,
 }
 
 impl ConnectionRef {
@@ -82,7 +82,7 @@ impl ConnectionRef {
     }
 
     /// Get the node ID
-    pub fn node_id(&self) -> NodeId {
+    pub fn node_id(&self) -> EndpointId {
         self.node_id
     }
 }
@@ -111,9 +111,9 @@ pub struct ConnectionPool {
     /// Configuration
     config: PoolConfig,
     /// Cached connections
-    connections: Arc<RwLock<HashMap<NodeId, CachedConnection>>>,
+    connections: Arc<RwLock<HashMap<EndpointId, CachedConnection>>>,
     /// Order of connections for LRU eviction
-    lru_order: Arc<RwLock<VecDeque<NodeId>>>,
+    lru_order: Arc<RwLock<VecDeque<EndpointId>>>,
 }
 
 impl ConnectionPool {
@@ -134,8 +134,8 @@ impl ConnectionPool {
     }
 
     /// Get or create a connection to a peer
-    pub async fn get_connection(&self, node_addr: NodeAddr) -> Result<ConnectionRef, PoolError> {
-        let node_id = node_addr.node_id;
+    pub async fn get_connection(&self, node_addr: EndpointAddr) -> Result<ConnectionRef, PoolError> {
+        let node_id = node_addr.id;
 
         // Check for cached connection
         {
@@ -162,8 +162,8 @@ impl ConnectionPool {
     }
 
     /// Establish a new connection
-    async fn connect(&self, node_addr: NodeAddr) -> Result<ConnectionRef, PoolError> {
-        let node_id = node_addr.node_id;
+    async fn connect(&self, node_addr: EndpointAddr) -> Result<ConnectionRef, PoolError> {
+        let node_id = node_addr.id;
 
         // Check connection limit
         {
@@ -250,7 +250,7 @@ impl ConnectionPool {
     }
 
     /// Close a specific connection
-    pub async fn close(&self, node_id: NodeId) {
+    pub async fn close(&self, node_id: EndpointId) {
         let mut connections = self.connections.write().await;
         let mut lru = self.lru_order.write().await;
 

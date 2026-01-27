@@ -36,7 +36,7 @@ impl Protocol {
 
         // Identity stats
         let endpoint_id = hex::encode(self.identity.public_key);
-        let relay_url = self.endpoint.node_addr().relay_url.map(|u| u.to_string());
+        let relay_url = self.endpoint.addr().relay_urls().next().map(|u| u.to_string());
 
         // Network stats
         let is_online = relay_url.is_some();

@@ -130,7 +130,7 @@ impl Protocol {
             .await
             .map_err(|e| ProtocolError::StartFailed(format!("failed to create endpoint: {}", e)))?;
 
-        info!(endpoint_id = %endpoint.node_id(), "Protocol started");
+        info!(endpoint_id = %endpoint.id(), "Protocol started");
 
         // Initialize DHT
         let local_dht_id = crate::network::dht::Id::new(identity.public_key);
@@ -168,7 +168,7 @@ impl Protocol {
                     id_bytes.copy_from_slice(&bytes);
 
                     // Create node ID
-                    if let Ok(node_id) = iroh::NodeId::from_bytes(&id_bytes) {
+                    if let Ok(node_id) = iroh::EndpointId::from_bytes(&id_bytes) {
                         // Register dial info with relay URL if available
                         let dial_info = if let Some(ref relay) = relay_url {
                             DialInfo::from_node_id_with_relay(node_id, relay.clone())
@@ -377,8 +377,8 @@ impl Protocol {
 
     /// Get the relay URL this node is connected to (if any)
     pub async fn relay_url(&self) -> Option<String> {
-        let node_addr = self.endpoint.node_addr();
-        node_addr.relay_url.map(|url| url.to_string())
+        let endpoint_addr = self.endpoint.addr();
+        endpoint_addr.relay_urls().next().map(|url| url.to_string())
     }
 
     /// Get the blob storage path

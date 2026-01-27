@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use iroh::{Endpoint, NodeId, NodeAddr};
+use iroh::{Endpoint, EndpointId, EndpointAddr};
 use iroh::endpoint::Connection;
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{Mutex, RwLock};
@@ -89,7 +89,8 @@ pub struct SendService {
     /// Configuration
     config: SendConfig,
     /// Active connections cache
-    connections: Arc<RwLock<HashMap<NodeId, Connection>>>,
+    connections: Arc<RwLock<HashMap<EndpointId, Connection>>>, 
+    /// TODO REMOVE THIS!!!!!!
 }
 
 impl SendService {
@@ -225,7 +226,7 @@ impl SendService {
     /// Send encoded message to a single member (with relay URL support)
     ///
     /// This is a low-level transport function that handles:
-    /// - Building NodeAddr with relay URL if available
+    /// - Building EndpointAddr with relay URL if available
     /// - Getting/creating connections from the cache
     /// - Sending data over a unidirectional QUIC stream
     pub async fn send_to_member(
@@ -233,18 +234,18 @@ impl SendService {
         member: &MemberInfo,
         encoded: &[u8],
     ) -> Result<(), SendError> {
-        let node_id = NodeId::from_bytes(&member.endpoint_id)
+        let node_id = EndpointId::from_bytes(&member.endpoint_id)
             .map_err(|e| SendError::Connection(e.to_string()))?;
 
-        // Build NodeAddr with relay URL if available
+        // Build EndpointAddr with relay URL if available
         let node_addr = if let Some(ref relay_url) = member.relay_url {
             if let Ok(relay) = relay_url.parse::<iroh::RelayUrl>() {
-                NodeAddr::new(node_id).with_relay_url(relay)
+                EndpointAddr::new(node_id).with_relay_url(relay)
             } else {
-                NodeAddr::from(node_id)
+                EndpointAddr::from(node_id)
             }
         } else {
-            NodeAddr::from(node_id)
+            EndpointAddr::from(node_id)
         };
 
         // Get or create connection
@@ -269,7 +270,7 @@ impl SendService {
     }
 
     /// Get or create a connection to a node
-    async fn get_connection(&self, node_id: NodeId, node_addr: NodeAddr) -> Result<Connection, SendError> {
+    async fn get_connection(&self, node_id: EndpointId, node_addr: EndpointAddr) -> Result<Connection, SendError> {
         // Check cache
         {
             let connections = self.connections.read().await;
@@ -280,7 +281,7 @@ impl SendService {
             }
         }
 
-        // Create new connection using provided NodeAddr (which may include relay URL)
+        // Create new connection using provided EndpointAddr (which may include relay URL)
         let conn = tokio::time::timeout(
             self.config.send_timeout,
             self.endpoint.connect(node_addr, SEND_ALPN),
@@ -312,7 +313,7 @@ impl SendService {
     }
 
     /// Close connection to a node
-    pub async fn close_connection(&self, node_id: NodeId) {
+    pub async fn close_connection(&self, node_id: EndpointId) {
         let mut connections = self.connections.write().await;
         if let Some(conn) = connections.remove(&node_id) {
             conn.close(0u32.into(), b"close");

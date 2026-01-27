@@ -73,18 +73,12 @@ impl Protocol {
             let alpn = conn.alpn();
             trace!(alpn = ?alpn, "connection ALPN check");
 
-            // Get sender's NodeId
-            let sender_id: [u8; 32] = match conn.remote_node_id() {
-                Ok(id) => *id.as_bytes(),
-                Err(e) => {
-                    debug!(error = %e, "failed to get remote node id");
-                    continue;
-                }
-            };
+            // Get sender's EndpointId (now infallible)
+            let sender_id: [u8; 32] = *conn.remote_id().as_bytes();
 
             trace!(sender = %hex::encode(sender_id), "accepted connection");
 
-            if alpn.as_deref() == Some(SEND_ALPN) {
+            if alpn == SEND_ALPN {
                 // Handle Send protocol
                 let db = db.clone();
                 let event_tx = event_tx.clone();
@@ -97,7 +91,7 @@ impl Protocol {
                         debug!(error = %e, sender = %hex::encode(sender_id), "Send connection handler error");
                     }
                 });
-            } else if alpn.as_deref() == Some(DHT_ALPN) {
+            } else if alpn == DHT_ALPN {
                 // Handle DHT protocol
                 let db = db.clone();
                 let dht_client = dht_client.clone();
@@ -110,7 +104,7 @@ impl Protocol {
                         debug!(error = %e, sender = %hex::encode(sender_id), "DHT connection handler error");
                     }
                 });
-            } else if alpn.as_deref() == Some(HARBOR_ALPN) {
+            } else if alpn == HARBOR_ALPN {
                 // Handle Harbor protocol (store, pull, sync)
                 let db = db.clone();
 
@@ -122,7 +116,7 @@ impl Protocol {
                         debug!(error = %e, sender = %hex::encode(sender_id), "Harbor connection handler error");
                     }
                 });
-            } else if alpn.as_deref() == Some(SHARE_ALPN) {
+            } else if alpn == SHARE_ALPN {
                 // Handle Share protocol (file chunks, bitfields)
                 let db = db.clone();
                 let blob_store = blob_store.clone();
@@ -139,7 +133,7 @@ impl Protocol {
                         debug!("Share connection received but blob store not initialized");
                     }
                 });
-            } else if alpn.as_deref() == Some(SYNC_ALPN) {
+            } else if alpn == SYNC_ALPN {
                 // Handle Sync protocol (sync requests and responses)
                 info!(sender = %hex::encode(&sender_id[..8]), "INCOMING: received SYNC_ALPN connection");
                 let endpoint_clone = endpoint.clone();

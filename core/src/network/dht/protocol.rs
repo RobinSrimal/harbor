@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use iroh::NodeAddr;
+use iroh::EndpointAddr;
 use irpc::channel::oneshot;
 use irpc::rpc_requests;
 use serde::{Deserialize, Serialize};
@@ -69,12 +69,12 @@ impl NodeInfo {
         }
     }
 
-    /// Create NodeInfo from a NodeAddr
-    pub fn from_node_addr(addr: &NodeAddr) -> Self {
+    /// Create NodeInfo from a EndpointAddr
+    pub fn from_endpoint_addr(addr: &EndpointAddr) -> Self {
         Self {
-            node_id: *addr.node_id.as_bytes(),
-            addresses: addr.direct_addresses.iter().map(|a| a.to_string()).collect(),
-            relay_url: addr.relay_url.as_ref().map(|u| u.to_string()),
+            node_id: *addr.id.as_bytes(),
+            addresses: addr.ip_addrs().map(|a| a.to_string()).collect(),
+            relay_url: addr.relay_urls().next().map(|u| u.to_string()),
         }
     }
 

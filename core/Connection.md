@@ -12,7 +12,7 @@ Harbor already has a `ConnectionPool` at `core/src/network/pool.rs` with:
 
 ## What's Missing: DNS Fallback
 
-The current `ConnectionPool::connect()` method calls `endpoint.connect(node_addr, self.alpn)` directly. If the provided relay URL is stale, the connection fails without trying DNS discovery.
+The current `ConnectionPool::connect()` method calls `endpoint.connect(endpoint_addr, self.alpn)` directly. If the provided relay URL is stale, the connection fails without trying DNS discovery.
 
 **Iroh behavior**: DNS discovery only triggers when **no relay URL is provided**. If we provide a stale relay URL, iroh uses it directly and fails.
 
@@ -21,28 +21,28 @@ The current `ConnectionPool::connect()` method calls `endpoint.connect(node_addr
 Add DNS fallback logic to `ConnectionPool::connect()`:
 
 ```rust
-async fn connect(&self, node_addr: NodeAddr) -> Result<ConnectionRef, PoolError> {
-    let node_id = node_addr.node_id;
+async fn connect(&self, endpoint_addr: EndpointAddr) -> Result<ConnectionRef, PoolError> {
+    let endpoint_id = endpoint_addr.endpoint_id;
 
     // ... existing connection limit check ...
 
-    // Try with provided NodeAddr (may include relay URL)
-    let connect_fut = self.endpoint.connect(node_addr.clone(), self.alpn);
+    // Try with provided EndpointAddr (may include relay URL)
+    let connect_fut = self.endpoint.connect(endpoint_addr.clone(), self.alpn);
     let result = tokio::time::timeout(self.config.connect_timeout, connect_fut).await;
 
     let connection = match result {
         Ok(Ok(conn)) => conn,
         Ok(Err(e)) | Err(_) => {
             // Connection failed - try DNS fallback if we had a relay URL
-            if node_addr.relay_url.is_some() {
+            if endpoint_addr.relay_url.is_some() {
                 debug!(
                     alpn = ?std::str::from_utf8(self.alpn),
-                    target = %node_id,
+                    target = %endpoint_id,
                     "relay connection failed, trying DNS discovery"
                 );
 
-                // Retry with just NodeId (triggers DNS discovery)
-                let fallback_addr = NodeAddr::from(node_id);
+                // Retry with just EndpointId (triggers DNS discovery)
+                let fallback_addr = EndpointAddr::from(endpoint_id);
                 let fallback_fut = self.endpoint.connect(fallback_addr, self.alpn);
                 tokio::time::timeout(self.config.connect_timeout, fallback_fut)
                     .await
@@ -63,18 +63,21 @@ async fn connect(&self, node_addr: NodeAddr) -> Result<ConnectionRef, PoolError>
 }
 ```
 
-## Prerequisites
+## Iroh 0.95.1 Terminology
 
-**Consider upgrading iroh first.** In iroh 0.94+:
+As of iroh 0.94+, all "Node" terminology has been renamed to "Endpoint":
 - `NodeId` → `EndpointId`
 - `NodeAddr` → `EndpointAddr`
+- `NodeTicket` → `EndpointTicket`
+- `endpoint.node_id()` → `endpoint.id()`
+- `endpoint.node_addr()` → `endpoint.addr()`
 
 Harbor's `endpoint_id` naming already aligns with the new terminology.
 
 ## Connection Flow
 
 ```
-Service.get_connection(node_addr)
+Service.get_connection(endpoint_addr)
          │
          ▼
 ┌────────────────────┐
@@ -82,26 +85,26 @@ Service.get_connection(node_addr)
 └────────────────────┘
          │ No
          ▼
-┌────────────────────────────────────────┐
-│ 1. Try with provided NodeAddr          │
-│    (includes relay URL if available)   │
-│              │                         │
-│              ▼                         │
-│    ┌──────────────┐                    │
-│    │ Success?     │─── Yes ──→ Cache & Return
-│    └──────────────┘                    │
-│              │ No                      │
-│              ▼                         │
-│ 2. Had relay URL?                      │
-│    │                                   │
-│    ├─ No ──→ Return error (DNS tried)  │
-│    │                                   │
-│    └─ Yes ──→ Fallback: DNS discovery  │
-│              NodeAddr::from(node_id)   │
-│              │                         │
-│              ▼                         │
-│         Success or Error               │
-└────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│ 1. Try with provided EndpointAddr            │
+│    (includes relay URL if available)         │
+│              │                               │
+│              ▼                               │
+│    ┌──────────────┐                          │
+│    │ Success?     │─── Yes ──→ Cache & Return│
+│    └──────────────┘                          │
+│              │ No                            │
+│              ▼                               │
+│ 2. Had relay URL?                            │
+│    │                                         │
+│    ├─ No ──→ Return error (DNS tried)        │
+│    │                                         │
+│    └─ Yes ──→ Fallback: DNS discovery        │
+│              EndpointAddr::from(endpoint_id) │
+│              │                               │
+│              ▼                               │
+│         Success or Error                     │
+└──────────────────────────────────────────────┘
 ```
 
 ## Why This Works
@@ -121,7 +124,7 @@ Services already use `ConnectionPool`. The DNS fallback is transparent:
 
 ```rust
 // SendService - no changes needed
-let conn = self.pool.get_connection(node_addr).await?;
+let conn = self.pool.get_connection(endpoint_addr).await?;
 ```
 
 The pool handles the fallback internally.
@@ -133,7 +136,7 @@ If we want to add more behavior (stream management, metrics, etc.), we could wra
 ```rust
 pub struct Connection {
     inner: iroh::endpoint::Connection,
-    node_id: NodeId,
+    endpoint_id: EndpointId,
     relay_url: Option<RelayUrl>,  // Could be updated after DNS discovery
 }
 ```

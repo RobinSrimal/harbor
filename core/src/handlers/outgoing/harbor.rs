@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use iroh::{Endpoint, NodeId};
+use iroh::{Endpoint, EndpointId};
 use tracing::debug;
 
 use crate::network::dht::ApiClient as DhtApiClient;
@@ -66,7 +66,7 @@ impl Protocol {
         connect_timeout: Duration,
         response_timeout: Duration,
     ) -> Result<bool, ProtocolError> {
-        let node_id = NodeId::from_bytes(harbor_node)
+        let node_id = EndpointId::from_bytes(harbor_node)
             .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
         let conn = tokio::time::timeout(
@@ -117,7 +117,7 @@ impl Protocol {
         connect_timeout: Duration,
         response_timeout: Duration,
     ) -> Result<Vec<PacketInfo>, ProtocolError> {
-        let node_id = NodeId::from_bytes(harbor_node)
+        let node_id = EndpointId::from_bytes(harbor_node)
             .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
         let conn = tokio::time::timeout(
@@ -167,7 +167,7 @@ impl Protocol {
         ack: &DeliveryAck,
         connect_timeout: Duration,
     ) -> Result<(), ProtocolError> {
-        let node_id = NodeId::from_bytes(harbor_node)
+        let node_id = EndpointId::from_bytes(harbor_node)
             .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
         let conn = tokio::time::timeout(
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn test_node_id_from_harbor_node() {
         let harbor_node = make_id(42);
-        let result = iroh::NodeId::from_bytes(&harbor_node);
+        let result = iroh::EndpointId::from_bytes(&harbor_node);
         assert!(result.is_ok());
     }
 

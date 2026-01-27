@@ -513,10 +513,10 @@ async fn connect_for_share(
     endpoint: &Endpoint,
     peer_id: &[u8; 32],
 ) -> Result<Connection, String> {
-    let node_id = iroh::NodeId::from_bytes(peer_id)
+    let node_id = iroh::EndpointId::from_bytes(peer_id)
         .map_err(|e| format!("Invalid node ID: {}", e))?;
 
-    let node_addr = iroh::NodeAddr::from(node_id);
+    let node_addr = iroh::EndpointAddr::from(node_id);
 
     tokio::time::timeout(
         Duration::from_secs(10),

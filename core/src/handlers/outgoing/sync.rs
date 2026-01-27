@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use iroh::{NodeAddr, NodeId};
+use iroh::{EndpointAddr, EndpointId};
 use tracing::info;
 
 use crate::network::sync::{encode_sync_response, SYNC_ALPN};
@@ -31,7 +31,7 @@ impl Protocol {
         let message = encode_sync_response(topic_id, &data);
 
         // Connect to requester via SYNC_ALPN
-        let node_id = NodeId::from_bytes(requester_id)
+        let node_id = EndpointId::from_bytes(requester_id)
             .map_err(|e| ProtocolError::Network(format!("invalid node id: {}", e)))?;
 
         let conn = self
@@ -68,12 +68,12 @@ impl Protocol {
         Ok(())
     }
 
-    /// Connect to a peer for sync by NodeId
+    /// Connect to a peer for sync by EndpointId
     async fn connect_for_sync(
         &self,
-        node_id: NodeId,
+        node_id: EndpointId,
     ) -> Result<iroh::endpoint::Connection, ProtocolError> {
-        let node_addr: NodeAddr = node_id.into();
+        let node_addr: EndpointAddr = node_id.into();
 
         tokio::time::timeout(SYNC_CONNECT_TIMEOUT, self.endpoint.connect(node_addr, SYNC_ALPN))
             .await
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn test_node_id_from_bytes() {
         let id = make_id(42);
-        let result = NodeId::from_bytes(&id);
+        let result = EndpointId::from_bytes(&id);
         assert!(result.is_ok());
     }
 

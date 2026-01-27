@@ -244,7 +244,7 @@ impl DhtActor {
     /// Returns Ok(()) if node responds, Err if unreachable.
     async fn ping_node(&self, node: &Id) -> Result<(), PoolError> {
         let dial_info = DialInfo::from_node_id(
-            iroh::NodeId::from_bytes(node.as_bytes()).expect("valid node id")
+            iroh::EndpointId::from_bytes(node.as_bytes()).expect("valid node id")
         );
 
         // Try to get/establish connection
@@ -310,7 +310,7 @@ impl DhtActor {
 
             for id in to_verify {
                 let dial_info = DialInfo::from_node_id(
-                    iroh::NodeId::from_bytes(id.as_bytes()).expect("valid node id")
+                    iroh::EndpointId::from_bytes(id.as_bytes()).expect("valid node id")
                 );
 
                 match pool.get_connection(&dial_info).await {
@@ -396,7 +396,7 @@ impl DhtActor {
                                 
                                 if is_new {
                                     // ALSO register with DhtPool so we can connect back to them
-                                    let node_id = iroh::NodeId::from_bytes(&requester_id)
+                                    let node_id = iroh::EndpointId::from_bytes(&requester_id)
                                         .expect("valid node id");
                                     let dial_info = DialInfo::from_node_id_with_relay(node_id, relay_url.clone());
                                     self.pool.register_dial_info(dial_info).await;
@@ -634,7 +634,7 @@ impl DhtActor {
                                 
                                 if is_new {
                                     // ALSO register with DhtPool so we can connect back to them
-                                    let node_id = iroh::NodeId::from_bytes(&requester_id)
+                                    let node_id = iroh::EndpointId::from_bytes(&requester_id)
                                         .expect("valid node id");
                                     let dial_info = DialInfo::from_node_id_with_relay(node_id, relay_url.clone());
                                     self.pool.register_dial_info(dial_info).await;

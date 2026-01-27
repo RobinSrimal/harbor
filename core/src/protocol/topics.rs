@@ -36,7 +36,7 @@ impl Protocol {
         let our_id = self.endpoint_id();
 
         // Get our relay URL for cross-network connectivity
-        let relay_url = self.endpoint.node_addr().relay_url.map(|u| u.to_string());
+        let relay_url = self.endpoint.addr().relay_urls().next().map(|u| u.to_string());
 
         // Create member info with relay URL
         let our_info = if let Some(relay) = relay_url {
@@ -86,7 +86,7 @@ impl Protocol {
         }
 
         // Send join announcement to other members (with relay info for connectivity)
-        let our_relay = self.endpoint.node_addr().relay_url.map(|u| u.to_string());
+        let our_relay = self.endpoint.addr().relay_urls().next().map(|u| u.to_string());
         let join_msg = if let Some(ref relay) = our_relay {
             JoinMessage::with_relay(our_id, relay.clone())
         } else {
@@ -217,7 +217,7 @@ impl Protocol {
 
         // Get our relay URL for cross-network connectivity (use fresh value)
         let our_id = self.endpoint_id();
-        let our_relay = self.endpoint.node_addr().relay_url.map(|u| u.to_string());
+        let our_relay = self.endpoint.addr().relay_urls().next().map(|u| u.to_string());
 
         // Build member info from database, but update our own relay URL with fresh value
         let member_info: Vec<MemberInfo> = members_with_info

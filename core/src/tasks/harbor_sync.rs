@@ -192,7 +192,7 @@ impl Protocol {
         let node_hex = hex::encode(harbor_node);
         debug!(partner = %node_hex, "Harbor sync: connecting to partner");
 
-        let node_id = iroh::NodeId::from_bytes(harbor_node)
+        let node_id = iroh::EndpointId::from_bytes(harbor_node)
             .map_err(|_| ProtocolError::Network("invalid node id".into()))?;
 
         let conn = endpoint

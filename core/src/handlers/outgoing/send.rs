@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn test_node_id_from_bytes() {
         let id = make_id(42);
-        let result = iroh::NodeId::from_bytes(&id);
+        let result = iroh::EndpointId::from_bytes(&id);
         assert!(result.is_ok());
     }
 

@@ -3,13 +3,13 @@
 //! Provides well-known bootstrap nodes for joining the DHT network.
 //! New nodes connect to these to discover other peers.
 
-use iroh::NodeId;
+use iroh::EndpointId;
 
 /// Bootstrap node information
 #[derive(Debug, Clone)]
 pub struct BootstrapNode {
-    /// The node's EndpointID (NodeId)
-    pub node_id: NodeId,
+    /// The node's EndpointID (EndpointId)
+    pub node_id: EndpointId,
     /// Optional human-readable name
     pub name: Option<&'static str>,
     /// Optional relay URL for cross-network connectivity
@@ -28,29 +28,29 @@ impl BootstrapNode {
         Some(arr)
     }
 
-    /// Create a new bootstrap node from hex-encoded NodeId
+    /// Create a new bootstrap node from hex-encoded EndpointId
     pub fn from_hex(hex: &str, name: Option<&'static str>) -> Option<Self> {
         let arr = Self::parse_hex(hex)?;
-        let node_id = NodeId::from_bytes(&arr).ok()?;
+        let node_id = EndpointId::from_bytes(&arr).ok()?;
         Some(Self { node_id, name, relay_url: None })
     }
 
     /// Create a new bootstrap node with relay URL
     pub fn from_hex_with_relay(hex: &str, name: Option<&'static str>, relay_url: &'static str) -> Option<Self> {
         let arr = Self::parse_hex(hex)?;
-        let node_id = NodeId::from_bytes(&arr).ok()?;
+        let node_id = EndpointId::from_bytes(&arr).ok()?;
         Some(Self { node_id, name, relay_url: Some(relay_url) })
     }
 
     /// Create from raw bytes
     pub fn from_bytes(bytes: &[u8; 32], name: Option<&'static str>) -> Option<Self> {
-        let node_id = NodeId::from_bytes(bytes).ok()?;
+        let node_id = EndpointId::from_bytes(bytes).ok()?;
         Some(Self { node_id, name, relay_url: None })
     }
 
     /// Create from raw bytes with relay URL
     pub fn from_bytes_with_relay(bytes: &[u8; 32], name: Option<&'static str>, relay_url: &'static str) -> Option<Self> {
-        let node_id = NodeId::from_bytes(bytes).ok()?;
+        let node_id = EndpointId::from_bytes(bytes).ok()?;
         Some(Self { node_id, name, relay_url: Some(relay_url) })
     }
 }
@@ -84,7 +84,7 @@ pub fn bootstrap_node_ids() -> Vec<[u8; 32]> {
 }
 
 /// Get bootstrap nodes with their relay URLs (for DialInfo registration)
-pub fn bootstrap_dial_info() -> Vec<(NodeId, Option<String>)> {
+pub fn bootstrap_dial_info() -> Vec<(EndpointId, Option<String>)> {
     default_bootstrap_nodes()
         .into_iter()
         .map(|n| (n.node_id, n.relay_url.map(|s| s.to_string())))

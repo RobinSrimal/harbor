@@ -76,7 +76,7 @@ pub async fn iterative_find_node(
             query_tasks.spawn(async move {
                 // Create dial info - pool will merge with known relay URLs
                 let dial_info = DialInfo::from_node_id(
-                    iroh::NodeId::from_bytes(id.as_bytes()).expect("valid node id")
+                    iroh::EndpointId::from_bytes(id.as_bytes()).expect("valid node id")
                 );
 
                 match pool.get_connection(&dial_info).await {
@@ -136,7 +136,7 @@ pub async fn iterative_find_node(
                             // Register relay URL with pool for future connections
                             // AND store in node_relay_urls so we can share with others
                             if let Some(relay_url) = info.relay_url {
-                                let node_id = iroh::NodeId::from_bytes(&info.node_id)
+                                let node_id = iroh::EndpointId::from_bytes(&info.node_id)
                                     .expect("valid node id");
                                 let dial_info = DialInfo::from_node_id_with_relay(node_id, relay_url.clone());
                                 pool.register_dial_info(dial_info).await;

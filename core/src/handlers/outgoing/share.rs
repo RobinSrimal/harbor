@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use iroh::{NodeAddr, NodeId};
+use iroh::{EndpointAddr, EndpointId};
 use tracing::{debug, info};
 
 use crate::data::{BlobStore, CHUNK_SIZE};
@@ -27,7 +27,7 @@ impl Protocol {
         hash: &[u8; 32],
         chunk_indices: &[u32],
     ) -> Result<Vec<ChunkResponse>, ProtocolError> {
-        let node_id = NodeId::from_bytes(peer_id)
+        let node_id = EndpointId::from_bytes(peer_id)
             .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
         let conn = self.connect_for_share(node_id).await?;
@@ -71,7 +71,7 @@ impl Protocol {
         source_id: &[u8; 32],
         hash: &[u8; 32],
     ) -> Result<ChunkMapResponse, ProtocolError> {
-        let node_id = NodeId::from_bytes(source_id)
+        let node_id = EndpointId::from_bytes(source_id)
             .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
         let conn = self.connect_for_share(node_id).await?;
@@ -130,8 +130,8 @@ impl Protocol {
     }
 
     /// Connect to a peer for Share protocol
-    async fn connect_for_share(&self, node_id: NodeId) -> Result<iroh::endpoint::Connection, ProtocolError> {
-        let node_addr: NodeAddr = node_id.into();
+    async fn connect_for_share(&self, node_id: EndpointId) -> Result<iroh::endpoint::Connection, ProtocolError> {
+        let node_addr: EndpointAddr = node_id.into();
 
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -152,9 +152,9 @@ impl Protocol {
         chunk_start: u32,
         chunk_end: u32,
     ) -> Result<(), ProtocolError> {
-        let node_id = NodeId::from_bytes(peer_id)
+        let node_id = EndpointId::from_bytes(peer_id)
             .map_err(|e| ProtocolError::Network(e.to_string()))?;
-        let node_addr: NodeAddr = node_id.into();
+        let node_addr: EndpointAddr = node_id.into();
 
         // Connect to peer
         let conn = tokio::time::timeout(
@@ -226,9 +226,9 @@ pub async fn push_section_to_peer_standalone(
     chunk_start: u32,
     chunk_end: u32,
 ) -> Result<(), ProtocolError> {
-    let node_id = NodeId::from_bytes(peer_id)
+    let node_id = EndpointId::from_bytes(peer_id)
         .map_err(|e| ProtocolError::Network(e.to_string()))?;
-    let node_addr: NodeAddr = node_id.into();
+    let node_addr: EndpointAddr = node_id.into();
 
     // Connect to peer
     let conn = tokio::time::timeout(

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::{Endpoint, NodeAddr, NodeId};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh::endpoint::Connection;
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{Mutex, RwLock};
@@ -361,7 +361,7 @@ impl ShareService {
             let chunk_end = ((section_id as u32 + 1) * chunks_per_section).min(total_chunks);
 
             // Try to connect to peer
-            let node_id = NodeId::from_bytes(peer_id)
+            let node_id = EndpointId::from_bytes(peer_id)
                 .map_err(|e| ShareError::Connection(e.to_string()))?;
 
             match self.connect_to_peer(node_id).await {
@@ -597,8 +597,8 @@ impl ShareService {
     }
 
     /// Connect to a peer
-    async fn connect_to_peer(&self, node_id: NodeId) -> Result<Connection, ShareError> {
-        let node_addr: NodeAddr = node_id.into();
+    async fn connect_to_peer(&self, node_id: EndpointId) -> Result<Connection, ShareError> {
+        let node_addr: EndpointAddr = node_id.into();
         
         tokio::time::timeout(
             self.config.connect_timeout,
