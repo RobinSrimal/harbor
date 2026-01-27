@@ -5,8 +5,6 @@
 //! - FindNodeResponse: Response with closest known nodes
 //! - NodeInfo: Information about a discovered node
 
-use std::sync::Arc;
-
 use iroh::EndpointAddr;
 use irpc::channel::oneshot;
 use irpc::rpc_requests;
@@ -91,53 +89,6 @@ pub enum RpcProtocol {
     /// Find the closest nodes to a target ID
     #[rpc(tx = oneshot::Sender<FindNodeResponse>)]
     FindNode(FindNode),
-}
-
-/// RPC client for DHT operations
-#[derive(Debug, Clone)]
-pub struct RpcClient {
-    inner: Arc<irpc::Client<RpcProtocol>>,
-}
-
-impl RpcClient {
-    /// Create a new RPC client from an irpc client
-    pub fn new(client: irpc::Client<RpcProtocol>) -> Self {
-        Self {
-            inner: Arc::new(client),
-        }
-    }
-
-    /// Find the closest nodes to a target ID
-    pub async fn find_node(
-        &self,
-        target: Id,
-        requester: Option<[u8; 32]>,
-        requester_relay_url: Option<String>,
-    ) -> Result<FindNodeResponse, irpc::Error> {
-        self.inner.rpc(FindNode { target, requester, requester_relay_url }).await
-    }
-}
-
-/// Weak reference to RPC client
-#[derive(Debug, Clone)]
-pub struct WeakRpcClient {
-    inner: std::sync::Weak<irpc::Client<RpcProtocol>>,
-}
-
-impl WeakRpcClient {
-    /// Try to upgrade to a strong reference
-    pub fn upgrade(&self) -> Option<RpcClient> {
-        self.inner.upgrade().map(|inner| RpcClient { inner })
-    }
-}
-
-impl RpcClient {
-    /// Create a weak reference
-    pub fn downgrade(&self) -> WeakRpcClient {
-        WeakRpcClient {
-            inner: Arc::downgrade(&self.inner),
-        }
-    }
 }
 
 #[cfg(test)]

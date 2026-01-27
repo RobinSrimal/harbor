@@ -11,6 +11,7 @@
 //! Each protocol has its own ALPN and connection pool.
 
 pub mod pool;
+pub mod rpc;
 pub mod service;
 pub mod dht;
 pub mod harbor;
@@ -21,13 +22,13 @@ pub mod sync;
 // Re-export commonly used items
 pub use service::ServiceDeps;
 pub use harbor::{HarborError, HarborMessage, HarborService, HARBOR_ALPN};
-pub use send::{Receipt, SendConfig, SendMessage, SendService, SEND_ALPN};
+pub use send::{Receipt, SendConfig, SendService, SEND_ALPN};
 pub use share::{
     FileAnnouncement, CanSeed, ShareConfig, ShareError, ShareMessage, ShareService, SHARE_ALPN,
 };
 pub use sync::{
     SyncMessage, SyncMessageType, SyncUpdate, InitialSyncRequest, InitialSyncResponse,
-    DecodeError as SyncDecodeError, SYNC_MESSAGE_PREFIX, SYNC_ALPN,
+    DecodeError as SyncDecodeError, SYNC_MESSAGE_PREFIX, SYNC_ALPN, SyncService,
 };
 
 // Topic message types (payload format for Send packets)

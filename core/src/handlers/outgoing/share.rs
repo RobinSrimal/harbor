@@ -114,12 +114,15 @@ impl Protocol {
             self.identity.public_key,
         ));
 
-        self.send_raw(
-            topic_id,
-            &topic_msg.encode(),
-            recipients,
-            crate::network::harbor::protocol::HarborPacketType::Content,
-        ).await?;
+        self.send_service
+            .send_to_topic(
+                topic_id,
+                &topic_msg.encode(),
+                recipients,
+                crate::network::harbor::protocol::HarborPacketType::Content,
+            )
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
         info!(
             hash = %hex::encode(&hash[..8]),

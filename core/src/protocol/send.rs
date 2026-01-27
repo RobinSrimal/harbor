@@ -32,12 +32,6 @@ impl Protocol {
     /// - The message exceeds 512KB
     /// - The topic doesn't exist
     /// - The caller is not a member of the topic
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// protocol.send(&topic_id, b"Hello, world!").await?;
-    /// ```
     pub async fn send(&self, topic_id: &[u8; 32], payload: &[u8]) -> Result<(), ProtocolError> {
         self.check_running().await?;
 
@@ -86,13 +80,16 @@ impl Protocol {
             return Ok(());
         }
 
-        // Wrap payload as Content message
+        // Wrap payload as Content message and delegate to SendService
         let content_msg = TopicMessage::Content(payload.to_vec());
         let encoded_payload = content_msg.encode();
 
-        // Send to all recipients with relay info
-        self.send_raw(topic_id, &encoded_payload, &recipients, HarborPacketType::Content)
+        self.send_service
+            .send_to_topic(topic_id, &encoded_payload, &recipients, HarborPacketType::Content)
             .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        Ok(())
     }
 
     /// Refresh member lists from Harbor Nodes
@@ -138,4 +135,3 @@ mod tests {
         assert!(too_large.len() > MAX_MESSAGE_SIZE);
     }
 }
-

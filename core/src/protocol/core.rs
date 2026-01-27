@@ -17,14 +17,15 @@ use tracing::info;
 
 use crate::data::{get_or_create_identity, start_db, LocalIdentity};
 use crate::network::dht::{
-    bootstrap_dial_info, bootstrap_node_ids, create_dht_node_with_buckets, ApiClient as DhtApiClient,
-    Buckets, DhtConfig, DhtPool, DhtPoolConfig, DialInfo, RpcClient as DhtRpcClient, DHT_ALPN,
+    bootstrap_dial_info, bootstrap_node_ids, create_dht_actor_with_buckets,
+    Buckets, DhtConfig, DhtPool, DhtPoolConfig, DhtService, DialInfo, DHT_ALPN,
+    service::WeakDhtService,
 };
 use crate::data::BlobStore;
 use crate::network::harbor::protocol::HARBOR_ALPN;
-use crate::network::send::{SendConfig, SendService, protocol::SEND_ALPN};
+use crate::network::send::{SendService, protocol::SEND_ALPN};
 use crate::network::share::{ShareConfig, ShareService, SHARE_ALPN};
-use crate::network::sync::protocol::SYNC_ALPN;
+use crate::network::sync::{SyncService, SYNC_ALPN};
 
 use super::config::ProtocolConfig;
 use super::error::ProtocolError;
@@ -55,15 +56,14 @@ pub struct Protocol {
     pub(crate) identity: Arc<LocalIdentity>,
     /// Database connection (wrapped for thread safety)
     pub(crate) db: Arc<Mutex<Connection>>,
-    /// DHT RPC client (must be kept alive to keep actor running)
-    #[allow(dead_code)]
-    dht_rpc_client: Option<DhtRpcClient>,
-    /// DHT client for finding Harbor Nodes
-    pub(crate) dht_client: Option<DhtApiClient>,
+    /// DHT service - single entry point for all DHT operations
+    pub(crate) dht_service: Option<Arc<DhtService>>,
     /// Send service for message delivery
     pub(crate) send_service: Arc<SendService>,
     /// Share service for file distribution
     pub(crate) share_service: Arc<ShareService>,
+    /// Sync service for CRDT synchronization
+    pub(crate) sync_service: Arc<SyncService>,
     /// Event sender (for app notifications: messages, file events, etc.)
     pub(crate) event_tx: mpsc::Sender<ProtocolEvent>,
     /// Event receiver (cloneable via Arc)
@@ -242,7 +242,11 @@ impl Protocol {
 
         let bootstrap_count = bootstrap_ids.len();
 
-        let (dht_rpc_client, dht_client) = create_dht_node_with_buckets(
+        // Wrap db in Arc<Mutex<>> for sharing with services
+        let db = Arc::new(Mutex::new(db));
+
+        let service_pool = dht_pool.clone();
+        let (mut dht_actor, dht_api_client) = create_dht_actor_with_buckets(
             local_dht_id,
             dht_pool,
             DhtConfig::persistent(),
@@ -250,9 +254,18 @@ impl Protocol {
             persisted_buckets,
         );
 
+        // Create DhtService, set weak ref on actor, then spawn
+        let dht_service = DhtService::new(
+            service_pool,
+            dht_api_client,
+            db.clone(),
+        );
+        dht_actor.set_service(WeakDhtService::new(&dht_service));
+        tokio::spawn(dht_actor.run());
+
         // Restore relay URLs from database
         if !persisted_relay_urls.is_empty() {
-            if let Err(e) = dht_client.set_node_relay_urls(persisted_relay_urls).await {
+            if let Err(e) = dht_service.set_node_relay_urls(persisted_relay_urls).await {
                 tracing::warn!(error = %e, "Failed to restore relay URLs from database");
             }
         }
@@ -266,19 +279,14 @@ impl Protocol {
         let (event_tx, event_rx) = mpsc::channel(1000);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-        // Store both clients - rpc_client must be kept alive to keep actor running!
-        let dht_rpc_client = Some(dht_rpc_client);
-        let dht_client = Some(dht_client);
-
-        // Wrap db in Arc<Mutex<>> for sharing with services
-        let db = Arc::new(Mutex::new(db));
+        let dht_service = Some(dht_service);
 
         // Initialize Send service
         let send_service = Arc::new(SendService::new(
             endpoint.clone(),
             identity.clone(),
             db.clone(),
-            SendConfig::default(),
+            event_tx.clone(),
         ));
 
         // Initialize Share service
@@ -302,15 +310,24 @@ impl Protocol {
             ShareConfig::default(),
         ));
 
+        // Initialize Sync service
+        let sync_service = Arc::new(SyncService::new(
+            endpoint.clone(),
+            identity.clone(),
+            db.clone(),
+            event_tx.clone(),
+            send_service.clone(),
+        ));
+
         let protocol = Self {
             config,
             endpoint,
             identity,
             db,
-            dht_rpc_client,
-            dht_client,
+            dht_service,
             send_service,
             share_service,
+            sync_service,
             event_tx,
             event_rx: Arc::new(RwLock::new(Some(event_rx))),
             running: Arc::new(RwLock::new(true)),
@@ -338,9 +355,9 @@ impl Protocol {
         let _ = self.shutdown_tx.send(()).await;
 
         // Save DHT routing table before shutdown
-        if let Some(ref dht_client) = self.dht_client {
+        if let Some(ref dht_service) = self.dht_service {
             info!("Saving DHT routing table before shutdown...");
-            if let Err(e) = Self::save_dht_routing_table(&self.db, dht_client).await {
+            if let Err(e) = dht_service.save_routing_table().await {
                 tracing::warn!(error = %e, "Failed to save DHT routing table on shutdown");
             }
         }
@@ -408,197 +425,43 @@ impl Protocol {
         Ok(())
     }
     
-    // ========== Sync Transport API (NEW) ==========
+    // ========== Sync Transport API ==========
     //
-    // These methods provide sync transport without internal CRDT handling.
+    // Thin delegates to SyncService.
     // Applications bring their own CRDT (Loro, Yjs, Automerge, etc.).
-    
+
     /// Send a sync update to all topic members
     ///
-    /// The `data` bytes are opaque to Harbor - application provides
-    /// serialized CRDT updates (Loro delta, Yjs update, etc.)
-    /// 
     /// Max size: 512 KB (uses broadcast via send protocol)
     pub async fn send_sync_update(
         &self,
         topic_id: &[u8; 32],
         data: Vec<u8>,
     ) -> Result<(), ProtocolError> {
-        use crate::data::get_topic_members_with_info;
-        use crate::network::harbor::protocol::HarborPacketType;
-        use crate::network::send::topic_messages::{TopicMessage, SyncUpdateMessage};
-        use super::types::MemberInfo;
-        
         self.check_running().await?;
-        
-        // Check size limit
-        if data.len() > MAX_MESSAGE_SIZE {
-            return Err(ProtocolError::MessageTooLarge);
-        }
-        
-        // Get topic members
-        let members_with_info = {
-            let db = self.db.lock().await;
-            get_topic_members_with_info(&db, topic_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?
-        };
-        
-        if members_with_info.is_empty() {
-            return Err(ProtocolError::TopicNotFound);
-        }
-        
-        let our_id = self.endpoint_id();
-        
-        // Get recipients (all members except us)
-        let recipients: Vec<MemberInfo> = members_with_info
-            .into_iter()
-            .filter(|m| m.endpoint_id != our_id)
-            .map(|m| MemberInfo {
-                endpoint_id: m.endpoint_id,
-                relay_url: m.relay_url,
-            })
-            .collect();
-        
-        if recipients.is_empty() {
-            return Ok(()); // No one to send to
-        }
-        
-        // Encode as SyncUpdate message
-        let msg = TopicMessage::SyncUpdate(SyncUpdateMessage { data });
-        let encoded = msg.encode();
-        
-        // Broadcast to all members
-        self.send_raw(topic_id, &encoded, &recipients, HarborPacketType::Content)
-            .await
+        self.sync_service.send_sync_update(topic_id, data).await
     }
-    
+
     /// Request sync state from topic members
-    ///
-    /// Broadcasts a sync request to all members. When peers respond,
-    /// you'll receive `ProtocolEvent::SyncResponse` events.
     pub async fn request_sync(
         &self,
         topic_id: &[u8; 32],
     ) -> Result<(), ProtocolError> {
-        use crate::data::get_topic_members_with_info;
-        use crate::network::harbor::protocol::HarborPacketType;
-        use crate::network::send::topic_messages::TopicMessage;
-        use super::types::MemberInfo;
-        
         self.check_running().await?;
-        
-        // Get topic members
-        let members_with_info = {
-            let db = self.db.lock().await;
-            get_topic_members_with_info(&db, topic_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?
-        };
-        
-        if members_with_info.is_empty() {
-            return Err(ProtocolError::TopicNotFound);
-        }
-        
-        let our_id = self.endpoint_id();
-        
-        // Get recipients (all members except us)
-        let recipients: Vec<MemberInfo> = members_with_info
-            .into_iter()
-            .filter(|m| m.endpoint_id != our_id)
-            .map(|m| MemberInfo {
-                endpoint_id: m.endpoint_id,
-                relay_url: m.relay_url,
-            })
-            .collect();
-        
-        if recipients.is_empty() {
-            return Ok(()); // No one to request from
-        }
-        
-        // Encode as SyncRequest message (no payload)
-        let msg = TopicMessage::SyncRequest;
-        let encoded = msg.encode();
-        
-        info!(
-            topic = %hex::encode(&topic_id[..8]),
-            recipients = recipients.len(),
-            "Broadcasting sync request"
-        );
-
-        // Broadcast to all members
-        self.send_raw(topic_id, &encoded, &recipients, HarborPacketType::Content)
-            .await
+        self.sync_service.request_sync(topic_id).await
     }
 
-    // Note: respond_sync() is implemented in handlers/outgoing/sync.rs
-
-    /// Save the current DHT routing table to the database
-    pub(crate) async fn save_dht_routing_table(
-        db: &Arc<Mutex<Connection>>,
-        dht_client: &DhtApiClient,
+    /// Respond to a sync request with current state
+    ///
+    /// Uses direct SYNC_ALPN connection - no size limit.
+    pub async fn respond_sync(
+        &self,
+        topic_id: &[u8; 32],
+        requester_id: &[u8; 32],
+        data: Vec<u8>,
     ) -> Result<(), ProtocolError> {
-        use crate::data::dht::{clear_all_entries, insert_dht_entry, DhtEntry};
-        use crate::data::dht::{current_timestamp, upsert_peer, PeerInfo};
-        use std::collections::HashMap;
-
-        // Get current routing table from DHT actor
-        let buckets = dht_client
-            .get_routing_table()
-            .await
-            .map_err(|e| ProtocolError::Network(format!("failed to get routing table: {}", e)))?;
-
-        // Get relay URLs for nodes
-        let relay_urls: HashMap<[u8; 32], String> = dht_client
-            .get_node_relay_urls()
-            .await
-            .map_err(|e| ProtocolError::Network(format!("failed to get relay URLs: {}", e)))?
-            .into_iter()
-            .collect();
-
-        let timestamp = current_timestamp();
-        let mut entry_count = 0;
-
-        // Save to database using transaction for atomicity
-        let mut db_lock = db.lock().await;
-        let tx = db_lock
-            .transaction()
-            .map_err(|e| ProtocolError::Database(format!("failed to start transaction: {}", e)))?;
-
-        // Clear existing entries and insert new ones
-        clear_all_entries(&tx)
-            .map_err(|e| ProtocolError::Database(format!("failed to clear DHT entries: {}", e)))?;
-
-        for (bucket_idx, entries) in buckets.iter().enumerate() {
-            for endpoint_id in entries {
-                // Ensure peer exists (required by foreign key constraint)
-                let peer = PeerInfo {
-                    endpoint_id: *endpoint_id,
-                    endpoint_address: None,
-                    address_timestamp: None,
-                    last_latency_ms: None,
-                    latency_timestamp: None,
-                    last_seen: timestamp,
-                };
-                upsert_peer(&tx, &peer)
-                    .map_err(|e| ProtocolError::Database(format!("failed to upsert peer: {}", e)))?;
-
-                let entry = DhtEntry {
-                    endpoint_id: *endpoint_id,
-                    bucket_index: bucket_idx as u8,
-                    added_at: timestamp,
-                    relay_url: relay_urls.get(endpoint_id).cloned(),
-                };
-                insert_dht_entry(&tx, &entry).map_err(|e| {
-                    ProtocolError::Database(format!("failed to insert DHT entry: {}", e))
-                })?;
-                entry_count += 1;
-            }
-        }
-
-        tx.commit()
-            .map_err(|e| ProtocolError::Database(format!("failed to commit transaction: {}", e)))?;
-
-        info!(entries = entry_count, "DHT routing table saved to database");
-        Ok(())
+        self.check_running().await?;
+        self.sync_service.respond_sync(topic_id, requester_id, data).await
     }
 }
 

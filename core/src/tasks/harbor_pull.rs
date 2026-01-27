@@ -16,7 +16,7 @@ use crate::data::{
     get_blob, insert_blob, init_blob_sections, record_peer_can_seed,
     CHUNK_SIZE,
 };
-use crate::network::dht::ApiClient as DhtApiClient;
+use crate::network::dht::DhtService;
 use crate::network::harbor::protocol::HarborPacketType;
 use crate::network::send::topic_messages::TopicMessage;
 use crate::security::{
@@ -33,7 +33,7 @@ impl Protocol {
         endpoint: Endpoint,
         event_tx: mpsc::Sender<ProtocolEvent>,
         our_id: [u8; 32],
-        dht_client: Option<DhtApiClient>,
+        dht_service: Option<Arc<DhtService>>,
         running: Arc<RwLock<bool>>,
         pull_interval: Duration,
         pull_max_nodes: usize,
@@ -65,7 +65,7 @@ impl Protocol {
                 let harbor_id = harbor_id_from_topic(&topic_id);
 
                 // Find Harbor Nodes for this topic
-                let harbor_nodes = Self::find_harbor_nodes(&dht_client, &harbor_id).await;
+                let harbor_nodes = Self::find_harbor_nodes(&dht_service, &harbor_id).await;
 
                 if harbor_nodes.is_empty() {
                     continue;

@@ -20,16 +20,14 @@ use tokio::task::JoinSet;
 use tokio::time::{interval, Interval};
 use tracing::{debug, error, info, trace};
 
-use super::internal::api::{ApiClient, ApiMessage, WeakApiClient};
+use super::internal::api::ApiMessage;
 use super::internal::config::DhtConfig;
 use super::internal::distance::Id;
 use super::internal::lookup::iterative_find_node;
 use super::internal::pool::{DhtPool, DhtPoolError as PoolError, DialInfo};
 use super::internal::routing::{AddNodeResult, Buckets, RoutingTable, BUCKET_COUNT};
-use super::protocol::{FindNodeResponse, NodeInfo, RpcClient, RpcMessage};
-
-// Import the DHT network handler
-use crate::handlers::outgoing::send_find_node;
+use super::protocol::NodeInfo;
+use super::service::{DhtService, WeakDhtService};
 
 /// DHT node state
 struct DhtNode {
@@ -63,12 +61,10 @@ pub struct DhtActor {
     pool: DhtPool,
     /// Configuration
     config: DhtConfig,
-    /// Receiver for RPC messages (from network)
-    rpc_rx: mpsc::Receiver<RpcMessage>,
     /// Receiver for API messages (local control)
     api_rx: mpsc::Receiver<ApiMessage>,
-    /// Weak reference to API for sending notifications
-    api: WeakApiClient,
+    /// Weak reference to DhtService for outgoing operations and notifications
+    service: Option<WeakDhtService>,
     /// Background tasks
     tasks: JoinSet<()>,
     /// RNG for random lookups
@@ -88,7 +84,7 @@ impl DhtActor {
         pool: DhtPool,
         config: DhtConfig,
         bootstrap: Vec<Id>,
-    ) -> (Self, RpcClient, ApiClient) {
+    ) -> (Self, irpc::Client<super::internal::api::ApiProtocol>) {
         Self::new_with_buckets(local_id, pool, config, bootstrap, None)
     }
 
@@ -99,7 +95,7 @@ impl DhtActor {
         config: DhtConfig,
         bootstrap: Vec<Id>,
         buckets: Option<Buckets>,
-    ) -> (Self, RpcClient, ApiClient) {
+    ) -> (Self, irpc::Client<super::internal::api::ApiProtocol>) {
         // Create node
         let mut node = match buckets {
             Some(b) => DhtNode::with_buckets(local_id, b),
@@ -113,13 +109,9 @@ impl DhtActor {
             }
         }
 
-        // Create RPC channel
-        let (rpc_tx, rpc_rx) = mpsc::channel(32);
-        let rpc_client = RpcClient::new(irpc::Client::local(rpc_tx));
-
         // Create API channel
         let (api_tx, api_rx) = mpsc::channel(32);
-        let api_client = ApiClient::new(irpc::Client::local(api_tx));
+        let api_client = irpc::Client::local(api_tx);
 
         // Create RNG
         let rng = match config.rng_seed {
@@ -134,9 +126,8 @@ impl DhtActor {
             node,
             pool,
             config,
-            rpc_rx,
             api_rx,
-            api: api_client.downgrade(),
+            service: None,
             tasks: JoinSet::new(),
             rng,
             candidates: HashSet::new(),
@@ -144,7 +135,15 @@ impl DhtActor {
             node_relay_urls: HashMap::new(),
         };
 
-        (actor, rpc_client, api_client)
+        (actor, api_client)
+    }
+
+    /// Set the DhtService reference (must be called before run())
+    ///
+    /// This breaks the circular dependency: DhtService owns the irpc client,
+    /// actor holds a weak ref back to DhtService.
+    pub fn set_service(&mut self, service: WeakDhtService) {
+        self.service = Some(service);
     }
 
     /// Run the actor's main loop
@@ -153,15 +152,7 @@ impl DhtActor {
             tokio::select! {
                 biased;
 
-                // Handle RPC messages from network
-                msg = self.rpc_rx.recv() => {
-                    match msg {
-                        Ok(Some(msg)) => self.handle_rpc(msg).await,
-                        _ => break,
-                    }
-                }
-
-                // Handle API messages from local control
+                // Handle API messages (from DhtService)
                 msg = self.api_rx.recv() => {
                     match msg {
                         Ok(Some(msg)) => self.handle_api(msg).await,
@@ -260,8 +251,8 @@ impl DhtActor {
         };
         let relay_url = self.pool.home_relay_url();
 
-        send_find_node(conn.connection(), random_target, requester, relay_url).await?;
-        
+        DhtService::send_find_node_on_conn(conn.connection(), random_target, requester, relay_url).await?;
+
         Ok(())
     }
 
@@ -298,11 +289,11 @@ impl DhtActor {
 
         // Verify each candidate by attempting connection and sending FindNode RPC
         let pool = self.pool.clone();
-        let api = self.api.clone();
+        let service = self.service.clone();
         let transient = self.config.transient;
         let local_id = *self.node.local_id();
         let home_relay_url = self.pool.home_relay_url();
-        
+
         // Spawn verification as background task so we don't block the actor
         self.tasks.spawn(async move {
             let mut verified = Vec::new();
@@ -323,7 +314,7 @@ impl DhtActor {
                             Some(*local_id.as_bytes())
                         };
 
-                        match send_find_node(conn.connection(), random_target, requester, home_relay_url.clone()).await {
+                        match DhtService::send_find_node_on_conn(conn.connection(), random_target, requester, home_relay_url.clone()).await {
                             Ok(_) => {
                                 trace!(node = %id, "candidate verified - FindNode RPC succeeded");
                                 verified.push(*id.as_bytes());
@@ -341,11 +332,13 @@ impl DhtActor {
                 }
             }
 
-            // Notify API to add verified nodes to routing table
+            // Notify service to add verified nodes to routing table
             if !verified.is_empty() {
                 info!(count = verified.len(), "verified {} candidate nodes", verified.len());
-                if let Some(api) = api.upgrade() {
-                    api.nodes_seen(&verified).await.ok();
+                if let Some(ref svc_weak) = service {
+                    if let Some(svc) = svc_weak.upgrade() {
+                        svc.nodes_seen(&verified).await.ok();
+                    }
                 }
             }
 
@@ -360,99 +353,7 @@ impl DhtActor {
         });
     }
 
-    /// Handle an RPC message from the network
-    async fn handle_rpc(&mut self, msg: RpcMessage) {
-        match msg {
-            RpcMessage::FindNode(msg) => {
-                // If requester wants to be added to our routing table,
-                // add them directly since they've proven they're real by connecting to us.
-                // Also store their relay URL for sharing with other nodes.
-                if let Some(requester_id) = msg.requester {
-                    if !self.config.transient {
-                        let id = Id::new(requester_id);
-                        // Don't add ourselves
-                        if id != *self.node.local_id() {
-                            // Add directly to routing table - they connected to us, so they're verified
-                            self.add_node_with_eviction(id).await;
-                            
-                            // Store their relay URL if provided - CRITICAL for peer discovery
-                            // Only log if this is a new relay URL (avoid spam)
-                            if let Some(ref relay_url) = msg.requester_relay_url {
-                                use std::collections::hash_map::Entry;
-                                let is_new = match self.node_relay_urls.entry(id) {
-                                    Entry::Vacant(e) => {
-                                        e.insert(relay_url.clone());
-                                        true
-                                    }
-                                    Entry::Occupied(mut e) => {
-                                        if e.get() != relay_url {
-                                            e.insert(relay_url.clone());
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    }
-                                };
-                                
-                                if is_new {
-                                    // ALSO register with DhtPool so we can connect back to them
-                                    let node_id = iroh::EndpointId::from_bytes(&requester_id)
-                                        .expect("valid node id");
-                                    let dial_info = DialInfo::from_node_id_with_relay(node_id, relay_url.clone());
-                                    self.pool.register_dial_info(dial_info).await;
-                                    
-                                    info!(
-                                        requester = %id,
-                                        relay = %relay_url,
-                                        "stored relay URL for requester (new)"
-                                    );
-                                }
-                            }
-                            
-                            debug!(
-                                requester = %id,
-                                relay = ?msg.requester_relay_url,
-                                "added requester directly to routing table"
-                            );
-                        }
-                    }
-                }
-                
-                let closest = self.node.routing_table.find_closest_nodes(&msg.target, self.config.k);
-                
-                // Convert to NodeInfo, including stored relay URLs for connectivity
-                let nodes: Vec<NodeInfo> = closest
-                    .iter()
-                    .map(|id| {
-                        let node_relay = self.node_relay_urls.get(id).cloned();
-                        NodeInfo::from_id_with_relay(id, node_relay)
-                    })
-                    .collect();
-                
-                // Log how many nodes have relay URLs - helpful for debugging discovery
-                let with_relay = nodes.iter().filter(|n| n.relay_url.is_some()).count();
-                if nodes.len() > 0 && with_relay < nodes.len() {
-                    debug!(
-                        total = nodes.len(),
-                        with_relay = with_relay,
-                        "FindNode response - some nodes missing relay URLs"
-                    );
-                }
-
-                debug!(
-                    target = %msg.target,
-                    returning_nodes = nodes.len(),
-                    routing_table_size = self.node.routing_table.len(),
-                    "responding to FindNode request"
-                );
-
-                let response = FindNodeResponse { nodes };
-                msg.tx.send(response).await.ok();
-            }
-        }
-    }
-
-    /// Handle an API message from local control
+    /// Handle an API message
     async fn handle_api(&mut self, msg: ApiMessage) {
         match msg {
             ApiMessage::NodesSeen(msg) => {
@@ -512,7 +413,9 @@ impl DhtActor {
 
                 let pool = self.pool.clone();
                 let config = self.config.clone();
-                let api = self.api.clone();
+                let service = self.service.clone().unwrap_or_else(|| {
+                    panic!("DhtActor::set_service must be called before run()")
+                });
                 let target = msg.target;
                 let local_id = *self.node.local_id();
                 let tx = msg.tx;
@@ -524,9 +427,9 @@ impl DhtActor {
                         local_id,
                         pool,
                         config,
-                        api,
+                        service,
                     ).await;
-                    
+
                     let ids: Vec<[u8; 32]> = result.into_iter().map(|id| *id.as_bytes()).collect();
                     tx.send(ids).await.ok();
                 });
@@ -565,14 +468,16 @@ impl DhtActor {
             ApiMessage::SelfLookup(msg) => {
                 let local_id = *self.node.local_id();
                 let initial = self.node.routing_table.find_closest_nodes(&local_id, self.config.k);
-                
+
                 let pool = self.pool.clone();
                 let config = self.config.clone();
-                let api = self.api.clone();
+                let service = self.service.clone().unwrap_or_else(|| {
+                    panic!("DhtActor::set_service must be called before run()")
+                });
                 let tx = msg.tx;
 
                 self.tasks.spawn(async move {
-                    iterative_find_node(local_id, initial, local_id, pool, config, api).await;
+                    iterative_find_node(local_id, initial, local_id, pool, config, service).await;
                     tx.send(()).await.ok();
                 });
             }
@@ -580,15 +485,17 @@ impl DhtActor {
             ApiMessage::RandomLookup(msg) => {
                 let random_id = Id::new(self.rng.r#gen());
                 let initial = self.node.routing_table.find_closest_nodes(&random_id, self.config.k);
-                
+
                 let pool = self.pool.clone();
                 let config = self.config.clone();
-                let api = self.api.clone();
+                let service = self.service.clone().unwrap_or_else(|| {
+                    panic!("DhtActor::set_service must be called before run()")
+                });
                 let local_id = *self.node.local_id();
                 let tx = msg.tx;
 
                 self.tasks.spawn(async move {
-                    iterative_find_node(random_id, initial, local_id, pool, config, api).await;
+                    iterative_find_node(random_id, initial, local_id, pool, config, service).await;
                     tx.send(()).await.ok();
                 });
             }
@@ -678,7 +585,7 @@ impl DhtActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::protocol::FindNode;
+    use super::super::protocol::{FindNode, FindNodeResponse};
     use super::super::internal::config::{DEFAULT_CANDIDATE_VERIFY_INTERVAL, MAX_CANDIDATES_PER_VERIFY};
     use super::super::internal::distance::Distance;
     use super::super::internal::routing::{K, ALPHA};
@@ -1006,32 +913,6 @@ mod tests {
         let decoded: FindNodeResponse = postcard::from_bytes(&bytes).unwrap();
         
         assert_eq!(decoded.nodes.len(), K);
-    }
-
-    #[test]
-    fn test_length_prefixed_protocol() {
-        // Test the length-prefixed message format used in send_find_node
-        let request = FindNode {
-            target: make_id(42),
-            requester: Some([1u8; 32]),
-            requester_relay_url: Some("https://relay.example.com/".to_string()),
-        };
-
-        // Simulate what send_find_node does
-        let request_bytes = postcard::to_allocvec(&request).unwrap();
-        let len = request_bytes.len() as u32;
-        
-        // Build message with length prefix
-        let mut message = Vec::new();
-        message.extend_from_slice(&len.to_be_bytes());
-        message.extend_from_slice(&request_bytes);
-
-        // Parse it back
-        let parsed_len = u32::from_be_bytes([message[0], message[1], message[2], message[3]]) as usize;
-        assert_eq!(parsed_len, request_bytes.len());
-
-        let parsed_request: FindNode = postcard::from_bytes(&message[4..]).unwrap();
-        assert_eq!(parsed_request.target, request.target);
     }
 
     #[test]

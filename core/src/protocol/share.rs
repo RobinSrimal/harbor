@@ -69,14 +69,16 @@ impl Protocol {
             .await
             .map_err(|e| ProtocolError::Database(e.to_string()))?;
 
-        // Send announcement via transport
-        self.send_raw(
-            topic_id,
-            &plan.message_bytes,
-            &plan.recipients,
-            crate::network::harbor::protocol::HarborPacketType::Content,
-        )
-        .await?;
+        // Send announcement via SendService
+        self.send_service
+            .send_to_topic(
+                topic_id,
+                &plan.message_bytes,
+                &plan.recipients,
+                crate::network::harbor::protocol::HarborPacketType::Content,
+            )
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
         info!(
             hash = hex::encode(&hash[..8]),

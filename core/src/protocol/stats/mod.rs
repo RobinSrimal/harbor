@@ -58,8 +58,8 @@ impl Protocol {
         // DHT stats from in-memory routing table (real-time)
         // Drop db lock before async DHT call
         drop(db);
-        let in_memory_nodes = if let Some(ref dht_client) = self.dht_client {
-            match dht_client.get_routing_table().await {
+        let in_memory_nodes = if let Some(ref dht) = self.dht_service {
+            match dht.get_routing_table().await {
                 Ok(buckets) => buckets.iter().map(|b| b.len() as u32).sum(),
                 Err(_) => 0,
             }
@@ -191,12 +191,12 @@ impl Protocol {
         // Drop db lock before async DHT call
         drop(db);
 
-        let harbor_node_count = if let Some(ref dht_client) = self.dht_client {
+        let harbor_node_count = if let Some(ref dht) = self.dht_service {
             // Create an Id from the harbor_id for DHT lookup
             let harbor_dht_id = crate::network::dht::Id::new(harbor_id);
 
             // Find nodes closest to the harbor_id from local routing table
-            match dht_client.find_closest(harbor_dht_id, Some(20)).await {
+            match dht.find_closest(harbor_dht_id, Some(20)).await {
                 Ok(nodes) => {
                     // Return count of nodes known to be near this harbor_id
                     nodes.len() as u32

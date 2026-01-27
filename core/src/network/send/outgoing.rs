@@ -1,31 +1,32 @@
-//! Send Service - Outgoing packet delivery
+//! Send Service - The single entry point for all send operations
 //!
-//! This module handles sending packets to topic members:
+//! Handles:
 //! - Creating and encrypting packets
-//! - Computing per-recipient PoW
-//! - Parallel delivery to multiple recipients
-//! - Tracking delivery status
+//! - Parallel delivery to multiple recipients via irpc RPC
+//! - Inline receipt acknowledgement
 //! - Connection management
+//! - Incoming connection handling (via handle_send_connection)
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures::future::join_all;
 use iroh::{Endpoint, EndpointId, EndpointAddr};
 use iroh::endpoint::Connection;
 use rusqlite::Connection as DbConnection;
-use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, trace};
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tracing::{debug, info, trace};
 
 use crate::data::send::store_outgoing_packet;
-use crate::data::LocalIdentity;
+use crate::data::{LocalIdentity, WILDCARD_RECIPIENT};
 use crate::network::harbor::protocol::HarborPacketType;
-use crate::protocol::MemberInfo;
-use crate::resilience::{PoWChallenge, compute_pow};
+use crate::network::rpc::ExistingConnection;
+use crate::protocol::{MemberInfo, ProtocolEvent};
 use crate::security::{
-    PacketError, create_packet, harbor_id_from_topic, send_target_id,
+    PacketError, create_packet, harbor_id_from_topic,
 };
-use super::protocol::{SEND_ALPN, SendMessage, Receipt};
-use super::SendConfig;
+use super::protocol::{SEND_ALPN, Receipt, DeliverPacket, SendRpcProtocol};
 
 /// Error during Send operations
 #[derive(Debug)]
@@ -73,24 +74,23 @@ pub struct SendResult {
     pub failed: Vec<([u8; 32], String)>,
 }
 
-/// Send service for outgoing packets
+/// Send service - single entry point for all send operations
 ///
-/// Follows the standard service pattern:
-/// - Takes Arc<LocalIdentity> for signing/encryption
-/// - Takes Arc<Mutex<DbConnection>> for persistence
-/// - Takes Endpoint for network operations
+/// Owns connection cache, identity, and provides both outgoing
+/// (send_to_topic) and incoming (handle_send_connection) operations.
 pub struct SendService {
     /// Iroh endpoint
     endpoint: Endpoint,
-    /// Local identity (shared with Protocol)
+    /// Local identity
     identity: Arc<LocalIdentity>,
-    /// Database connection (shared with Protocol)
+    /// Database connection
     db: Arc<Mutex<DbConnection>>,
-    /// Configuration
-    config: SendConfig,
+    /// Event sender (for incoming packet processing)
+    event_tx: mpsc::Sender<ProtocolEvent>,
+    /// Connection timeout
+    send_timeout: Duration,
     /// Active connections cache
-    connections: Arc<RwLock<HashMap<EndpointId, Connection>>>, 
-    /// TODO REMOVE THIS!!!!!!
+    connections: Arc<RwLock<HashMap<EndpointId, Connection>>>,
 }
 
 impl SendService {
@@ -99,13 +99,14 @@ impl SendService {
         endpoint: Endpoint,
         identity: Arc<LocalIdentity>,
         db: Arc<Mutex<DbConnection>>,
-        config: SendConfig,
+        event_tx: mpsc::Sender<ProtocolEvent>,
     ) -> Self {
         Self {
             endpoint,
             identity,
             db,
-            config,
+            event_tx,
+            send_timeout: Duration::from_secs(5),
             connections: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -120,30 +121,33 @@ impl SendService {
         &self.identity
     }
 
-    /// Get the PoW configuration
-    pub fn pow_config(&self) -> &crate::resilience::PoWConfig {
-        &self.config.pow_config
+    /// Get the event sender
+    pub fn event_tx(&self) -> &mpsc::Sender<ProtocolEvent> {
+        &self.event_tx
     }
+
+    /// Get the database connection
+    pub fn db(&self) -> &Arc<Mutex<DbConnection>> {
+        &self.db
+    }
+
+    // ========== Outgoing: Single Entry Point ==========
 
     /// Send a message to topic members
     ///
+    /// This is the single entry point for all send operations.
+    /// Takes pre-encoded TopicMessage bytes and delivers to all recipients.
+    ///
     /// # Arguments
     /// * `topic_id` - The topic to send on
-    /// * `recipients` - MemberInfo for topic members to send to (includes relay URLs)
-    /// * `plaintext` - The message payload
-    /// * `packet_type` - Type of packet (Content, SyncUpdate, etc.)
-    ///
-    /// # Returns
-    /// Result with delivery status for each recipient
-    ///
-    /// # PoW
-    /// Computes a unique PoW for each recipient to prevent replay attacks.
-    /// The PoW is bound to `send_target_id(topic_id, recipient_id) + packet_id + timestamp`.
-    pub async fn send(
+    /// * `encoded_payload` - Pre-encoded TopicMessage bytes (from TopicMessage::encode())
+    /// * `recipients` - MemberInfo for topic members to send to
+    /// * `packet_type` - Type of packet (Content, Join, Leave, etc.)
+    pub async fn send_to_topic(
         &self,
         topic_id: &[u8; 32],
+        encoded_payload: &[u8],
         recipients: &[MemberInfo],
-        plaintext: &[u8],
         packet_type: HarborPacketType,
     ) -> Result<SendResult, SendError> {
         if recipients.is_empty() {
@@ -158,7 +162,7 @@ impl SendService {
             topic_id,
             &self.identity.private_key,
             &self.identity.public_key,
-            plaintext,
+            encoded_payload,
         )?;
 
         let packet_id = packet.packet_id;
@@ -180,41 +184,72 @@ impl SendService {
             ).map_err(|e| SendError::Database(e.to_string()))?;
         }
 
+        // Filter out self and wildcard for actual delivery
+        let our_id = self.identity.public_key;
+        let actual_recipients: Vec<&MemberInfo> = recipients
+            .iter()
+            .filter(|m| m.endpoint_id != our_id && m.endpoint_id != WILDCARD_RECIPIENT)
+            .collect();
+
         let mut delivered_to = Vec::new();
         let mut failed = Vec::new();
 
-        for member in recipients {
-            // Skip self
-            if member.endpoint_id == self.identity.public_key {
-                delivered_to.push(member.endpoint_id);
-                continue;
+        // Mark self as delivered if in recipients
+        if recipients.iter().any(|m| m.endpoint_id == our_id) {
+            delivered_to.push(our_id);
+        }
+
+        if actual_recipients.is_empty() {
+            debug!(packet_id = hex::encode(&packet_id[..8]), "no recipients (only self/wildcard)");
+            return Ok(SendResult { packet_id, delivered_to, failed });
+        }
+
+        info!(
+            packet_id = hex::encode(&packet_id[..8]),
+            recipient_count = actual_recipients.len(),
+            "sending to recipients in parallel"
+        );
+
+        // Deliver to all recipients in parallel via irpc RPC
+        let send_futures = actual_recipients.iter().map(|member| {
+            let packet_clone = packet.clone();
+            let member = (*member).clone();
+            async move {
+                let result = self.deliver_to_member(&member, packet_clone).await;
+                (member.endpoint_id, result)
             }
+        });
 
-            // Compute PoW for this specific recipient
-            // send_target_id = hash(topic_id || recipient_id)
-            let target_id = send_target_id(topic_id, &member.endpoint_id);
-            let challenge = PoWChallenge::new(target_id, packet_id, self.config.pow_config.difficulty_bits);
-            let pow = compute_pow(&challenge);
+        let results = join_all(send_futures).await;
 
-            // Create message with PoW
-            let message = SendMessage::PacketWithPoW {
-                packet: packet.clone(),
-                proof_of_work: pow,
-            };
-            let encoded = message.encode();
-
-            match self.send_to_member(member, &encoded).await {
-                Ok(()) => {
-                    delivered_to.push(member.endpoint_id);
-                    trace!(recipient = hex::encode(&member.endpoint_id), "packet delivered");
+        for (endpoint_id, result) in results {
+            match result {
+                Ok(receipt) => {
+                    delivered_to.push(endpoint_id);
+                    trace!(
+                        recipient = hex::encode(endpoint_id),
+                        receipt_from = hex::encode(receipt.sender),
+                        "packet delivered with receipt"
+                    );
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
-                    failed.push((member.endpoint_id, err_msg.clone()));
-                    debug!(recipient = hex::encode(&member.endpoint_id), error = %err_msg, "delivery failed");
+                    failed.push((endpoint_id, err_msg.clone()));
+                    debug!(
+                        recipient = hex::encode(endpoint_id),
+                        error = %err_msg,
+                        "delivery failed"
+                    );
                 }
             }
         }
+
+        info!(
+            packet_id = hex::encode(&packet_id[..8]),
+            delivered = delivered_to.len(),
+            failed = failed.len(),
+            "parallel send complete"
+        );
 
         Ok(SendResult {
             packet_id,
@@ -223,17 +258,16 @@ impl SendService {
         })
     }
 
-    /// Send encoded message to a single member (with relay URL support)
+    // ========== Transport: irpc RPC delivery ==========
+
+    /// Deliver a packet to a single member via irpc RPC
     ///
-    /// This is a low-level transport function that handles:
-    /// - Building EndpointAddr with relay URL if available
-    /// - Getting/creating connections from the cache
-    /// - Sending data over a unidirectional QUIC stream
-    pub async fn send_to_member(
+    /// Opens a connection, sends DeliverPacket RPC, receives Receipt inline.
+    async fn deliver_to_member(
         &self,
         member: &MemberInfo,
-        encoded: &[u8],
-    ) -> Result<(), SendError> {
+        packet: crate::security::SendPacket,
+    ) -> Result<Receipt, SendError> {
         let node_id = EndpointId::from_bytes(&member.endpoint_id)
             .map_err(|e| SendError::Connection(e.to_string()))?;
 
@@ -251,22 +285,16 @@ impl SendService {
         // Get or create connection
         let conn = self.get_connection(node_id, node_addr).await?;
 
-        // Open unidirectional stream and send
-        let mut send_stream = conn
-            .open_uni()
+        // Send via irpc RPC - DeliverPacket request, Receipt response
+        let client = irpc::Client::<SendRpcProtocol>::boxed(
+            ExistingConnection::new(&conn)
+        );
+        let receipt = client
+            .rpc(DeliverPacket { packet })
             .await
             .map_err(|e| SendError::Send(e.to_string()))?;
 
-        send_stream
-            .write_all(encoded)
-            .await
-            .map_err(|e| SendError::Send(e.to_string()))?;
-
-        send_stream
-            .finish()
-            .map_err(|e| SendError::Send(e.to_string()))?;
-
-        Ok(())
+        Ok(receipt)
     }
 
     /// Get or create a connection to a node
@@ -281,9 +309,9 @@ impl SendService {
             }
         }
 
-        // Create new connection using provided EndpointAddr (which may include relay URL)
+        // Create new connection
         let conn = tokio::time::timeout(
-            self.config.send_timeout,
+            self.send_timeout,
             self.endpoint.connect(node_addr, SEND_ALPN),
         )
         .await
@@ -299,98 +327,12 @@ impl SendService {
         Ok(conn)
     }
 
-    /// Send a receipt back to the sender
-    pub async fn send_receipt(
-        &self,
-        receipt: &Receipt,
-        sender: &[u8; 32],
-    ) -> Result<(), SendError> {
-        let message = SendMessage::Receipt(receipt.clone());
-        let encoded = message.encode();
-        // Create MemberInfo without relay (receipts go to whoever sent us the packet)
-        let member = MemberInfo::new(*sender);
-        self.send_to_member(&member, &encoded).await
-    }
-
     /// Close connection to a node
     pub async fn close_connection(&self, node_id: EndpointId) {
         let mut connections = self.connections.write().await;
         if let Some(conn) = connections.remove(&node_id) {
             conn.close(0u32.into(), b"close");
         }
-    }
-}
-
-/// Prepare a packet for sending - creates, stores, and encodes
-///
-/// This function handles the business logic of packet preparation:
-/// 1. Creates the packet (encrypt, MAC, sign)
-/// 2. Stores in the outgoing table for tracking
-/// 3. Encodes for wire transmission
-///
-/// The caller is responsible for the actual transport (sending to recipients).
-///
-/// # Arguments
-/// * `topic_id` - The topic to send on
-/// * `payload` - The message payload (plaintext)
-/// * `recipients` - EndpointIDs of recipients (for tracking)
-/// * `packet_type` - Type of packet (Content, SyncUpdate, etc.)
-/// * `private_key` - Sender's private key for signing
-/// * `public_key` - Sender's public key (EndpointID)
-/// * `db` - Database connection for storing outgoing packet
-///
-/// # Returns
-/// Tuple of (packet_id, encoded_message) on success
-pub fn prepare_packet(
-    topic_id: &[u8; 32],
-    payload: &[u8],
-    recipients: &[[u8; 32]],
-    packet_type: crate::network::harbor::protocol::HarborPacketType,
-    private_key: &[u8; 32],
-    public_key: &[u8; 32],
-    db: &mut rusqlite::Connection,
-) -> Result<([u8; 32], Vec<u8>), SendError> {
-    use crate::network::send::protocol::SendMessage;
-
-    // Create the packet
-    let packet = create_packet(topic_id, private_key, public_key, payload)?;
-
-    let packet_id = packet.packet_id;
-    let harbor_id = harbor_id_from_topic(topic_id);
-    let packet_bytes = packet.to_bytes().map_err(SendError::PacketCreation)?;
-
-    // Store in outgoing table for tracking
-    store_outgoing_packet(
-        db,
-        &packet_id,
-        topic_id,
-        &harbor_id,
-        &packet_bytes,
-        recipients,
-        packet_type as u8,
-    )
-    .map_err(|e| SendError::Database(e.to_string()))?;
-
-    // Encode for wire
-    let message = SendMessage::Packet(packet);
-    let encoded = message.encode();
-
-    Ok((packet_id, encoded))
-}
-
-/// Result of parallel send operation
-#[derive(Debug, Clone)]
-pub struct ParallelSendResult {
-    /// Number of successful deliveries
-    pub delivered: usize,
-    /// Number of failed deliveries
-    pub failed: usize,
-}
-
-impl ParallelSendResult {
-    /// Returns true if all sends failed
-    pub fn all_failed(&self) -> bool {
-        self.delivered == 0 && self.failed > 0
     }
 }
 

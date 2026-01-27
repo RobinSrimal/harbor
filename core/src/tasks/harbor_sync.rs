@@ -11,7 +11,7 @@ use rusqlite::Connection;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::network::dht::ApiClient as DhtApiClient;
+use crate::network::dht::DhtService;
 use crate::network::harbor::protocol::{HARBOR_ALPN, HarborMessage};
 use crate::network::harbor::service::HarborService;
 
@@ -26,7 +26,7 @@ impl Protocol {
         db: Arc<Mutex<Connection>>,
         endpoint: Endpoint,
         our_id: [u8; 32],
-        dht_client: Option<DhtApiClient>,
+        dht_service: Option<Arc<DhtService>>,
         running: Arc<RwLock<bool>>,
         sync_interval: Duration,
         sync_candidates: usize,
@@ -82,7 +82,7 @@ impl Protocol {
                 let harbor_id_hex = hex::encode(harbor_id);
                 
                 // Find closest Harbor Nodes for this HarborID
-                let harbor_nodes = Self::find_harbor_nodes(&dht_client, &harbor_id).await;
+                let harbor_nodes = Self::find_harbor_nodes(&dht_service, &harbor_id).await;
 
                 if harbor_nodes.is_empty() {
                     debug!(

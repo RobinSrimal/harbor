@@ -9,12 +9,8 @@
 
 mod dht;
 mod harbor;
-mod send;
 mod share;
 mod sync;
-
-// Re-export DHT handler for use by the DHT actor
-pub use dht::send_find_node;
 
 // Re-export share handler functions for use in spawned tasks
 pub use share::push_section_to_peer_standalone;

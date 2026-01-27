@@ -7,11 +7,10 @@ use std::collections::{BTreeSet, HashSet};
 use tokio::task::JoinSet;
 use tracing::{debug, trace};
 
-use super::api::WeakApiClient;
 use super::config::DhtConfig;
 use super::distance::{Distance, Id};
 use super::pool::{DhtPool, DialInfo};
-use crate::handlers::outgoing::send_find_node;
+use crate::network::dht::service::{DhtService, WeakDhtService};
 
 /// Perform iterative node lookup (Kademlia algorithm)
 ///
@@ -23,7 +22,7 @@ pub async fn iterative_find_node(
     local_id: Id,
     pool: DhtPool,
     config: DhtConfig,
-    api: WeakApiClient,
+    service: WeakDhtService,
 ) -> Vec<Id> {
     // Track candidates sorted by distance
     let mut candidates: BTreeSet<(Distance, Id)> = initial
@@ -82,7 +81,7 @@ pub async fn iterative_find_node(
                 match pool.get_connection(&dial_info).await {
                     Ok(conn) => {
                         // Send actual FindNode RPC over the connection
-                        match send_find_node(conn.connection(), target_for_rpc, requester_for_rpc, relay_url_for_rpc).await {
+                        match DhtService::send_find_node_on_conn(conn.connection(), target_for_rpc, requester_for_rpc, relay_url_for_rpc).await {
                             Ok(response) => {
                                 // Return full NodeInfo so caller can extract relay URLs
                                 trace!(
@@ -118,9 +117,9 @@ pub async fn iterative_find_node(
                     let dist = target.distance(&id);
                     results.insert((dist, id));
 
-                    // Notify API that responding node is alive (verified by successful query)
-                    if let Some(api) = api.upgrade() {
-                        api.nodes_seen(&[*id.as_bytes()]).await.ok();
+                    // Notify service that responding node is alive (verified by successful query)
+                    if let Some(svc) = service.upgrade() {
+                        svc.nodes_seen(&[*id.as_bytes()]).await.ok();
                     }
 
                     // Add new candidates for lookup AND notify DHT about discovered nodes
@@ -149,8 +148,8 @@ pub async fn iterative_find_node(
                     // Store discovered relay URLs in our node_relay_urls map
                     // This allows us to share them with other nodes in FindNode responses
                     if !discovered_relay_urls.is_empty() {
-                        if let Some(api) = api.upgrade() {
-                            api.set_node_relay_urls(discovered_relay_urls).await.ok();
+                        if let Some(svc) = service.upgrade() {
+                            svc.set_node_relay_urls(discovered_relay_urls).await.ok();
                         }
                     }
 
@@ -163,8 +162,8 @@ pub async fn iterative_find_node(
                             discovered_count = discovered.len(),
                             "discovered nodes from FindNode response"
                         );
-                        if let Some(api) = api.upgrade() {
-                            api.add_candidates(&discovered).await.ok();
+                        if let Some(svc) = service.upgrade() {
+                            svc.add_candidates(&discovered).await.ok();
                         }
                     } else {
                         debug!(peer = %id, "FindNode response contained no new nodes");
@@ -172,8 +171,8 @@ pub async fn iterative_find_node(
                 }
                 Err(_) => {
                     // Node is dead
-                    if let Some(api) = api.upgrade() {
-                        api.nodes_dead(&[*id.as_bytes()]).await.ok();
+                    if let Some(svc) = service.upgrade() {
+                        svc.nodes_dead(&[*id.as_bytes()]).await.ok();
                     }
                 }
             }

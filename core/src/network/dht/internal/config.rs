@@ -5,8 +5,7 @@ use std::time::Duration;
 use super::routing::{K, ALPHA, Buckets};
 use super::distance::Id;
 use super::pool::DhtPool;
-use super::api::ApiClient;
-use crate::network::dht::protocol::RpcClient;
+use super::api::ApiProtocol;
 use crate::network::dht::actor::DhtActor;
 
 /// Default interval for verifying candidate nodes (30 seconds)
@@ -63,29 +62,29 @@ impl DhtConfig {
     }
 }
 
-/// Create a DHT node and return clients for interaction
-pub fn create_dht_node(
+/// Create a DHT actor (not yet running) and return it with clients
+///
+/// The caller must call `actor.set_service(weak_service)` and then
+/// `tokio::spawn(actor.run())` after creating the DhtService.
+pub fn create_dht_actor(
     local_id: Id,
     pool: DhtPool,
     config: DhtConfig,
     bootstrap: Vec<Id>,
-) -> (RpcClient, ApiClient) {
-    create_dht_node_with_buckets(local_id, pool, config, bootstrap, None)
+) -> (DhtActor, irpc::Client<ApiProtocol>) {
+    create_dht_actor_with_buckets(local_id, pool, config, bootstrap, None)
 }
 
-/// Create a DHT node with pre-existing buckets
-pub fn create_dht_node_with_buckets(
+/// Create a DHT actor with pre-existing buckets (not yet running)
+///
+/// The caller must call `actor.set_service(weak_service)` and then
+/// `tokio::spawn(actor.run())` after creating the DhtService.
+pub fn create_dht_actor_with_buckets(
     local_id: Id,
     pool: DhtPool,
     config: DhtConfig,
     bootstrap: Vec<Id>,
     buckets: Option<Buckets>,
-) -> (RpcClient, ApiClient) {
-    let (actor, rpc_client, api_client) = DhtActor::new_with_buckets(
-        local_id, pool, config, bootstrap, buckets
-    );
-
-    tokio::spawn(actor.run());
-
-    (rpc_client, api_client)
+) -> (DhtActor, irpc::Client<ApiProtocol>) {
+    DhtActor::new_with_buckets(local_id, pool, config, bootstrap, buckets)
 }

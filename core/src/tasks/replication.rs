@@ -12,7 +12,7 @@ use tracing::{debug, error, info, trace};
 use crate::data::send::{
     get_packets_needing_replication, delete_outgoing_packet,
 };
-use crate::network::dht::ApiClient as DhtApiClient;
+use crate::network::dht::DhtService;
 use crate::network::harbor::protocol::HarborPacketType;
 use crate::resilience::{PoWChallenge, PoWConfig, compute_pow};
 
@@ -26,7 +26,7 @@ impl Protocol {
         db: Arc<Mutex<Connection>>,
         endpoint: Endpoint,
         our_id: [u8; 32],
-        dht_client: Option<DhtApiClient>,
+        dht_service: Option<Arc<DhtService>>,
         running: Arc<RwLock<bool>>,
         check_interval: Duration,
         replication_factor: usize,
@@ -63,7 +63,7 @@ impl Protocol {
             // For each packet, find Harbor Nodes via DHT and replicate
             for packet in &packets {
                 // Find Harbor Nodes for this topic's HarborID
-                let harbor_nodes = Self::find_harbor_nodes(&dht_client, &packet.harbor_id).await;
+                let harbor_nodes = Self::find_harbor_nodes(&dht_service, &packet.harbor_id).await;
 
                 if harbor_nodes.is_empty() {
                     debug!(

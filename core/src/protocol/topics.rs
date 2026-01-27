@@ -113,13 +113,15 @@ impl Protocol {
         // Send to all existing members using their connection info (best effort)
         // The WILDCARD recipient is filtered out for direct sending but kept for Harbor storage
         let send_result = self
-            .send_raw(
+            .send_service
+            .send_to_topic(
                 &invite.topic_id,
                 &payload,
                 &members_with_wildcard,
                 HarborPacketType::Join,
             )
-            .await;
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()));
         if let Err(e) = send_result {
             debug!(error = %e, "failed to send join announcement to some members");
             // Continue anyway - Harbor replication will handle missed members
@@ -161,8 +163,10 @@ impl Protocol {
         });
 
         let send_result = self
-            .send_raw(topic_id, &payload, &remaining_members, HarborPacketType::Leave)
-            .await;
+            .send_service
+            .send_to_topic(topic_id, &payload, &remaining_members, HarborPacketType::Leave)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()));
         if let Err(e) = send_result {
             debug!(error = %e, "failed to send leave announcement to some members");
             // Continue anyway

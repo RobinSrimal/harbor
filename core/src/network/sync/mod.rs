@@ -16,6 +16,5 @@ pub use protocol::{
     DecodeError, SYNC_MESSAGE_PREFIX, SYNC_ALPN,
 };
 pub use service::{
-    ProcessSyncError, SyncConfig, encode_sync_response, process_incoming_sync_message,
+    ProcessSyncError, SyncConfig, SyncService, encode_sync_response, process_incoming_sync_message,
 };
-

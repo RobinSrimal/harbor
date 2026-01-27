@@ -35,15 +35,15 @@
 pub mod actor;
 pub mod internal;
 pub mod protocol;
+pub mod service;
 
 // Re-export commonly used items from internal modules
-pub use internal::api::ApiClient;
 pub use internal::bootstrap::{BootstrapConfig, BootstrapNode, default_bootstrap_nodes, bootstrap_node_ids, bootstrap_dial_info};
-pub use internal::config::{DhtConfig, create_dht_node, create_dht_node_with_buckets};
+pub use internal::config::{DhtConfig, create_dht_actor, create_dht_actor_with_buckets};
 pub use internal::distance::{Distance, Id};
 pub use internal::pool::{DhtPool, DhtPoolConfig, DhtPoolError, DialInfo, DHT_ALPN};
 pub use internal::routing::{Buckets, RoutingTable, K, ALPHA, BUCKET_COUNT};
-pub use protocol::RpcClient;
+pub use service::{DhtService, WeakDhtService};
 
 #[cfg(test)]
 mod tests {

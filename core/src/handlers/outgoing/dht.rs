@@ -1,87 +1,13 @@
-//! DHT outgoing operations
+//! DHT outgoing operations - serialization tests
 //!
-//! This module provides DHT network operations:
-//! - send_find_node: Send FindNode RPC to a peer
-//!
-//! The actor manages state (routing table) and lookup algorithm,
-//! while this module handles the actual network I/O.
-
-use iroh::endpoint::Connection;
-
-use crate::network::dht::Id;
-use crate::network::dht::protocol::{FindNode, FindNodeResponse};
-use crate::network::pool::PoolError;
-
-/// Send a FindNode request to a connected peer
-///
-/// This is the low-level network call used by the DHT actor during lookups.
-/// The actor manages connection pooling and routing table state; this function
-/// just handles the wire protocol.
-///
-/// # Arguments
-/// * `conn` - An established QUIC connection to the peer
-/// * `target` - The ID we're looking for closest nodes to
-/// * `requester` - Our node ID (so peer can add us to their routing table)
-/// * `requester_relay_url` - Our relay URL for connectivity
-///
-/// # Returns
-/// The peer's response containing their closest known nodes to the target
-pub async fn send_find_node(
-    conn: &Connection,
-    target: Id,
-    requester: Option<[u8; 32]>,
-    requester_relay_url: Option<String>,
-) -> Result<FindNodeResponse, PoolError> {
-    // Open bidirectional stream
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to open stream: {}", e)))?;
-
-    // Create and serialize request
-    let request = FindNode { target, requester, requester_relay_url };
-    let request_bytes = postcard::to_allocvec(&request)
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to serialize request: {}", e)))?;
-
-    // Send length-prefixed request
-    let len = request_bytes.len() as u32;
-    send.write_all(&len.to_be_bytes())
-        .await
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to send length: {}", e)))?;
-    send.write_all(&request_bytes)
-        .await
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to send request: {}", e)))?;
-    send.finish()
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to finish send: {}", e)))?;
-
-    // Read length-prefixed response
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to read response length: {}", e)))?;
-    let response_len = u32::from_be_bytes(len_buf) as usize;
-
-    // Sanity check response size (max 64KB should be plenty for node list)
-    if response_len > 65536 {
-        return Err(PoolError::ConnectionFailed("response too large".to_string()));
-    }
-
-    let mut response_bytes = vec![0u8; response_len];
-    recv.read_exact(&mut response_bytes)
-        .await
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to read response: {}", e)))?;
-
-    // Deserialize response
-    let response: FindNodeResponse = postcard::from_bytes(&response_bytes)
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to deserialize response: {}", e)))?;
-
-    Ok(response)
-}
+//! The actual send_find_node logic has moved to DhtService.
+//! These tests verify the wire protocol serialization format.
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::network::dht::protocol::NodeInfo;
+    use crate::network::dht::Id;
+    use crate::network::dht::protocol::{FindNode, FindNodeResponse, NodeInfo};
+    use crate::network::pool::PoolError;
 
     fn make_id(seed: u8) -> Id {
         Id::new([seed; 32])
@@ -151,31 +77,6 @@ mod tests {
         let decoded: FindNodeResponse = postcard::from_bytes(&bytes).unwrap();
 
         assert!(decoded.nodes.is_empty());
-    }
-
-    #[test]
-    fn test_length_prefix_format() {
-        // Test the length-prefixed message format used in send_find_node
-        let request = FindNode {
-            target: make_id(42),
-            requester: None,
-            requester_relay_url: None,
-        };
-
-        let request_bytes = postcard::to_allocvec(&request).unwrap();
-        let len = request_bytes.len() as u32;
-
-        // Build wire format
-        let mut wire = Vec::new();
-        wire.extend_from_slice(&len.to_be_bytes());
-        wire.extend_from_slice(&request_bytes);
-
-        // Parse back
-        let parsed_len = u32::from_be_bytes([wire[0], wire[1], wire[2], wire[3]]) as usize;
-        assert_eq!(parsed_len, request_bytes.len());
-
-        let parsed: FindNode = postcard::from_bytes(&wire[4..]).unwrap();
-        assert_eq!(*parsed.target.as_bytes(), [42u8; 32]);
     }
 
     #[test]

@@ -22,11 +22,11 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, trace};
 
 use crate::data::BlobStore;
-use crate::network::dht::{ApiClient as DhtApiClient, DHT_ALPN};
+use crate::network::dht::{DhtService, DHT_ALPN};
 use crate::network::harbor::protocol::HARBOR_ALPN;
-use crate::network::send::protocol::SEND_ALPN;
+use crate::network::send::{SendService, protocol::SEND_ALPN};
 use crate::network::share::protocol::SHARE_ALPN;
-use crate::network::sync::protocol::SYNC_ALPN;
+use crate::network::sync::{SyncService, SYNC_ALPN};
 
 use crate::protocol::{ProtocolEvent, Protocol};
 
@@ -37,11 +37,13 @@ impl Protocol {
     pub(crate) async fn run_incoming_handler(
         endpoint: Endpoint,
         db: Arc<Mutex<Connection>>,
-        event_tx: mpsc::Sender<ProtocolEvent>,
+        _event_tx: mpsc::Sender<ProtocolEvent>,
         our_id: [u8; 32],
         running: Arc<RwLock<bool>>,
-        dht_client: Option<DhtApiClient>,
+        dht_service: Option<Arc<DhtService>>,
+        send_service: Option<Arc<SendService>>,
         blob_store: Option<Arc<BlobStore>>,
+        sync_service: Option<Arc<SyncService>>,
     ) {
         loop {
             // Check if we should stop
@@ -81,27 +83,35 @@ impl Protocol {
             if alpn == SEND_ALPN {
                 // Handle Send protocol
                 let db = db.clone();
-                let event_tx = event_tx.clone();
+                let send_service = send_service.clone();
 
                 tokio::spawn(async move {
                     trace!(sender = %hex::encode(sender_id), "starting Send connection handler");
-                    if let Err(e) =
-                        Self::handle_send_connection(conn, db, event_tx, sender_id, our_id).await
-                    {
-                        debug!(error = %e, sender = %hex::encode(sender_id), "Send connection handler error");
+                    if let Some(ref service) = send_service {
+                        if let Err(e) =
+                            service.handle_send_connection(conn, db, sender_id, our_id).await
+                        {
+                            debug!(error = %e, sender = %hex::encode(sender_id), "Send connection handler error");
+                        }
+                    } else {
+                        debug!("Send connection received but Send service not initialized");
                     }
                 });
             } else if alpn == DHT_ALPN {
                 // Handle DHT protocol
                 let db = db.clone();
-                let dht_client = dht_client.clone();
+                let dht_service = dht_service.clone();
 
                 tokio::spawn(async move {
                     trace!(sender = %hex::encode(sender_id), "starting DHT connection handler");
-                    if let Err(e) =
-                        Self::handle_dht_connection(conn, db, sender_id, our_id, dht_client).await
-                    {
-                        debug!(error = %e, sender = %hex::encode(sender_id), "DHT connection handler error");
+                    if let Some(ref service) = dht_service {
+                        if let Err(e) =
+                            service.handle_dht_connection(conn, db, sender_id, our_id).await
+                        {
+                            debug!(error = %e, sender = %hex::encode(sender_id), "DHT connection handler error");
+                        }
+                    } else {
+                        debug!("DHT connection received but DHT service not initialized");
                     }
                 });
             } else if alpn == HARBOR_ALPN {
@@ -135,16 +145,18 @@ impl Protocol {
                 });
             } else if alpn == SYNC_ALPN {
                 // Handle Sync protocol (sync requests and responses)
-                info!(sender = %hex::encode(&sender_id[..8]), "INCOMING: received SYNC_ALPN connection");
-                let endpoint_clone = endpoint.clone();
-                let event_tx = event_tx.clone();
+                let sync_service = sync_service.clone();
 
                 tokio::spawn(async move {
-                    info!(sender = %hex::encode(&sender_id[..8]), "INCOMING: starting Sync connection handler");
-                    if let Err(e) =
-                        Self::handle_sync_connection(conn, endpoint_clone, event_tx, sender_id).await
-                    {
-                        debug!(error = %e, sender = %hex::encode(sender_id), "Sync connection handler error");
+                    trace!(sender = %hex::encode(sender_id), "starting Sync connection handler");
+                    if let Some(ref service) = sync_service {
+                        if let Err(e) =
+                            service.handle_sync_connection(conn, sender_id).await
+                        {
+                            debug!(error = %e, sender = %hex::encode(sender_id), "Sync connection handler error");
+                        }
+                    } else {
+                        debug!("Sync connection received but Sync service not initialized");
                     }
                 });
             } else {

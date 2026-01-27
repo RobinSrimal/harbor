@@ -5,8 +5,6 @@
 //! - NodesSeen: Update routing table when nodes are verified
 //! - NodesDead: Remove unresponsive nodes from routing table
 
-use std::sync::Arc;
-
 use irpc::channel::{oneshot, none::NoSender};
 use irpc::rpc_requests;
 use serde::{Deserialize, Serialize};
@@ -97,114 +95,6 @@ pub enum ApiProtocol {
     },
 }
 
-/// DHT API client
-#[derive(Debug, Clone)]
-pub struct ApiClient {
-    inner: Arc<irpc::Client<ApiProtocol>>,
-}
-
-impl ApiClient {
-    /// Create a new API client
-    pub fn new(client: irpc::Client<ApiProtocol>) -> Self {
-        Self {
-            inner: Arc::new(client),
-        }
-    }
-
-    /// Notify that we have verified these nodes are alive
-    pub async fn nodes_seen(&self, ids: &[[u8; 32]]) -> Result<(), irpc::Error> {
-        self.inner.notify(NodesSeen { ids: ids.to_vec() }).await
-    }
-
-    /// Notify that these nodes are unresponsive
-    pub async fn nodes_dead(&self, ids: &[[u8; 32]]) -> Result<(), irpc::Error> {
-        self.inner.notify(NodesDead { ids: ids.to_vec() }).await
-    }
-
-    /// Add nodes to candidates list for verification
-    /// 
-    /// Use this for discovered nodes (e.g., from DHT query responses) that
-    /// haven't been directly verified yet. They will be verified before
-    /// being added to the routing table.
-    pub async fn add_candidates(&self, ids: &[[u8; 32]]) -> Result<(), irpc::Error> {
-        self.inner.notify(AddCandidates { ids: ids.to_vec() }).await
-    }
-
-    /// Find the K closest nodes to a target
-    pub async fn lookup(
-        &self,
-        target: Id,
-        initial: Option<Vec<[u8; 32]>>,
-    ) -> Result<Vec<[u8; 32]>, irpc::Error> {
-        self.inner.rpc(Lookup { target, initial }).await
-    }
-
-    /// Get the current routing table
-    pub async fn get_routing_table(&self) -> Result<Vec<Vec<[u8; 32]>>, irpc::Error> {
-        self.inner.rpc(GetRoutingTable).await
-    }
-
-    /// Get relay URLs for all known nodes (for persistence)
-    pub async fn get_node_relay_urls(&self) -> Result<Vec<([u8; 32], String)>, irpc::Error> {
-        self.inner.rpc(GetNodeRelayUrls).await
-    }
-
-    /// Set relay URLs for nodes (for restoration from database)
-    pub async fn set_node_relay_urls(&self, relay_urls: Vec<([u8; 32], String)>) -> Result<(), irpc::Error> {
-        self.inner.notify(SetNodeRelayUrls { relay_urls }).await
-    }
-
-    /// Perform a self-lookup to populate nearby buckets
-    pub async fn self_lookup(&self) -> Result<(), irpc::Error> {
-        self.inner.rpc(SelfLookup).await
-    }
-
-    /// Perform a random lookup to refresh distant buckets
-    pub async fn random_lookup(&self) -> Result<(), irpc::Error> {
-        self.inner.rpc(RandomLookup).await
-    }
-
-    /// Find K closest nodes to a target from the local routing table (no network lookup)
-    /// 
-    /// This is a synchronous query of the in-memory routing table, unlike `lookup()`
-    /// which performs an iterative network lookup.
-    pub async fn find_closest(&self, target: Id, k: Option<usize>) -> Result<Vec<[u8; 32]>, irpc::Error> {
-        self.inner.rpc(FindClosest { target, k }).await
-    }
-
-    /// Handle an incoming FindNode request
-    /// 
-    /// This returns NodeInfo with relay URLs (unlike find_closest which only returns IDs).
-    /// Also handles adding the requester to the routing table if they provided their ID.
-    pub async fn handle_find_node_request(
-        &self,
-        target: Id,
-        requester: Option<[u8; 32]>,
-        requester_relay_url: Option<String>,
-    ) -> Result<Vec<NodeInfo>, irpc::Error> {
-        self.inner.rpc(HandleFindNodeRequest { target, requester, requester_relay_url }).await
-    }
-
-    /// Create a weak reference
-    pub fn downgrade(&self) -> WeakApiClient {
-        WeakApiClient {
-            inner: Arc::downgrade(&self.inner),
-        }
-    }
-}
-
-/// Weak reference to API client
-#[derive(Debug, Clone)]
-pub struct WeakApiClient {
-    inner: std::sync::Weak<irpc::Client<ApiProtocol>>,
-}
-
-impl WeakApiClient {
-    /// Try to upgrade to a strong reference
-    pub fn upgrade(&self) -> Option<ApiClient> {
-        self.inner.upgrade().map(|inner| ApiClient { inner })
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -314,8 +204,5 @@ mod tests {
         assert_eq!(decoded.ids[0], [1u8; 32]);
     }
 
-    // Note: WeakApiClient upgrade/downgrade requires a running irpc server,
-    // which is tested in integration tests. The pattern itself (Arc/Weak)
-    // is a standard Rust idiom that doesn't need unit testing.
 }
 

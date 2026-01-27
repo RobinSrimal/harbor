@@ -7,12 +7,13 @@
 //!
 //! Note: Finding Harbor Nodes uses `dht_lookup()` from outgoing/dht.rs
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointId};
 use tracing::debug;
 
-use crate::network::dht::ApiClient as DhtApiClient;
+use crate::network::dht::DhtService;
 use crate::network::harbor::protocol::{
     HARBOR_ALPN, HarborMessage, StoreRequest, PullRequest, DeliveryAck, PacketInfo,
 };
@@ -28,13 +29,13 @@ const PULL_RESPONSE_MAX_SIZE: usize = 10 * 1024 * 1024; // 10MB
 impl Protocol {
     /// Find Harbor Nodes for a given HarborID using DHT lookup
     ///
-    /// This is a convenience wrapper that handles the Option<DhtApiClient>.
+    /// This is a convenience wrapper that handles the Option<Arc<DhtService>>.
     /// For direct DHT access, use `dht_lookup()`.
     pub(crate) async fn find_harbor_nodes(
-        dht_client: &Option<DhtApiClient>,
+        dht_service: &Option<Arc<DhtService>>,
         harbor_id: &[u8; 32],
     ) -> Vec<[u8; 32]> {
-        let Some(client) = dht_client else {
+        let Some(client) = dht_service else {
             debug!("DHT client not available, cannot find Harbor Nodes");
             return vec![];
         };
