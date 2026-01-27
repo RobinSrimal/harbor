@@ -126,16 +126,6 @@ api_get_invite() {
     echo "$result"
 }
 
-api_refresh_members() {
-    local n=$1
-    local port=$(api_port $n)
-    local result
-    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/refresh_members")
-    local exit_code=$?
-    log_api_error $exit_code $n "POST /api/refresh_members"
-    echo "$result"
-}
-
 wait_for_api() {
     local n=$1
     local port=$(api_port $n)

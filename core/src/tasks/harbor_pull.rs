@@ -17,6 +17,7 @@ use crate::data::{
     CHUNK_SIZE,
 };
 use crate::network::dht::DhtService;
+use crate::network::harbor::HarborService;
 use crate::network::harbor::protocol::HarborPacketType;
 use crate::network::send::topic_messages::TopicMessage;
 use crate::security::{
@@ -65,7 +66,7 @@ impl Protocol {
                 let harbor_id = harbor_id_from_topic(&topic_id);
 
                 // Find Harbor Nodes for this topic
-                let harbor_nodes = Self::find_harbor_nodes(&dht_service, &harbor_id).await;
+                let harbor_nodes = HarborService::find_harbor_nodes(&dht_service, &harbor_id).await;
 
                 if harbor_nodes.is_empty() {
                     continue;
@@ -93,7 +94,7 @@ impl Protocol {
                 // Stop after consecutive empty responses (configurable)
                 let mut consecutive_empty = 0;
                 for harbor_node in harbor_nodes.iter().take(pull_max_nodes) {
-                    match Self::send_harbor_pull(&endpoint, harbor_node, &pull_req, connect_timeout, response_timeout).await {
+                    match HarborService::send_harbor_pull(&endpoint, harbor_node, &pull_req, connect_timeout, response_timeout).await {
                         Ok(packets) => {
                             if packets.is_empty() {
                                 consecutive_empty += 1;
@@ -275,7 +276,7 @@ impl Protocol {
                                             packet_id: packet_info.packet_id,
                                             recipient_id: our_id,
                                         };
-                                        let _ = Self::send_harbor_ack(&endpoint, harbor_node, &ack, connect_timeout).await;
+                                        let _ = HarborService::send_harbor_ack(&endpoint, harbor_node, &ack, connect_timeout).await;
                                     }
                                     Err(e) => {
                                         debug!(error = %e, "failed to verify pulled packet");

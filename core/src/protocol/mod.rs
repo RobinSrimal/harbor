@@ -37,11 +37,8 @@ pub(crate) mod core;
 mod config;
 mod error;
 mod events;
-mod types;
-mod topics;
-mod send;
+mod api;
 mod stats;
-mod share;
 
 // Core protocol
 pub use core::Protocol;
@@ -56,8 +53,8 @@ pub use events::{
     SyncUpdateEvent, SyncRequestEvent, SyncResponseEvent,
 };
 
-// Domain types
-pub use types::{MemberInfo, TopicInvite};
+// Domain types (from TopicService)
+pub use crate::network::topic::{MemberInfo, TopicInvite};
 
 // Stats types
 pub use stats::{
@@ -66,4 +63,4 @@ pub use stats::{
 };
 
 // Share types
-pub use share::ShareStatus;
+pub use api::ShareStatus;

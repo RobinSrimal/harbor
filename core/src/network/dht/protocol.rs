@@ -170,5 +170,48 @@ mod tests {
         let response = FindNodeResponse::default();
         assert!(response.nodes.is_empty());
     }
+
+    // Tests moved from handlers/outgoing/dht.rs
+
+    #[test]
+    fn test_find_node_request_no_requester() {
+        let request = FindNode {
+            target: make_id(42),
+            requester: None,
+            requester_relay_url: None,
+        };
+
+        let bytes = postcard::to_allocvec(&request).unwrap();
+        let decoded: FindNode = postcard::from_bytes(&bytes).unwrap();
+
+        assert!(decoded.requester.is_none());
+        assert!(decoded.requester_relay_url.is_none());
+    }
+
+    #[test]
+    fn test_max_response_size_check() {
+        const MAX_SIZE: usize = 65536;
+
+        let nodes: Vec<NodeInfo> = (0..20u8)
+            .map(|i| NodeInfo {
+                node_id: [i; 32],
+                addresses: vec!["192.168.1.1:4433".to_string()],
+                relay_url: Some("https://relay.example.com/".to_string()),
+            })
+            .collect();
+
+        let response = FindNodeResponse { nodes };
+        let bytes = postcard::to_allocvec(&response).unwrap();
+
+        assert!(bytes.len() < MAX_SIZE, "Response {} bytes exceeds limit", bytes.len());
+    }
+
+    #[test]
+    fn test_pool_error_formatting() {
+        use crate::network::pool::PoolError;
+        let err = PoolError::ConnectionFailed("test error".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("test error"));
+    }
 }
 

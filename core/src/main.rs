@@ -47,7 +47,6 @@ fn print_usage() {
     println!("  POST /api/topic             Create topic, returns invite");
     println!("  POST /api/join              Join topic (invite in body)");
     println!("  POST /api/send              Send message (JSON: topic, message)");
-    println!("  POST /api/refresh_members   Trigger member discovery refresh");
     println!("  GET  /api/stats             Get node statistics");
     println!("  GET  /api/topics            List all topics");
     println!("  GET  /api/invite/:topic     Get fresh invite for topic (all current members)");
@@ -544,7 +543,6 @@ async fn handle_request(protocol: &Protocol, bootstrap: &BootstrapInfo, request:
         ("POST", "/api/topic") => handle_create_topic(protocol).await,
         ("POST", "/api/join") => handle_join_topic(protocol, body).await,
         ("POST", "/api/send") => handle_send(protocol, body).await,
-        ("POST", "/api/refresh_members") => handle_refresh_members(protocol).await,
         ("POST", "/api/share") => handle_share_file(protocol, body).await,
         ("POST", "/api/share/pull") => handle_share_pull(protocol, body).await,
         ("POST", "/api/share/export") => handle_share_export(protocol, body).await,
@@ -656,21 +654,6 @@ async fn handle_send(protocol: &Protocol, body: &str) -> String {
     };
     info!("API: handle_send returning response");
     result
-}
-
-async fn handle_refresh_members(protocol: &Protocol) -> String {
-    info!("API: handle_refresh_members started");
-    
-    match protocol.refresh_members().await {
-        Ok(count) => {
-            info!("API: refresh_members completed, {} topics refreshed", count);
-            http_response(200, &format!("Refreshed {} topics", count))
-        }
-        Err(e) => {
-            warn!("API: refresh_members failed: {}", e);
-            http_response(500, &format!("Failed to refresh: {}", e))
-        }
-    }
 }
 
 async fn handle_stats(protocol: &Protocol) -> String {

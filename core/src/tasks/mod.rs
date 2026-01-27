@@ -41,21 +41,13 @@ impl Protocol {
         let dht_service = self.dht_service.clone();
         let send_service = Some(self.send_service.clone());
 
-        // Initialize blob store for Share protocol
-        let blob_path = self.blob_path();
-        let blob_store = match crate::data::BlobStore::new(&blob_path) {
-            Ok(store) => Some(std::sync::Arc::new(store)),
-            Err(e) => {
-                warn!(error = %e, path = %blob_path.display(), "failed to initialize blob store");
-                None
-            }
-        };
-
         let sync_service = Some(self.sync_service.clone());
+        let harbor_service = Some(self.harbor_service.clone());
+        let share_service = Some(self.share_service.clone());
 
         let incoming_task = tokio::spawn(async move {
             Self::run_incoming_handler(
-                endpoint, db, event_tx, our_id, running, dht_service, send_service, blob_store, sync_service,
+                endpoint, db, event_tx, our_id, running, dht_service, send_service, harbor_service, share_service, sync_service,
             ).await;
         });
         tasks.push(incoming_task);

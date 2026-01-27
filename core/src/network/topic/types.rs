@@ -1,10 +1,8 @@
-//! Public types for the Protocol API
-//!
-//! User-facing types for topic management and invites.
+//! Public types for topic management and invites.
 
 use serde::{Deserialize, Serialize};
 
-use super::error::ProtocolError;
+use crate::protocol::ProtocolError;
 
 /// Member info for topic invites
 ///
@@ -250,7 +248,7 @@ mod tests {
             MemberInfo::with_relay(test_id(11), "https://relay.example.com".to_string()),
         ];
         let invite = TopicInvite::new_with_info(test_id(1), member_info);
-        
+
         let info = invite.get_member_info();
         assert_eq!(info.len(), 2);
         assert!(info[0].relay_url.is_none());

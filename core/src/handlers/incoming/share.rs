@@ -2,7 +2,7 @@
 //!
 //! Handles incoming Share protocol connections:
 //! - ChunkMapRequest: Respond with who has what
-//! - ChunkRequest: Send requested chunks
+//! - ChunkRequest: Send requested chunk
 //! - Bitfield: Exchange chunk availability
 //! - PeerSuggestion handling
 //!
@@ -11,29 +11,23 @@
 //! - Delegating business logic to the service layer
 //! - Sending responses
 
-use std::sync::Arc;
-
-use rusqlite::Connection;
-use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
-use crate::data::{BlobStore, CHUNK_SIZE};
+use crate::data::CHUNK_SIZE;
 use crate::network::share::protocol::ShareMessage;
-use crate::network::share::service::process_incoming_share_message;
-use crate::protocol::{Protocol, ProtocolError};
+use crate::network::share::service::{process_incoming_share_message, ShareService};
 
 /// Maximum message size for share protocol (chunk size + overhead)
 const MAX_READ_SIZE: usize = (CHUNK_SIZE as usize) + 1024;
 
-impl Protocol {
+impl ShareService {
     /// Handle a single incoming Share protocol connection
-    pub(crate) async fn handle_share_connection(
+    pub async fn handle_share_connection(
+        &self,
         conn: iroh::endpoint::Connection,
-        db: Arc<Mutex<Connection>>,
-        blob_store: Arc<BlobStore>,
         sender_id: [u8; 32],
-        our_id: [u8; 32],
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<(), crate::protocol::ProtocolError> {
+        let our_id = self.endpoint_id();
         trace!(sender = %hex::encode(sender_id), "share connection established");
 
         loop {
@@ -69,8 +63,8 @@ impl Protocol {
                 message,
                 sender_id,
                 our_id,
-                &db,
-                &blob_store,
+                &self.db(),
+                self.blob_store(),
             ).await;
 
             // Send all responses

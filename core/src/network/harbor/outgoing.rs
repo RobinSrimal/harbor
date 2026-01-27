@@ -6,8 +6,14 @@
 //! - Processing pull responses
 //! - Creating acknowledgments
 //! - Creating and applying sync requests/responses (Harbor-to-Harbor)
+//! - Network send operations (store, pull, ack, sync to remote Harbor Nodes)
+//! - Finding Harbor Nodes via DHT
 //! - Maintenance (cleanup)
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use iroh::{Endpoint, EndpointId};
 use rusqlite::Connection;
 use tracing::{debug, info, trace};
 
@@ -15,10 +21,12 @@ use crate::data::harbor::{
     cache_packet, cleanup_expired, get_active_harbor_ids, get_cached_packet, get_packets_for_sync,
     get_undelivered_recipients, mark_pulled, was_pulled, PacketType,
 };
+use crate::network::dht::DhtService;
+use crate::protocol::ProtocolError;
 
 use super::protocol::{
-    DeliveryAck, HarborPacketType, PacketInfo, PullRequest, PullResponse, StoreRequest,
-    SyncRequest, SyncResponse,
+    DeliveryAck, HarborPacketType, HarborMessage, PacketInfo, PullRequest, PullResponse,
+    StoreRequest, SyncRequest, SyncResponse, HARBOR_ALPN,
 };
 use super::service::{HarborError, HarborService};
 
@@ -297,6 +305,261 @@ impl HarborService {
             );
         }
         Ok(deleted)
+    }
+
+    // ============ Network Operations ============
+
+    /// Maximum buffer size for store responses (small, just status)
+    pub const STORE_RESPONSE_MAX_SIZE: usize = 1024;
+
+    /// Maximum buffer size for pull responses (can contain many packets)
+    pub const PULL_RESPONSE_MAX_SIZE: usize = 10 * 1024 * 1024; // 10MB
+
+    /// Maximum buffer size for sync responses
+    pub const SYNC_RESPONSE_MAX_SIZE: usize = 1024 * 1024; // 1MB
+
+    /// Find Harbor Nodes for a given HarborID using DHT lookup
+    pub async fn find_harbor_nodes(
+        dht_service: &Option<Arc<DhtService>>,
+        harbor_id: &[u8; 32],
+    ) -> Vec<[u8; 32]> {
+        let Some(client) = dht_service else {
+            debug!("DHT client not available, cannot find Harbor Nodes");
+            return vec![];
+        };
+
+        use crate::network::dht::Id as DhtId;
+        let target = DhtId::new(*harbor_id);
+        let initial: Option<Vec<[u8; 32]>> = None;
+        match client.lookup(target, initial).await {
+            Ok(nodes) => {
+                debug!(
+                    harbor_id = hex::encode(harbor_id),
+                    count = nodes.len(),
+                    "found Harbor Nodes via DHT"
+                );
+                nodes
+            }
+            Err(e) => {
+                debug!(error = %e, "DHT lookup failed");
+                vec![]
+            }
+        }
+    }
+
+    /// Send a StoreRequest to a Harbor Node
+    pub async fn send_harbor_store(
+        endpoint: &Endpoint,
+        harbor_node: &[u8; 32],
+        request: &StoreRequest,
+        connect_timeout: Duration,
+        response_timeout: Duration,
+    ) -> Result<bool, ProtocolError> {
+        let node_id = EndpointId::from_bytes(harbor_node)
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        let conn = tokio::time::timeout(
+            connect_timeout,
+            endpoint.connect(node_id, HARBOR_ALPN),
+        )
+        .await
+        .map_err(|_| ProtocolError::Network("connect timeout".to_string()))?
+        .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        let message = HarborMessage::Store(request.clone());
+        let encoded = message.encode();
+
+        // Send request
+        let mut send = conn.open_uni().await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+        tokio::io::AsyncWriteExt::write_all(&mut send, &encoded).await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+        send.finish()
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        // Wait for response with timeout
+        let mut recv = tokio::time::timeout(
+            response_timeout,
+            conn.accept_uni(),
+        )
+        .await
+        .map_err(|_| ProtocolError::Network("response timeout".to_string()))?
+        .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        let response_bytes = recv.read_to_end(Self::STORE_RESPONSE_MAX_SIZE).await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        let response = HarborMessage::decode(&response_bytes)
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        match response {
+            HarborMessage::StoreResponse(resp) => Ok(resp.success),
+            _ => Err(ProtocolError::Network("unexpected response".to_string())),
+        }
+    }
+
+    /// Send a PullRequest to a Harbor Node
+    pub async fn send_harbor_pull(
+        endpoint: &Endpoint,
+        harbor_node: &[u8; 32],
+        request: &PullRequest,
+        connect_timeout: Duration,
+        response_timeout: Duration,
+    ) -> Result<Vec<PacketInfo>, ProtocolError> {
+        let node_id = EndpointId::from_bytes(harbor_node)
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        let conn = tokio::time::timeout(
+            connect_timeout,
+            endpoint.connect(node_id, HARBOR_ALPN),
+        )
+        .await
+        .map_err(|_| ProtocolError::Network("connect timeout".to_string()))?
+        .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        let message = HarborMessage::Pull(request.clone());
+        let encoded = message.encode();
+
+        // Send request
+        let mut send = conn.open_uni().await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+        tokio::io::AsyncWriteExt::write_all(&mut send, &encoded).await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+        send.finish()
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        // Wait for response with timeout (larger buffer for packets)
+        let mut recv = tokio::time::timeout(
+            response_timeout,
+            conn.accept_uni(),
+        )
+        .await
+        .map_err(|_| ProtocolError::Network("response timeout".to_string()))?
+        .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        let response_bytes = recv.read_to_end(Self::PULL_RESPONSE_MAX_SIZE).await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        let response = HarborMessage::decode(&response_bytes)
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        match response {
+            HarborMessage::PullResponse(resp) => Ok(resp.packets),
+            _ => Err(ProtocolError::Network("unexpected response".to_string())),
+        }
+    }
+
+    /// Send a DeliveryAck to a Harbor Node (fire-and-forget)
+    pub async fn send_harbor_ack(
+        endpoint: &Endpoint,
+        harbor_node: &[u8; 32],
+        ack: &DeliveryAck,
+        connect_timeout: Duration,
+    ) -> Result<(), ProtocolError> {
+        let node_id = EndpointId::from_bytes(harbor_node)
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        let conn = tokio::time::timeout(
+            connect_timeout,
+            endpoint.connect(node_id, HARBOR_ALPN),
+        )
+        .await
+        .map_err(|_| ProtocolError::Network("connect timeout".to_string()))?
+        .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        let message = HarborMessage::Ack(ack.clone());
+        let encoded = message.encode();
+
+        // Send ack (no response expected)
+        let mut send = conn.open_uni().await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+        tokio::io::AsyncWriteExt::write_all(&mut send, &encoded).await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+        send.finish()
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Send a SyncRequest to another Harbor Node
+    pub async fn send_harbor_sync(
+        endpoint: &Endpoint,
+        harbor_node: &[u8; 32],
+        request: &SyncRequest,
+    ) -> Result<SyncResponse, ProtocolError> {
+        let node_hex = hex::encode(harbor_node);
+        debug!(partner = %node_hex, "Harbor sync: connecting to partner");
+
+        let node_id = EndpointId::from_bytes(harbor_node)
+            .map_err(|_| ProtocolError::Network("invalid node id".into()))?;
+
+        let conn = endpoint
+            .connect(node_id, HARBOR_ALPN)
+            .await
+            .map_err(|e| {
+                debug!(partner = %node_hex, error = %e, "Harbor sync: connection failed");
+                ProtocolError::Network(e.to_string())
+            })?;
+
+        debug!(partner = %node_hex, "Harbor sync: connection established, opening stream");
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| {
+                debug!(partner = %node_hex, error = %e, "Harbor sync: failed to open stream");
+                ProtocolError::Network(e.to_string())
+            })?;
+
+        // Send request
+        let msg = HarborMessage::SyncRequest(request.clone());
+        let data = postcard::to_allocvec(&msg)
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        debug!(
+            partner = %node_hex,
+            request_size = data.len(),
+            packets_we_have = request.have_packets.len(),
+            "Harbor sync: sending request"
+        );
+
+        send.write_all(&data).await
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+        send.finish()
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        // Read response
+        let response_data = recv.read_to_end(Self::SYNC_RESPONSE_MAX_SIZE)
+            .await
+            .map_err(|e| {
+                debug!(partner = %node_hex, error = %e, "Harbor sync: failed to read response");
+                ProtocolError::Network(e.to_string())
+            })?;
+
+        debug!(
+            partner = %node_hex,
+            response_size = response_data.len(),
+            "Harbor sync: received response"
+        );
+
+        let response: HarborMessage = postcard::from_bytes(&response_data)
+            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        match response {
+            HarborMessage::SyncResponse(resp) => {
+                debug!(
+                    partner = %node_hex,
+                    missing_packets = resp.missing_packets.len(),
+                    delivery_updates = resp.delivery_updates.len(),
+                    "Harbor sync: parsed response"
+                );
+                Ok(resp)
+            },
+            other => {
+                debug!(partner = %node_hex, "Harbor sync: unexpected response type");
+                Err(ProtocolError::Network(format!("unexpected response: {:?}", std::mem::discriminant(&other))))
+            }
+        }
     }
 }
 

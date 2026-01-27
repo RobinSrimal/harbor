@@ -5,14 +5,19 @@
 //! - Pull requests (retrieving missed packets)
 //! - Acknowledgments (marking packets as delivered)
 //! - Sync requests (Harbor-to-Harbor synchronization)
+//! - Connection handler (accepts QUIC connections, dispatches to handlers)
+
+use std::sync::Arc;
 
 use rusqlite::Connection;
+use tokio::sync::Mutex;
 use tracing::{debug, info, trace, warn};
 
 use crate::data::harbor::{
     all_recipients_delivered, cache_packet, delete_packet, get_packets_for_recipient,
     get_packets_for_sync, mark_delivered, PacketType,
 };
+use crate::protocol::ProtocolError;
 use crate::resilience::{RateLimitResult, StorageCheckResult};
 use crate::security::send::packet::{verify_for_storage, PacketError};
 
@@ -592,6 +597,87 @@ impl HarborService {
                 Ok(None)
             }
         }
+    }
+
+    // ============ Connection Handler ============
+
+    /// Handle an incoming Harbor protocol connection
+    ///
+    /// Processes Store, Pull, Ack, and Sync requests from other nodes.
+    /// This allows this node to act as a Harbor Node (store packets for others).
+    pub async fn handle_harbor_connection(
+        &self,
+        conn: iroh::endpoint::Connection,
+        db: Arc<Mutex<Connection>>,
+        sender_id: [u8; 32],
+        _our_id: [u8; 32],
+    ) -> Result<(), ProtocolError> {
+        trace!(sender = %hex::encode(sender_id), "handling Harbor connection");
+
+        loop {
+            // Accept unidirectional stream for request
+            let mut recv = match conn.accept_uni().await {
+                Ok(r) => r,
+                Err(e) => {
+                    trace!(error = %e, "Harbor stream accept ended");
+                    break;
+                }
+            };
+
+            // Read message with size limit (1MB should be plenty for Harbor messages)
+            const MAX_HARBOR_MSG_SIZE: usize = 1024 * 1024;
+            let buf = match recv.read_to_end(MAX_HARBOR_MSG_SIZE).await {
+                Ok(data) => data,
+                Err(e) => {
+                    debug!(error = %e, "failed to read Harbor message");
+                    continue;
+                }
+            };
+
+            trace!(bytes = buf.len(), "read Harbor message");
+
+            // Decode message
+            let message = match HarborMessage::decode(&buf) {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!(error = %e, "failed to decode Harbor message");
+                    continue;
+                }
+            };
+
+            trace!("decoded HarborMessage: {:?}", std::mem::discriminant(&message));
+
+            // Process with HarborService
+            let response = {
+                let mut db_lock = db.lock().await;
+                match self.handle_message(&mut db_lock, message, &sender_id) {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        warn!(error = %e, "Harbor message handling failed");
+                        continue;
+                    }
+                }
+            };
+
+            // Send response if there is one
+            if let Some(resp_msg) = response {
+                let resp_bytes = resp_msg.encode();
+
+                if let Ok(mut send) = conn.open_uni().await {
+                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut send, &resp_bytes).await {
+                        debug!(error = %e, "failed to send Harbor response");
+                        continue;
+                    }
+                    if let Err(e) = send.finish() {
+                        debug!(error = %e, "failed to finish Harbor response stream");
+                    }
+                } else {
+                    debug!("failed to open response stream");
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

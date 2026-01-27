@@ -1,57 +1,114 @@
-//! Topic operations for the Protocol
+//! Topic Service - Topic lifecycle management
 //!
-//! This module contains public API methods for topic management:
-//! - create_topic: Create a new topic
-//! - join_topic: Join an existing topic
-//! - leave_topic: Leave a topic
-//! - list_topics: List all subscribed topics
-//! - get_invite: Get an invite for a topic
+//! Handles:
+//! - Creating topics
+//! - Joining topics (with JOIN announcement)
+//! - Leaving topics (with LEAVE announcement)
+//! - Listing subscribed topics
+//! - Generating invites with current membership
 
+use std::sync::Arc;
+
+use iroh::Endpoint;
+use rusqlite::Connection as DbConnection;
+use tokio::sync::Mutex;
 use tracing::{debug, info, trace};
 
 use crate::data::{
     add_topic_member, cleanup_pulled_for_topic, get_all_topics,
     get_topic_members_with_info, remove_topic_member, subscribe_topic, unsubscribe_topic,
+    LocalIdentity, WILDCARD_RECIPIENT,
 };
 use crate::network::harbor::protocol::HarborPacketType;
 use crate::network::send::topic_messages::{JoinMessage, LeaveMessage, TopicMessage};
-
-use super::core::Protocol;
-use super::error::ProtocolError;
+use crate::network::send::SendService;
 use super::types::{MemberInfo, TopicInvite};
 
-impl Protocol {
+/// Error during Topic operations
+#[derive(Debug)]
+pub enum TopicError {
+    /// Database error
+    Database(String),
+    /// Network/send error
+    Network(String),
+    /// Topic not found
+    TopicNotFound,
+}
+
+impl std::fmt::Display for TopicError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TopicError::Database(e) => write!(f, "database error: {}", e),
+            TopicError::Network(e) => write!(f, "network error: {}", e),
+            TopicError::TopicNotFound => write!(f, "topic not found"),
+        }
+    }
+}
+
+impl std::error::Error for TopicError {}
+
+/// Topic service - manages topic lifecycle
+pub struct TopicService {
+    /// Iroh endpoint
+    endpoint: Endpoint,
+    /// Local identity
+    identity: Arc<LocalIdentity>,
+    /// Database connection
+    db: Arc<Mutex<DbConnection>>,
+    /// Send service for announcements
+    send_service: Arc<SendService>,
+}
+
+impl TopicService {
+    /// Create a new Topic service
+    pub fn new(
+        endpoint: Endpoint,
+        identity: Arc<LocalIdentity>,
+        db: Arc<Mutex<DbConnection>>,
+        send_service: Arc<SendService>,
+    ) -> Self {
+        Self {
+            endpoint,
+            identity,
+            db,
+            send_service,
+        }
+    }
+
+    /// Get our EndpointID
+    fn endpoint_id(&self) -> [u8; 32] {
+        self.identity.public_key
+    }
+
+    /// Get our current relay URL
+    fn relay_url(&self) -> Option<String> {
+        self.endpoint.addr().relay_urls().next().map(|u| u.to_string())
+    }
+
     /// Create a new topic
     ///
-    /// This creates a new topic with this node as the only member.
+    /// Creates a new topic with this node as the only member.
     /// Returns an invite that can be shared with others.
-    pub async fn create_topic(&self) -> Result<TopicInvite, ProtocolError> {
-        self.check_running().await?;
-
-        // Generate random topic ID
+    pub async fn create_topic(&self) -> Result<TopicInvite, TopicError> {
         use rand::{rngs::OsRng, Rng};
         let mut topic_id = [0u8; 32];
         OsRng.fill(&mut topic_id);
 
         let our_id = self.endpoint_id();
+        let relay_url = self.relay_url();
 
-        // Get our relay URL for cross-network connectivity
-        let relay_url = self.endpoint.addr().relay_urls().next().map(|u| u.to_string());
-
-        // Create member info with relay URL
         let our_info = if let Some(relay) = relay_url {
             MemberInfo::with_relay(our_id, relay)
         } else {
             MemberInfo::new(our_id)
         };
 
-        // Subscribe to the topic
         {
             let db = self.db.lock().await;
             subscribe_topic(&db, &topic_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?;
+                .map_err(|e| TopicError::Database(e.to_string()))?;
             add_topic_member(&db, &topic_id, &our_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?;
+                .map_err(|e| TopicError::Database(e.to_string()))?;
         }
 
         Ok(TopicInvite::new_with_info(topic_id, vec![our_info]))
@@ -59,34 +116,29 @@ impl Protocol {
 
     /// Join an existing topic
     ///
-    /// This joins a topic using an invite received from another member.
+    /// Joins a topic using an invite received from another member.
     /// The invite contains all current topic members.
     /// Announces our presence to other members.
-    pub async fn join_topic(&self, invite: TopicInvite) -> Result<(), ProtocolError> {
-        self.check_running().await?;
-
+    pub async fn join_topic(&self, invite: TopicInvite) -> Result<(), TopicError> {
         let our_id = self.endpoint_id();
         let member_ids = invite.member_ids();
 
-        // Subscribe to the topic
         {
             let db = self.db.lock().await;
             subscribe_topic(&db, &invite.topic_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?;
+                .map_err(|e| TopicError::Database(e.to_string()))?;
 
-            // Add ourselves
             add_topic_member(&db, &invite.topic_id, &our_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?;
+                .map_err(|e| TopicError::Database(e.to_string()))?;
 
-            // Add all members from the invite (invite contains complete member list)
             for member_id in &member_ids {
                 add_topic_member(&db, &invite.topic_id, member_id)
-                    .map_err(|e| ProtocolError::Database(e.to_string()))?;
+                    .map_err(|e| TopicError::Database(e.to_string()))?;
             }
         }
 
-        // Send join announcement to other members (with relay info for connectivity)
-        let our_relay = self.endpoint.addr().relay_urls().next().map(|u| u.to_string());
+        // Send join announcement
+        let our_relay = self.relay_url();
         let join_msg = if let Some(ref relay) = our_relay {
             JoinMessage::with_relay(our_id, relay.clone())
         } else {
@@ -101,17 +153,13 @@ impl Protocol {
             "sending join announcement"
         );
 
-        // Build recipient list: existing members + WILDCARD for future member discovery
-        // WILDCARD ensures JOIN packets are stored on Harbor for members who join later
-        use crate::data::WILDCARD_RECIPIENT;
+        // Build recipient list with WILDCARD for Harbor storage
         let mut members_with_wildcard = invite.get_member_info().to_vec();
         members_with_wildcard.push(MemberInfo {
             endpoint_id: WILDCARD_RECIPIENT,
             relay_url: None,
         });
 
-        // Send to all existing members using their connection info (best effort)
-        // The WILDCARD recipient is filtered out for direct sending but kept for Harbor storage
         let send_result = self
             .send_service
             .send_to_topic(
@@ -121,10 +169,9 @@ impl Protocol {
                 HarborPacketType::Join,
             )
             .await
-            .map_err(|e| ProtocolError::Network(e.to_string()));
+            .map_err(|e| TopicError::Network(e.to_string()));
         if let Err(e) = send_result {
             debug!(error = %e, "failed to send join announcement to some members");
-            // Continue anyway - Harbor replication will handle missed members
         }
 
         info!(topic = hex::encode(invite.topic_id), "joined topic");
@@ -132,23 +179,19 @@ impl Protocol {
     }
 
     /// Leave a topic
-    pub async fn leave_topic(&self, topic_id: &[u8; 32]) -> Result<(), ProtocolError> {
-        self.check_running().await?;
-
+    pub async fn leave_topic(&self, topic_id: &[u8; 32]) -> Result<(), TopicError> {
         let our_id = self.endpoint_id();
 
-        // Get current members with relay info before we leave
         let members_with_info = {
             let db = self.db.lock().await;
             get_topic_members_with_info(&db, topic_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?
+                .map_err(|e| TopicError::Database(e.to_string()))?
         };
 
-        // Send leave announcement to remaining members + WILDCARD for future member discovery
+        // Send leave announcement
         let leave_msg = LeaveMessage::new(our_id);
         let payload = TopicMessage::Leave(leave_msg).encode();
 
-        use crate::data::WILDCARD_RECIPIENT;
         let mut remaining_members: Vec<MemberInfo> = members_with_info
             .into_iter()
             .filter(|m| m.endpoint_id != our_id)
@@ -166,27 +209,20 @@ impl Protocol {
             .send_service
             .send_to_topic(topic_id, &payload, &remaining_members, HarborPacketType::Leave)
             .await
-            .map_err(|e| ProtocolError::Network(e.to_string()));
+            .map_err(|e| TopicError::Network(e.to_string()));
         if let Err(e) = send_result {
             debug!(error = %e, "failed to send leave announcement to some members");
-            // Continue anyway
         }
 
-        // Now remove ourselves and unsubscribe
+        // Remove ourselves and unsubscribe
         {
             let db = self.db.lock().await;
-
-            // Remove ourselves from members
             remove_topic_member(&db, topic_id, &our_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?;
-
-            // Unsubscribe
+                .map_err(|e| TopicError::Database(e.to_string()))?;
             unsubscribe_topic(&db, topic_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?;
-
-            // Clean up pulled packet tracking for this topic
+                .map_err(|e| TopicError::Database(e.to_string()))?;
             cleanup_pulled_for_topic(&db, topic_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?;
+                .map_err(|e| TopicError::Database(e.to_string()))?;
         }
 
         info!(topic = hex::encode(*topic_id), "left topic");
@@ -194,47 +230,36 @@ impl Protocol {
     }
 
     /// List all topics we're subscribed to
-    pub async fn list_topics(&self) -> Result<Vec<[u8; 32]>, ProtocolError> {
-        self.check_running().await?;
-
+    pub async fn list_topics(&self) -> Result<Vec<[u8; 32]>, TopicError> {
         let db = self.db.lock().await;
-        let topics = get_all_topics(&db).map_err(|e| ProtocolError::Database(e.to_string()))?;
-
+        let topics = get_all_topics(&db).map_err(|e| TopicError::Database(e.to_string()))?;
         Ok(topics.into_iter().map(|t| t.topic_id).collect())
     }
 
     /// Get an invite for an existing topic
     ///
     /// Returns a fresh invite containing ALL current topic members.
-    /// This should be used when sharing invites to ensure the new member
-    /// has a complete view of the topic membership.
-    pub async fn get_invite(&self, topic_id: &[u8; 32]) -> Result<TopicInvite, ProtocolError> {
-        self.check_running().await?;
-
+    pub async fn get_invite(&self, topic_id: &[u8; 32]) -> Result<TopicInvite, TopicError> {
         let db = self.db.lock().await;
         let members_with_info = get_topic_members_with_info(&db, topic_id)
-            .map_err(|e| ProtocolError::Database(e.to_string()))?;
+            .map_err(|e| TopicError::Database(e.to_string()))?;
 
         if members_with_info.is_empty() {
-            return Err(ProtocolError::TopicNotFound);
+            return Err(TopicError::TopicNotFound);
         }
 
-        // Get our relay URL for cross-network connectivity (use fresh value)
         let our_id = self.endpoint_id();
-        let our_relay = self.endpoint.addr().relay_urls().next().map(|u| u.to_string());
+        let our_relay = self.relay_url();
 
-        // Build member info from database, but update our own relay URL with fresh value
         let member_info: Vec<MemberInfo> = members_with_info
             .into_iter()
             .map(|m| {
                 if m.endpoint_id == our_id {
-                    // Use fresh relay URL for ourselves
                     MemberInfo {
                         endpoint_id: m.endpoint_id,
                         relay_url: our_relay.clone().or(m.relay_url),
                     }
                 } else {
-                    // Use stored relay URL for others
                     MemberInfo {
                         endpoint_id: m.endpoint_id,
                         relay_url: m.relay_url,

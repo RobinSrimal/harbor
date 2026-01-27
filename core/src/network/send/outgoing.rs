@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, trace};
 
 use crate::data::send::store_outgoing_packet;
-use crate::data::{LocalIdentity, WILDCARD_RECIPIENT};
+use crate::data::{get_topic_members_with_info, LocalIdentity, WILDCARD_RECIPIENT};
 use crate::network::harbor::protocol::HarborPacketType;
 use crate::network::rpc::ExistingConnection;
 use crate::protocol::{MemberInfo, ProtocolEvent};
@@ -41,6 +41,10 @@ pub enum SendError {
     Database(String),
     /// No recipients
     NoRecipients,
+    /// Topic not found
+    TopicNotFound,
+    /// Not a member of the topic
+    NotMember,
 }
 
 impl std::fmt::Display for SendError {
@@ -51,6 +55,8 @@ impl std::fmt::Display for SendError {
             SendError::Send(e) => write!(f, "send failed: {}", e),
             SendError::Database(e) => write!(f, "database error: {}", e),
             SendError::NoRecipients => write!(f, "no recipients specified"),
+            SendError::TopicNotFound => write!(f, "topic not found"),
+            SendError::NotMember => write!(f, "not a member of this topic"),
         }
     }
 }
@@ -131,11 +137,68 @@ impl SendService {
         &self.db
     }
 
-    // ========== Outgoing: Single Entry Point ==========
+    // ========== Outgoing ==========
+
+    /// Send content to a topic, resolving recipients from the database
+    ///
+    /// Looks up topic members, validates membership, filters out self,
+    /// encodes as Content message, and delivers to all recipients.
+    pub async fn send_content(
+        &self,
+        topic_id: &[u8; 32],
+        payload: &[u8],
+    ) -> Result<(), SendError> {
+        let our_id = self.endpoint_id();
+
+        // Get topic members with relay info
+        let members_with_info = {
+            let db = self.db.lock().await;
+            get_topic_members_with_info(&db, topic_id)
+                .map_err(|e| SendError::Database(e.to_string()))?
+        };
+
+        trace!(
+            topic = %hex::encode(topic_id),
+            member_count = members_with_info.len(),
+            "sending message"
+        );
+
+        if members_with_info.is_empty() {
+            return Err(SendError::TopicNotFound);
+        }
+
+        if !members_with_info.iter().any(|m| m.endpoint_id == our_id) {
+            return Err(SendError::NotMember);
+        }
+
+        // Get recipients (all members except us)
+        let recipients: Vec<MemberInfo> = members_with_info
+            .into_iter()
+            .filter(|m| m.endpoint_id != our_id)
+            .map(|m| MemberInfo {
+                endpoint_id: m.endpoint_id,
+                relay_url: m.relay_url,
+            })
+            .collect();
+
+        if recipients.is_empty() {
+            trace!("no recipients - only member is self");
+            return Ok(());
+        }
+
+        // Encode as Content message and send
+        let content_msg = super::topic_messages::TopicMessage::Content(payload.to_vec());
+        let encoded_payload = content_msg.encode();
+
+        self.send_to_topic(topic_id, &encoded_payload, &recipients, HarborPacketType::Content)
+            .await?;
+
+        Ok(())
+    }
 
     /// Send a message to topic members
     ///
-    /// This is the single entry point for all send operations.
+    /// Lower-level entry point for all send operations.
     /// Takes pre-encoded TopicMessage bytes and delivers to all recipients.
     ///
     /// # Arguments

@@ -5,13 +5,21 @@
 //! The implementation is split across:
 //! - `service.rs` (this file): Core struct, constructors, error types
 //! - `incoming.rs`: Incoming request handlers (store, pull, ack, sync)
-//! - `outgoing.rs`: Outgoing operations (create requests, process responses)
+//! - `outgoing.rs`: Outgoing operations (create requests, process responses, network sends)
 //!
 //! See root README for `RUST_LOG` configuration.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use iroh::Endpoint;
+use rusqlite::Connection as DbConnection;
+use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::mpsc;
+
+use crate::data::LocalIdentity;
+use crate::network::dht::DhtService;
+use crate::protocol::ProtocolEvent;
 use crate::resilience::{PoWConfig, PoWVerifyResult, RateLimitConfig, RateLimiter};
 use crate::resilience::{StorageConfig, StorageManager};
 
@@ -20,11 +28,27 @@ use crate::resilience::{StorageConfig, StorageManager};
 /// Handles both server-side (acting as Harbor Node) and client-side
 /// (storing to / pulling from Harbor Nodes) operations.
 ///
+/// Owns its resources (endpoint, identity, db, event channel) following
+/// the same pattern as SendService, DhtService, etc.
+///
 /// Includes abuse protection:
 /// - Rate limiting (per-connection and per-HarborID limits)
 /// - Proof of Work (requires computational work before storing)
 /// - Storage limits (total and per-HarborID quotas)
 pub struct HarborService {
+    // === Primary resources (shared with other services) ===
+    /// Iroh QUIC endpoint for outgoing connections
+    pub(super) endpoint: Option<Endpoint>,
+    /// Local identity (keypair)
+    pub(super) identity: Option<Arc<LocalIdentity>>,
+    /// Database connection
+    pub(super) db: Option<Arc<TokioMutex<DbConnection>>>,
+    /// Event sender (for app notifications)
+    pub(super) event_tx: Option<mpsc::Sender<ProtocolEvent>>,
+    /// DHT service for finding Harbor Nodes
+    pub(super) dht_service: Option<Arc<DhtService>>,
+
+    // === Harbor-specific config ===
     /// Local node's EndpointID
     pub(super) endpoint_id: [u8; 32],
     /// Rate limiter for abuse prevention (thread-safe via Mutex)
@@ -33,17 +57,65 @@ pub struct HarborService {
     pub(super) pow_config: PoWConfig,
     /// Storage quota manager
     pub(super) storage_manager: StorageManager,
+
+    // === Timeout configuration ===
+    /// Timeout for connecting to Harbor Nodes
+    pub(super) connect_timeout: Duration,
+    /// Timeout for Harbor Node responses
+    pub(super) response_timeout: Duration,
 }
 
 impl HarborService {
-    /// Create a new Harbor service with default configs (platform-appropriate storage)
-    pub fn new(endpoint_id: [u8; 32]) -> Self {
-        Self::with_full_config(
+    /// Create a fully-wired Harbor service (for production use)
+    ///
+    /// This is the primary constructor, matching the pattern of SendService::new().
+    pub fn new(
+        endpoint: Endpoint,
+        identity: Arc<LocalIdentity>,
+        db: Arc<TokioMutex<DbConnection>>,
+        event_tx: mpsc::Sender<ProtocolEvent>,
+        dht_service: Option<Arc<DhtService>>,
+        pow_config: PoWConfig,
+        storage_config: StorageConfig,
+        connect_timeout: Duration,
+        response_timeout: Duration,
+    ) -> Self {
+        let endpoint_id = identity.public_key;
+        Self {
+            endpoint: Some(endpoint),
+            identity: Some(identity),
+            db: Some(db),
+            event_tx: Some(event_tx),
+            dht_service,
             endpoint_id,
-            RateLimitConfig::default(),
-            PoWConfig::default(),
-            StorageConfig::default(),
-        )
+            rate_limiter: Mutex::new(RateLimiter::with_config(RateLimitConfig::default())),
+            pow_config,
+            storage_manager: StorageManager::new(storage_config),
+            connect_timeout,
+            response_timeout,
+        }
+    }
+
+    /// Create a standalone Harbor service with custom configs (for tests and incoming-only use)
+    pub fn with_full_config(
+        endpoint_id: [u8; 32],
+        rate_config: RateLimitConfig,
+        pow_config: PoWConfig,
+        storage_config: StorageConfig,
+    ) -> Self {
+        Self {
+            endpoint: None,
+            identity: None,
+            db: None,
+            event_tx: None,
+            dht_service: None,
+            endpoint_id,
+            rate_limiter: Mutex::new(RateLimiter::with_config(rate_config)),
+            pow_config,
+            storage_manager: StorageManager::new(storage_config),
+            connect_timeout: Duration::from_secs(5),
+            response_timeout: Duration::from_secs(30),
+        }
     }
 
     /// Create a new Harbor service with custom rate limit and PoW configs
@@ -53,21 +125,6 @@ impl HarborService {
         pow_config: PoWConfig,
     ) -> Self {
         Self::with_full_config(endpoint_id, rate_config, pow_config, StorageConfig::default())
-    }
-
-    /// Create a new Harbor service with all custom configs
-    pub fn with_full_config(
-        endpoint_id: [u8; 32],
-        rate_config: RateLimitConfig,
-        pow_config: PoWConfig,
-        storage_config: StorageConfig,
-    ) -> Self {
-        Self {
-            endpoint_id,
-            rate_limiter: Mutex::new(RateLimiter::with_config(rate_config)),
-            pow_config,
-            storage_manager: StorageManager::new(storage_config),
-        }
     }
 
     /// Create a new Harbor service with custom rate limit config (default PoW and storage)
@@ -88,6 +145,38 @@ impl HarborService {
         )
     }
 
+    // === Accessors ===
+
+    /// Get our EndpointID
+    pub fn endpoint_id(&self) -> [u8; 32] {
+        self.endpoint_id
+    }
+
+    /// Get the identity
+    pub fn identity(&self) -> &LocalIdentity {
+        self.identity.as_ref().expect("HarborService: identity not set (test-only instance?)")
+    }
+
+    /// Get the database
+    pub fn db(&self) -> &Arc<TokioMutex<DbConnection>> {
+        self.db.as_ref().expect("HarborService: db not set (test-only instance?)")
+    }
+
+    /// Get the event sender
+    pub fn event_tx(&self) -> &mpsc::Sender<ProtocolEvent> {
+        self.event_tx.as_ref().expect("HarborService: event_tx not set (test-only instance?)")
+    }
+
+    /// Get the endpoint
+    pub fn endpoint(&self) -> &Endpoint {
+        self.endpoint.as_ref().expect("HarborService: endpoint not set (test-only instance?)")
+    }
+
+    /// Get the DHT service
+    pub fn dht_service(&self) -> &Option<Arc<DhtService>> {
+        &self.dht_service
+    }
+
     /// Get the PoW difficulty bits (for clients to know what difficulty to use)
     pub fn pow_difficulty(&self) -> u8 {
         self.pow_config.difficulty_bits
@@ -101,6 +190,16 @@ impl HarborService {
     /// Get the storage configuration
     pub fn storage_config(&self) -> &StorageConfig {
         self.storage_manager.config()
+    }
+
+    /// Get connect timeout
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Get response timeout
+    pub fn response_timeout(&self) -> Duration {
+        self.response_timeout
     }
 }
 
@@ -576,5 +675,59 @@ mod tests {
                 i
             );
         }
+    }
+
+    // Tests moved from handlers/outgoing/harbor.rs
+
+    #[test]
+    fn test_harbor_connect_timeout_default_is_reasonable() {
+        let config = crate::protocol::ProtocolConfig::default();
+        assert!(config.harbor_connect_timeout_secs >= 3);
+        assert!(config.harbor_connect_timeout_secs <= 30);
+    }
+
+    #[test]
+    fn test_harbor_response_timeout_default_is_reasonable() {
+        let config = crate::protocol::ProtocolConfig::default();
+        assert!(config.harbor_response_timeout_secs >= 10);
+        assert!(config.harbor_response_timeout_secs <= 120);
+    }
+
+    #[test]
+    fn test_response_timeout_longer_than_connect() {
+        let config = crate::protocol::ProtocolConfig::default();
+        assert!(config.harbor_response_timeout_secs > config.harbor_connect_timeout_secs);
+    }
+
+    #[test]
+    fn test_store_response_max_size() {
+        assert!(HarborService::STORE_RESPONSE_MAX_SIZE <= 4096);
+        assert!(HarborService::STORE_RESPONSE_MAX_SIZE >= 256);
+    }
+
+    #[test]
+    fn test_pull_response_max_size() {
+        assert!(HarborService::PULL_RESPONSE_MAX_SIZE >= 1024 * 1024);
+        assert!(HarborService::PULL_RESPONSE_MAX_SIZE <= 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_pull_response_larger_than_store() {
+        assert!(HarborService::PULL_RESPONSE_MAX_SIZE > HarborService::STORE_RESPONSE_MAX_SIZE);
+    }
+
+    #[test]
+    fn test_node_id_from_harbor_node() {
+        let harbor_node = [42u8; 32];
+        let result = iroh::EndpointId::from_bytes(&harbor_node);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_dht_id_from_harbor_id() {
+        use crate::network::dht::Id as DhtId;
+        let harbor_id = [123u8; 32];
+        let target = DhtId::new(harbor_id);
+        assert_eq!(*target.as_bytes(), harbor_id);
     }
 }

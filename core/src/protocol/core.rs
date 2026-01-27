@@ -22,14 +22,17 @@ use crate::network::dht::{
     service::WeakDhtService,
 };
 use crate::data::BlobStore;
+use crate::network::harbor::HarborService;
 use crate::network::harbor::protocol::HARBOR_ALPN;
 use crate::network::send::{SendService, protocol::SEND_ALPN};
 use crate::network::share::{ShareConfig, ShareService, SHARE_ALPN};
 use crate::network::sync::{SyncService, SYNC_ALPN};
+use crate::network::topic::TopicService;
 
 use super::config::ProtocolConfig;
 use super::error::ProtocolError;
 use super::events::ProtocolEvent;
+use super::stats::StatsService;
 
 /// Maximum message size (512 KB)
 pub const MAX_MESSAGE_SIZE: usize = 512 * 1024;
@@ -60,10 +63,16 @@ pub struct Protocol {
     pub(crate) dht_service: Option<Arc<DhtService>>,
     /// Send service for message delivery
     pub(crate) send_service: Arc<SendService>,
+    /// Harbor service for store-and-forward
+    pub(crate) harbor_service: Arc<HarborService>,
     /// Share service for file distribution
     pub(crate) share_service: Arc<ShareService>,
     /// Sync service for CRDT synchronization
     pub(crate) sync_service: Arc<SyncService>,
+    /// Topic service for topic lifecycle
+    pub(crate) topic_service: Arc<TopicService>,
+    /// Stats service for monitoring
+    pub(crate) stats_service: Arc<StatsService>,
     /// Event sender (for app notifications: messages, file events, etc.)
     pub(crate) event_tx: mpsc::Sender<ProtocolEvent>,
     /// Event receiver (cloneable via Arc)
@@ -289,6 +298,32 @@ impl Protocol {
             event_tx.clone(),
         ));
 
+        // Initialize Harbor service
+        let pow_config = if config.enable_pow {
+            crate::resilience::PoWConfig {
+                enabled: true,
+                difficulty_bits: config.pow_difficulty,
+                ..crate::resilience::PoWConfig::default()
+            }
+        } else {
+            crate::resilience::PoWConfig::disabled()
+        };
+        let storage_config = crate::resilience::StorageConfig {
+            max_total_bytes: config.max_storage_bytes,
+            ..crate::resilience::StorageConfig::default()
+        };
+        let harbor_service = Arc::new(HarborService::new(
+            endpoint.clone(),
+            identity.clone(),
+            db.clone(),
+            event_tx.clone(),
+            dht_service.clone(),
+            pow_config,
+            storage_config,
+            Duration::from_secs(config.harbor_connect_timeout_secs),
+            Duration::from_secs(config.harbor_response_timeout_secs),
+        ));
+
         // Initialize Share service
         let blob_path = if let Some(ref path) = config.blob_path {
             path.clone()
@@ -308,6 +343,7 @@ impl Protocol {
             db.clone(),
             blob_store,
             ShareConfig::default(),
+            Some(send_service.clone()),
         ));
 
         // Initialize Sync service
@@ -319,6 +355,22 @@ impl Protocol {
             send_service.clone(),
         ));
 
+        // Initialize Topic service
+        let topic_service = Arc::new(TopicService::new(
+            endpoint.clone(),
+            identity.clone(),
+            db.clone(),
+            send_service.clone(),
+        ));
+
+        // Initialize Stats service
+        let stats_service = Arc::new(StatsService::new(
+            endpoint.clone(),
+            identity.clone(),
+            db.clone(),
+            dht_service.clone(),
+        ));
+
         let protocol = Self {
             config,
             endpoint,
@@ -326,8 +378,11 @@ impl Protocol {
             db,
             dht_service,
             send_service,
+            harbor_service,
             share_service,
             sync_service,
+            topic_service,
+            stats_service,
             event_tx,
             event_rx: Arc::new(RwLock::new(Some(event_rx))),
             running: Arc::new(RwLock::new(true)),
@@ -423,45 +478,6 @@ impl Protocol {
             return Err(ProtocolError::NotRunning);
         }
         Ok(())
-    }
-    
-    // ========== Sync Transport API ==========
-    //
-    // Thin delegates to SyncService.
-    // Applications bring their own CRDT (Loro, Yjs, Automerge, etc.).
-
-    /// Send a sync update to all topic members
-    ///
-    /// Max size: 512 KB (uses broadcast via send protocol)
-    pub async fn send_sync_update(
-        &self,
-        topic_id: &[u8; 32],
-        data: Vec<u8>,
-    ) -> Result<(), ProtocolError> {
-        self.check_running().await?;
-        self.sync_service.send_sync_update(topic_id, data).await
-    }
-
-    /// Request sync state from topic members
-    pub async fn request_sync(
-        &self,
-        topic_id: &[u8; 32],
-    ) -> Result<(), ProtocolError> {
-        self.check_running().await?;
-        self.sync_service.request_sync(topic_id).await
-    }
-
-    /// Respond to a sync request with current state
-    ///
-    /// Uses direct SYNC_ALPN connection - no size limit.
-    pub async fn respond_sync(
-        &self,
-        topic_id: &[u8; 32],
-        requester_id: &[u8; 32],
-        data: Vec<u8>,
-    ) -> Result<(), ProtocolError> {
-        self.check_running().await?;
-        self.sync_service.respond_sync(topic_id, requester_id, data).await
     }
 }
 

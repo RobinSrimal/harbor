@@ -17,11 +17,13 @@ use rusqlite::Connection as DbConnection;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, trace, warn};
 
+use crate::network::send::SendService;
+
 use crate::data::{
     BlobMetadata, BlobState, BlobStore, CHUNK_SIZE, LocalIdentity, SectionTrace,
-    add_blob_recipient, get_blob, get_blobs_for_topic, get_section_peer_suggestion, get_section_traces,
-    get_topic_members_with_info, init_blob_sections, insert_blob, mark_blob_complete,
-    record_section_received,
+    add_blob_recipient, get_blob, get_blobs_for_topic, get_section_peer_suggestion,
+    get_section_traces, get_topic_members_with_info, init_blob_sections, insert_blob,
+    mark_blob_complete, record_section_received,
 };
 use super::protocol::{
     BitfieldMessage, ChunkAck, ChunkMapRequest, ChunkMapResponse, ChunkRequest, ChunkResponse,
@@ -224,6 +226,8 @@ pub struct ShareService {
     blob_store: Arc<BlobStore>,
     /// Configuration
     config: ShareConfig,
+    /// Send service for broadcasting announcements
+    send_service: Option<Arc<SendService>>,
     /// Active outgoing transfers
     outgoing_transfers: Arc<RwLock<HashMap<[u8; 32], Vec<ActiveTransfer>>>>,
     /// Active incoming transfers
@@ -238,6 +242,7 @@ impl ShareService {
         db: Arc<Mutex<DbConnection>>,
         blob_store: Arc<BlobStore>,
         config: ShareConfig,
+        send_service: Option<Arc<SendService>>,
     ) -> Self {
         Self {
             endpoint,
@@ -245,6 +250,7 @@ impl ShareService {
             db,
             blob_store,
             config,
+            send_service,
             outgoing_transfers: Arc::new(RwLock::new(HashMap::new())),
             incoming_transfers: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -364,7 +370,7 @@ impl ShareService {
             let node_id = EndpointId::from_bytes(peer_id)
                 .map_err(|e| ShareError::Connection(e.to_string()))?;
 
-            match self.connect_to_peer(node_id).await {
+            match self.connect_for_share(node_id).await {
                 Ok(conn) => {
                     // Add to initial recipients
                     initial_recipients.push(InitialRecipient {
@@ -596,19 +602,6 @@ impl ShareService {
         Ok(self.blob_store.is_complete(hash, total_chunks)?)
     }
 
-    /// Connect to a peer
-    async fn connect_to_peer(&self, node_id: EndpointId) -> Result<Connection, ShareError> {
-        let node_addr: EndpointAddr = node_id.into();
-        
-        tokio::time::timeout(
-            self.config.connect_timeout,
-            self.endpoint.connect(node_addr, SHARE_ALPN),
-        )
-        .await
-        .map_err(|_| ShareError::Connection("timeout".to_string()))?
-        .map_err(|e| ShareError::Connection(e.to_string()))
-    }
-
     /// Get active transfer count for a blob
     pub async fn active_transfer_count(&self, hash: &[u8; 32]) -> usize {
         let outgoing = self.outgoing_transfers.read().await;
@@ -626,6 +619,11 @@ impl ShareService {
     /// Get blob store reference
     pub fn blob_store(&self) -> &BlobStore {
         &self.blob_store
+    }
+
+    /// Get database reference
+    pub fn db(&self) -> &Mutex<DbConnection> {
+        &self.db
     }
 
     /// Get recipient IDs for a can-seed announcement
@@ -813,8 +811,152 @@ impl ShareService {
         Ok((hash, size, total_chunks, num_sections, display_name))
     }
 
+    /// Share a file with topic members: import, announce, and push sections
+    ///
+    /// This is the full share flow owned by ShareService. Protocol delegates here.
+    pub async fn share_and_announce(
+        &self,
+        topic_id: &[u8; 32],
+        file_path: &Path,
+    ) -> Result<[u8; 32], ShareError> {
+        // 1. Import file and store metadata
+        let (hash, total_size, total_chunks, num_sections, display_name) =
+            self.share_file(file_path, topic_id).await?;
+
+        info!(
+            hash = hex::encode(&hash[..8]),
+            size = total_size,
+            chunks = total_chunks,
+            sections = num_sections,
+            "File imported, announcing to topic"
+        );
+
+        // 2. Prepare announcement plan
+        let plan = self
+            .prepare_announcement(topic_id, &hash, total_size, total_chunks, num_sections, &display_name)
+            .await?;
+
+        // 3. Broadcast announcement via SendService
+        let send_service = self.send_service.as_ref()
+            .ok_or_else(|| ShareError::Protocol("send service not available".to_string()))?;
+
+        send_service
+            .send_to_topic(
+                topic_id,
+                &plan.message_bytes,
+                &plan.recipients,
+                crate::network::harbor::protocol::HarborPacketType::Content,
+            )
+            .await
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        info!(
+            hash = hex::encode(&hash[..8]),
+            members = plan.recipients.len(),
+            "File announced to topic"
+        );
+
+        // 4. Spawn section pushes to initial recipients
+        for push in plan.section_pushes {
+            let service = self.blob_store.clone();
+            let endpoint = self.endpoint.clone();
+            let hash_copy = hash;
+
+            tokio::spawn(async move {
+                let node_id = match EndpointId::from_bytes(&push.peer_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        warn!(error = %e, "Invalid peer ID for section push");
+                        return;
+                    }
+                };
+                let node_addr: EndpointAddr = node_id.into();
+
+                let conn = match tokio::time::timeout(
+                    Duration::from_secs(15),
+                    endpoint.connect(node_addr, SHARE_ALPN),
+                ).await {
+                    Ok(Ok(c)) => c,
+                    _ => {
+                        warn!(
+                            peer = hex::encode(&push.peer_id[..8]),
+                            section = push.section_id,
+                            "Failed to connect for section push"
+                        );
+                        return;
+                    }
+                };
+
+                for chunk_index in push.chunk_start..push.chunk_end {
+                    let data = match service.read_chunk(&hash_copy, chunk_index) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(error = %e, chunk = chunk_index, "Failed to read chunk for push");
+                            return;
+                        }
+                    };
+
+                    let msg = ShareMessage::ChunkResponse(ChunkResponse {
+                        hash: hash_copy,
+                        chunk_index,
+                        data,
+                    });
+
+                    let mut send = match conn.open_uni().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(error = %e, "Failed to open stream for push");
+                            return;
+                        }
+                    };
+
+                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut send, &msg.encode()).await {
+                        warn!(error = %e, "Failed to write chunk for push");
+                        return;
+                    }
+                    let _ = send.finish();
+                }
+
+                info!(
+                    peer = hex::encode(&push.peer_id[..8]),
+                    hash = hex::encode(&hash_copy[..8]),
+                    chunks = push.chunk_end - push.chunk_start,
+                    "Section push complete"
+                );
+            });
+        }
+
+        Ok(hash)
+    }
+
+    /// Request to download a file by hash
+    ///
+    /// Looks up metadata, checks completion, then runs the pull flow.
+    pub async fn request_blob(&self, hash: &[u8; 32]) -> Result<(), ShareError> {
+        let metadata = {
+            let db_lock = self.db.lock().await;
+            get_blob(&db_lock, hash)
+                .map_err(|e| ShareError::Database(e.to_string()))?
+        };
+
+        let metadata = metadata.ok_or(ShareError::BlobNotFound)?;
+
+        if metadata.state == BlobState::Complete {
+            debug!(hash = hex::encode(&hash[..8]), "Blob already complete");
+            return Ok(());
+        }
+
+        info!(
+            hash = hex::encode(&hash[..8]),
+            name = metadata.display_name,
+            "Starting blob pull"
+        );
+
+        self.execute_blob_pull(hash, &metadata).await
+    }
+
     // ========================================================================
-    // Pull coordination (business logic only - transport is in handlers/outgoing)
+    // Pull coordination
     // ========================================================================
 
     /// Create a pull plan for fetching a blob
@@ -942,7 +1084,317 @@ impl ShareService {
     }
 
     // ========================================================================
-    // Announcement coordination (business logic only - transport is in protocol layer)
+    // Outgoing operations (transport + business logic)
+    // ========================================================================
+
+    /// Connect to a peer for Share protocol
+    async fn connect_for_share(&self, node_id: EndpointId) -> Result<Connection, ShareError> {
+        let node_addr: EndpointAddr = node_id.into();
+        tokio::time::timeout(
+            self.config.connect_timeout,
+            self.endpoint.connect(node_addr, SHARE_ALPN),
+        )
+        .await
+        .map_err(|_| ShareError::Connection("timeout".to_string()))?
+        .map_err(|e| ShareError::Connection(e.to_string()))
+    }
+
+    /// Request a single chunk from a peer (1:1 RPC)
+    pub async fn request_chunk(
+        &self,
+        peer_id: &[u8; 32],
+        hash: &[u8; 32],
+        chunk_index: u32,
+    ) -> Result<ChunkResponse, ShareError> {
+        let node_id = EndpointId::from_bytes(peer_id)
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        let conn = self.connect_for_share(node_id).await?;
+
+        let request = ShareMessage::ChunkRequest(ChunkRequest {
+            hash: *hash,
+            chunk_index,
+        });
+
+        // Open bidirectional stream
+        let (mut send, mut recv) = conn.open_bi().await
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        // Send request
+        tokio::io::AsyncWriteExt::write_all(&mut send, &request.encode()).await
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+        send.finish()
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        // Read single response
+        let max_size = CHUNK_SIZE as usize + 1024;
+        let data = recv.read_to_end(max_size).await
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        match ShareMessage::decode(&data) {
+            Ok(ShareMessage::ChunkResponse(resp)) => Ok(resp),
+            _ => Err(ShareError::Protocol("invalid chunk response".to_string())),
+        }
+    }
+
+    /// Request chunk map from source (1:1 RPC)
+    pub async fn request_chunk_map(
+        &self,
+        source_id: &[u8; 32],
+        hash: &[u8; 32],
+    ) -> Result<ChunkMapResponse, ShareError> {
+        let node_id = EndpointId::from_bytes(source_id)
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        let conn = self.connect_for_share(node_id).await?;
+
+        let request = ShareMessage::ChunkMapRequest(ChunkMapRequest {
+            hash: *hash,
+        });
+
+        let (mut send, mut recv) = conn.open_bi().await
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        tokio::io::AsyncWriteExt::write_all(&mut send, &request.encode()).await
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+        send.finish()
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        let data = recv.read_to_end(64 * 1024).await
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        match ShareMessage::decode(&data) {
+            Ok(ShareMessage::ChunkMapResponse(resp)) => Ok(resp),
+            _ => Err(ShareError::Protocol("invalid chunk map response".to_string())),
+        }
+    }
+
+    /// Announce that we can seed (have 100% of file)
+    ///
+    /// Uses the Send protocol to broadcast to topic members.
+    pub async fn announce_can_seed(
+        &self,
+        topic_id: &[u8; 32],
+        hash: &[u8; 32],
+        recipients: &[crate::protocol::MemberInfo],
+    ) -> Result<(), ShareError> {
+        use crate::network::send::topic_messages::{TopicMessage, CanSeedMessage};
+
+        let send_service = self.send_service.as_ref()
+            .ok_or_else(|| ShareError::Protocol("send service not available".to_string()))?;
+
+        let topic_msg = TopicMessage::CanSeed(CanSeedMessage::new(
+            *hash,
+            self.identity.public_key,
+        ));
+
+        send_service
+            .send_to_topic(
+                topic_id,
+                &topic_msg.encode(),
+                recipients,
+                crate::network::harbor::protocol::HarborPacketType::Content,
+            )
+            .await
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        info!(
+            hash = %hex::encode(&hash[..8]),
+            "announced can seed"
+        );
+
+        Ok(())
+    }
+
+    /// Push a section of chunks to a peer
+    pub async fn push_section_to_peer(
+        &self,
+        peer_id: &[u8; 32],
+        hash: &[u8; 32],
+        chunk_start: u32,
+        chunk_end: u32,
+    ) -> Result<(), ShareError> {
+        let node_id = EndpointId::from_bytes(peer_id)
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+        let node_addr: EndpointAddr = node_id.into();
+
+        let conn = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.endpoint.connect(node_addr, SHARE_ALPN),
+        )
+        .await
+        .map_err(|_| ShareError::Connection("timeout".to_string()))?
+        .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        info!(
+            peer = hex::encode(&peer_id[..8]),
+            hash = hex::encode(&hash[..8]),
+            chunks = format!("{}-{}", chunk_start, chunk_end),
+            "Pushing section to peer"
+        );
+
+        for chunk_index in chunk_start..chunk_end {
+            let data = self.blob_store.read_chunk(hash, chunk_index)?;
+
+            let msg = ShareMessage::ChunkResponse(ChunkResponse {
+                hash: *hash,
+                chunk_index,
+                data,
+            });
+
+            let mut send = conn.open_uni().await
+                .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+            tokio::io::AsyncWriteExt::write_all(&mut send, &msg.encode()).await
+                .map_err(|e| ShareError::Connection(e.to_string()))?;
+            send.finish()
+                .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+            debug!(
+                chunk = chunk_index,
+                peer = hex::encode(&peer_id[..8]),
+                "Pushed chunk"
+            );
+        }
+
+        info!(
+            peer = hex::encode(&peer_id[..8]),
+            hash = hex::encode(&hash[..8]),
+            chunks = chunk_end - chunk_start,
+            "Section push complete"
+        );
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Pull orchestration
+    // ========================================================================
+
+    /// Execute the blob pull process
+    ///
+    /// Coordinates chunk map request, chunk fetching, and completion announcement.
+    pub async fn execute_blob_pull(
+        &self,
+        hash: &[u8; 32],
+        metadata: &BlobMetadata,
+    ) -> Result<(), ShareError> {
+        // 1. Query source for chunk map
+        let peers_with_chunks = match self.request_chunk_map(&metadata.source_id, hash).await {
+            Ok(map) => map.peers,
+            Err(e) => {
+                debug!(error = %e, "Failed to get chunk map, will try source directly");
+                vec![PeerChunks {
+                    endpoint_id: metadata.source_id,
+                    chunk_start: 0,
+                    chunk_end: metadata.total_chunks,
+                }]
+            }
+        };
+
+        info!(
+            hash = hex::encode(&hash[..8]),
+            peers = peers_with_chunks.len(),
+            "Starting pull from {} peer(s)",
+            peers_with_chunks.len()
+        );
+
+        // 2. Get pull plan
+        let plan = self.plan_blob_pull(hash, metadata, &peers_with_chunks)?;
+
+        if plan.missing_chunks.is_empty() {
+            info!(hash = hex::encode(&hash[..8]), "Already have all chunks");
+            return Ok(());
+        }
+
+        info!(
+            hash = hex::encode(&hash[..8]),
+            missing = plan.missing_chunks.len(),
+            total = metadata.total_chunks,
+            "Need to fetch {} chunks",
+            plan.missing_chunks.len()
+        );
+
+        // 3. Request chunks from peers (1:1 RPC per chunk)
+        for assignment in &plan.peer_assignments {
+            for &chunk_index in &assignment.chunks {
+                match self.request_chunk(&assignment.peer_id, hash, chunk_index).await {
+                    Ok(resp) => {
+                        let result = self.process_pull_chunk(
+                            hash,
+                            resp.chunk_index,
+                            &resp.data,
+                            metadata.total_size,
+                            metadata.total_chunks,
+                        )?;
+
+                        if result.stored {
+                            debug!(
+                                chunk = resp.chunk_index,
+                                from = hex::encode(&assignment.peer_id[..8]),
+                                "Received chunk"
+                            );
+                        } else {
+                            warn!(chunk = resp.chunk_index, "Chunk verification failed");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            peer = hex::encode(&assignment.peer_id[..8]),
+                            chunk = chunk_index,
+                            "Failed to request chunk"
+                        );
+                    }
+                }
+            }
+
+            // Record section trace
+            if !assignment.chunks.is_empty() {
+                let section_id = self.calculate_section_id(assignment.chunks[0], metadata.total_chunks);
+                let _ = self.record_section_trace(hash, section_id, &assignment.peer_id).await;
+            }
+        }
+
+        // 4. Check completion
+        if self.blob_store.is_complete(hash, metadata.total_chunks).unwrap_or(false) {
+            self.mark_complete(hash).await?;
+
+            info!(
+                hash = hex::encode(&hash[..8]),
+                name = metadata.display_name,
+                "Blob pull complete!"
+            );
+
+            // Announce we can seed
+            match self.get_can_seed_recipients(&metadata.topic_id).await {
+                Ok(recipients) => {
+                    if let Err(e) = self.announce_can_seed(&metadata.topic_id, hash, &recipients).await {
+                        warn!(error = %e, "Failed to announce can seed");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to get can seed recipients");
+                }
+            }
+        } else {
+            let bitfield = self.blob_store
+                .get_chunk_bitfield(hash, metadata.total_chunks)
+                .unwrap_or_default();
+            let have = bitfield.iter().filter(|&&b| b).count();
+            info!(
+                hash = hex::encode(&hash[..8]),
+                have = have,
+                total = metadata.total_chunks,
+                "Pull incomplete, will retry later"
+            );
+        }
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Announcement coordination
     // ========================================================================
 
     /// Prepare an announcement for sharing a file with topic members
@@ -1149,9 +1601,9 @@ async fn handle_chunk_map_request(
     }))
 }
 
-/// Handle ChunkRequest - send requested chunks
+/// Handle ChunkRequest - send the requested chunk
 ///
-/// Returns all requested chunks as multiple ChunkResponse messages
+/// Returns a single ChunkResponse (1:1 RPC)
 async fn handle_chunk_request(
     db: &Mutex<DbConnection>,
     blob_store: &BlobStore,
@@ -1167,43 +1619,26 @@ async fn handle_chunk_request(
         }
     };
 
-    // Send all requested chunks
-    let mut responses = Vec::with_capacity(req.chunks.len());
+    match blob_store.read_chunk(&req.hash, req.chunk_index) {
+        Ok(data) => {
+            trace!(
+                hash = %hex::encode(&req.hash[..8]),
+                chunk = req.chunk_index,
+                to = %hex::encode(&sender_id[..8]),
+                "sending chunk"
+            );
 
-    for &chunk_index in &req.chunks {
-        match blob_store.read_chunk(&req.hash, chunk_index) {
-            Ok(data) => {
-                trace!(
-                    hash = %hex::encode(&req.hash[..8]),
-                    chunk = chunk_index,
-                    to = %hex::encode(&sender_id[..8]),
-                    "sending chunk"
-                );
-
-                responses.push(ShareMessage::ChunkResponse(ChunkResponse {
-                    hash: req.hash,
-                    chunk_index,
-                    data,
-                }));
-            }
-            Err(e) => {
-                debug!(error = %e, chunk = chunk_index, "failed to read chunk");
-                // Continue with other chunks even if one fails
-            }
+            vec![ShareMessage::ChunkResponse(ChunkResponse {
+                hash: req.hash,
+                chunk_index: req.chunk_index,
+                data,
+            })]
+        }
+        Err(e) => {
+            debug!(error = %e, chunk = req.chunk_index, "failed to read chunk");
+            Vec::new()
         }
     }
-
-    if !responses.is_empty() {
-        debug!(
-            hash = %hex::encode(&req.hash[..8]),
-            chunks = responses.len(),
-            to = %hex::encode(&sender_id[..8]),
-            "sending {} chunks",
-            responses.len()
-        );
-    }
-
-    responses
 }
 
 /// Handle incoming Bitfield - log for tracking

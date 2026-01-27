@@ -13,6 +13,7 @@ use crate::data::send::{
     get_packets_needing_replication, delete_outgoing_packet,
 };
 use crate::network::dht::DhtService;
+use crate::network::harbor::HarborService;
 use crate::network::harbor::protocol::HarborPacketType;
 use crate::resilience::{PoWChallenge, PoWConfig, compute_pow};
 
@@ -63,7 +64,7 @@ impl Protocol {
             // For each packet, find Harbor Nodes via DHT and replicate
             for packet in &packets {
                 // Find Harbor Nodes for this topic's HarborID
-                let harbor_nodes = Self::find_harbor_nodes(&dht_service, &packet.harbor_id).await;
+                let harbor_nodes = HarborService::find_harbor_nodes(&dht_service, &packet.harbor_id).await;
 
                 if harbor_nodes.is_empty() {
                     debug!(
@@ -123,7 +124,7 @@ impl Protocol {
                         break;
                     }
 
-                    match Self::send_harbor_store(&endpoint, harbor_node, &store_req, connect_timeout, response_timeout).await {
+                    match HarborService::send_harbor_store(&endpoint, harbor_node, &store_req, connect_timeout, response_timeout).await {
                         Ok(true) => {
                             success_count += 1;
                             trace!(

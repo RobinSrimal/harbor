@@ -546,11 +546,11 @@ async fn request_chunks_from_peer(
     let mut received = 0;
     let mut suggested_peers = Vec::new();
 
-    // Batch request chunks (request up to 10 at a time)
-    for chunk_batch in chunks.chunks(10) {
+    // Request each chunk individually (1:1 RPC)
+    for &chunk_index in chunks {
         let request = ShareMessage::ChunkRequest(ChunkRequest {
             hash: *hash,
-            chunks: chunk_batch.to_vec(),
+            chunk_index,
         });
 
         // Open bidirectional stream
@@ -570,52 +570,41 @@ async fn request_chunks_from_peer(
         }
         let _ = send.finish();
 
-        // Read responses
-        let max_response_size = (CHUNK_SIZE as usize + 256) * chunk_batch.len();
+        // Read single response
+        let max_response_size = CHUNK_SIZE as usize + 1024;
         let response_data = match recv.read_to_end(max_response_size).await {
             Ok(data) => data,
             Err(e) => {
                 debug!(error = %e, "Failed to read chunk response");
-                break;
+                continue;
             }
         };
 
-        // Parse and store chunks
-        // The response may contain multiple ChunkResponse messages
-        let mut offset = 0;
-        while offset < response_data.len() {
-            match ShareMessage::decode_with_size(&response_data[offset..]) {
-                Ok((ShareMessage::ChunkResponse(resp), consumed)) => {
-                    if &resp.hash == hash {
-                        if let Err(e) = blob_store.write_chunk(
-                            hash,
-                            resp.chunk_index,
-                            &resp.data,
-                            total_size,
-                        ) {
-                            warn!(error = %e, chunk = resp.chunk_index, "Failed to write chunk");
-                        } else {
-                            received += 1;
-                        }
+        // Parse response
+        match ShareMessage::decode(&response_data) {
+            Ok(ShareMessage::ChunkResponse(resp)) => {
+                if &resp.hash == hash {
+                    if let Err(e) = blob_store.write_chunk(
+                        hash,
+                        resp.chunk_index,
+                        &resp.data,
+                        total_size,
+                    ) {
+                        warn!(error = %e, chunk = resp.chunk_index, "Failed to write chunk");
+                    } else {
+                        received += 1;
                     }
-                    offset += consumed;
                 }
-                Ok((ShareMessage::PeerSuggestion(suggestion), consumed)) => {
-                    // Track suggested peer for fallback
-                    info!(
-                        suggested = hex::encode(&suggestion.suggested_peer[..8]),
-                        section = suggestion.section_id,
-                        "Peer suggested alternative - will try if current attempt fails"
-                    );
-                    suggested_peers.push(suggestion.suggested_peer);
-                    offset += consumed;
-                }
-                Ok((_, consumed)) => {
-                    // Skip unknown message types
-                    offset += consumed;
-                }
-                Err(_) => break,
             }
+            Ok(ShareMessage::PeerSuggestion(suggestion)) => {
+                info!(
+                    suggested = hex::encode(&suggestion.suggested_peer[..8]),
+                    section = suggestion.section_id,
+                    "Peer suggested alternative - will try if current attempt fails"
+                );
+                suggested_peers.push(suggestion.suggested_peer);
+            }
+            _ => {}
         }
     }
 

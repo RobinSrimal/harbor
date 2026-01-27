@@ -21,11 +21,11 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, trace};
 
-use crate::data::BlobStore;
 use crate::network::dht::{DhtService, DHT_ALPN};
+use crate::network::harbor::HarborService;
 use crate::network::harbor::protocol::HARBOR_ALPN;
 use crate::network::send::{SendService, protocol::SEND_ALPN};
-use crate::network::share::protocol::SHARE_ALPN;
+use crate::network::share::{ShareService, SHARE_ALPN};
 use crate::network::sync::{SyncService, SYNC_ALPN};
 
 use crate::protocol::{ProtocolEvent, Protocol};
@@ -42,7 +42,8 @@ impl Protocol {
         running: Arc<RwLock<bool>>,
         dht_service: Option<Arc<DhtService>>,
         send_service: Option<Arc<SendService>>,
-        blob_store: Option<Arc<BlobStore>>,
+        harbor_service: Option<Arc<HarborService>>,
+        share_service: Option<Arc<ShareService>>,
         sync_service: Option<Arc<SyncService>>,
     ) {
         loop {
@@ -117,30 +118,34 @@ impl Protocol {
             } else if alpn == HARBOR_ALPN {
                 // Handle Harbor protocol (store, pull, sync)
                 let db = db.clone();
+                let harbor_service = harbor_service.clone();
 
                 tokio::spawn(async move {
                     trace!(sender = %hex::encode(sender_id), "starting Harbor connection handler");
-                    if let Err(e) =
-                        Self::handle_harbor_connection(conn, db, sender_id, our_id).await
-                    {
-                        debug!(error = %e, sender = %hex::encode(sender_id), "Harbor connection handler error");
+                    if let Some(ref service) = harbor_service {
+                        if let Err(e) =
+                            service.handle_harbor_connection(conn, db, sender_id, our_id).await
+                        {
+                            debug!(error = %e, sender = %hex::encode(sender_id), "Harbor connection handler error");
+                        }
+                    } else {
+                        debug!("Harbor connection received but Harbor service not initialized");
                     }
                 });
             } else if alpn == SHARE_ALPN {
                 // Handle Share protocol (file chunks, bitfields)
-                let db = db.clone();
-                let blob_store = blob_store.clone();
+                let share_service = share_service.clone();
 
                 tokio::spawn(async move {
-                    if let Some(store) = blob_store {
+                    if let Some(ref service) = share_service {
                         trace!(sender = %hex::encode(sender_id), "starting Share connection handler");
                         if let Err(e) =
-                            Self::handle_share_connection(conn, db, store, sender_id, our_id).await
+                            service.handle_share_connection(conn, sender_id).await
                         {
                             debug!(error = %e, sender = %hex::encode(sender_id), "Share connection handler error");
                         }
                     } else {
-                        debug!("Share connection received but blob store not initialized");
+                        debug!("Share connection received but Share service not initialized");
                     }
                 });
             } else if alpn == SYNC_ALPN {
