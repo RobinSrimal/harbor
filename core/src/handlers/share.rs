@@ -11,6 +11,7 @@
 //! - Delegating business logic to the service layer
 //! - Sending responses
 
+use iroh::protocol::{AcceptError, ProtocolHandler};
 use tracing::{debug, trace};
 
 use crate::data::CHUNK_SIZE;
@@ -20,9 +21,19 @@ use crate::network::share::service::{process_incoming_share_message, ShareServic
 /// Maximum message size for share protocol (chunk size + overhead)
 const MAX_READ_SIZE: usize = (CHUNK_SIZE as usize) + 1024;
 
+impl ProtocolHandler for ShareService {
+    async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
+        let sender_id = *conn.remote_id().as_bytes();
+        if let Err(e) = self.handle_share_connection(conn, sender_id).await {
+            debug!(error = %e, sender = %hex::encode(sender_id), "Share connection handler error");
+        }
+        Ok(())
+    }
+}
+
 impl ShareService {
     /// Handle a single incoming Share protocol connection
-    pub async fn handle_share_connection(
+    pub(crate) async fn handle_share_connection(
         &self,
         conn: iroh::endpoint::Connection,
         sender_id: [u8; 32],

@@ -16,12 +16,12 @@ use tracing::{debug, info, trace};
 
 use crate::data::{
     add_topic_member, cleanup_pulled_for_topic, get_all_topics,
-    get_topic_members_with_info, remove_topic_member, subscribe_topic, unsubscribe_topic,
+    get_topic_members, get_peer_relay_info, remove_topic_member, subscribe_topic, unsubscribe_topic,
     LocalIdentity, WILDCARD_RECIPIENT,
 };
 use crate::network::harbor::protocol::HarborPacketType;
 use crate::network::send::topic_messages::{JoinMessage, LeaveMessage, TopicMessage};
-use crate::network::send::SendService;
+use crate::network::send::{SendService, SendOptions};
 use super::types::{MemberInfo, TopicInvite};
 
 /// Error during Topic operations
@@ -166,7 +166,7 @@ impl TopicService {
                 &invite.topic_id,
                 &payload,
                 &members_with_wildcard,
-                HarborPacketType::Join,
+                SendOptions::default().with_packet_type(HarborPacketType::Join),
             )
             .await
             .map_err(|e| TopicError::Network(e.to_string()));
@@ -182,9 +182,9 @@ impl TopicService {
     pub async fn leave_topic(&self, topic_id: &[u8; 32]) -> Result<(), TopicError> {
         let our_id = self.endpoint_id();
 
-        let members_with_info = {
+        let members = {
             let db = self.db.lock().await;
-            get_topic_members_with_info(&db, topic_id)
+            get_topic_members(&db, topic_id)
                 .map_err(|e| TopicError::Database(e.to_string()))?
         };
 
@@ -192,13 +192,10 @@ impl TopicService {
         let leave_msg = LeaveMessage::new(our_id);
         let payload = TopicMessage::Leave(leave_msg).encode();
 
-        let mut remaining_members: Vec<MemberInfo> = members_with_info
+        let mut remaining_members: Vec<MemberInfo> = members
             .into_iter()
-            .filter(|m| m.endpoint_id != our_id)
-            .map(|m| MemberInfo {
-                endpoint_id: m.endpoint_id,
-                relay_url: m.relay_url,
-            })
+            .filter(|m| *m != our_id)
+            .map(|endpoint_id| MemberInfo::new(endpoint_id))
             .collect();
         remaining_members.push(MemberInfo {
             endpoint_id: WILDCARD_RECIPIENT,
@@ -207,7 +204,7 @@ impl TopicService {
 
         let send_result = self
             .send_service
-            .send_to_topic(topic_id, &payload, &remaining_members, HarborPacketType::Leave)
+            .send_to_topic(topic_id, &payload, &remaining_members, SendOptions::default().with_packet_type(HarborPacketType::Leave))
             .await
             .map_err(|e| TopicError::Network(e.to_string()));
         if let Err(e) = send_result {
@@ -241,28 +238,35 @@ impl TopicService {
     /// Returns a fresh invite containing ALL current topic members.
     pub async fn get_invite(&self, topic_id: &[u8; 32]) -> Result<TopicInvite, TopicError> {
         let db = self.db.lock().await;
-        let members_with_info = get_topic_members_with_info(&db, topic_id)
+        let members = get_topic_members(&db, topic_id)
             .map_err(|e| TopicError::Database(e.to_string()))?;
 
-        if members_with_info.is_empty() {
+        if members.is_empty() {
             return Err(TopicError::TopicNotFound);
         }
 
         let our_id = self.endpoint_id();
         let our_relay = self.relay_url();
 
-        let member_info: Vec<MemberInfo> = members_with_info
+        let member_info: Vec<MemberInfo> = members
             .into_iter()
-            .map(|m| {
-                if m.endpoint_id == our_id {
-                    MemberInfo {
-                        endpoint_id: m.endpoint_id,
-                        relay_url: our_relay.clone().or(m.relay_url),
+            .map(|endpoint_id| {
+                if endpoint_id == our_id {
+                    // Use our current live relay URL
+                    if let Some(ref relay) = our_relay {
+                        MemberInfo::with_relay(endpoint_id, relay.clone())
+                    } else {
+                        MemberInfo::new(endpoint_id)
                     }
                 } else {
+                    // Look up relay URL from peers table
+                    let relay_url = get_peer_relay_info(&db, &endpoint_id)
+                        .ok()
+                        .flatten()
+                        .map(|(url, _)| url);
                     MemberInfo {
-                        endpoint_id: m.endpoint_id,
-                        relay_url: m.relay_url,
+                        endpoint_id,
+                        relay_url,
                     }
                 }
             })

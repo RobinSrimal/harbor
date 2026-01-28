@@ -5,18 +5,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::Endpoint;
-use rusqlite::Connection;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::data::{
-    get_topics_for_member, add_topic_member_with_relay,
+    get_topics_for_member, add_topic_member, update_peer_relay_url, current_timestamp,
     remove_topic_member, mark_pulled, was_pulled, get_joined_at,
     get_blob, insert_blob, init_blob_sections, record_peer_can_seed,
     CHUNK_SIZE,
 };
-use crate::network::dht::DhtService;
 use crate::network::harbor::HarborService;
 use crate::network::harbor::protocol::HarborPacketType;
 use crate::network::send::topic_messages::TopicMessage;
@@ -25,23 +22,24 @@ use crate::security::{
     VerificationMode, SendPacket,
 };
 
+use crate::network::live::LiveService;
+use crate::network::send::PacketSource;
 use crate::protocol::{Protocol, IncomingMessage, ProtocolEvent};
 
 impl Protocol {
     /// Run the Harbor pull loop
     pub(crate) async fn run_harbor_pull_loop(
-        db: Arc<Mutex<Connection>>,
-        endpoint: Endpoint,
+        harbor_service: Arc<HarborService>,
         event_tx: mpsc::Sender<ProtocolEvent>,
         our_id: [u8; 32],
-        dht_service: Option<Arc<DhtService>>,
         running: Arc<RwLock<bool>>,
         pull_interval: Duration,
         pull_max_nodes: usize,
         pull_early_stop: usize,
-        connect_timeout: Duration,
-        response_timeout: Duration,
+        live_service: Arc<LiveService>,
     ) {
+        let db = harbor_service.db().clone();
+        let dht_service = harbor_service.dht_service().clone();
         loop {
             // Check if we should stop
             if !*running.read().await {
@@ -94,7 +92,7 @@ impl Protocol {
                 // Stop after consecutive empty responses (configurable)
                 let mut consecutive_empty = 0;
                 for harbor_node in harbor_nodes.iter().take(pull_max_nodes) {
-                    match HarborService::send_harbor_pull(&endpoint, harbor_node, &pull_req, connect_timeout, response_timeout).await {
+                    match harbor_service.send_harbor_pull(harbor_node, &pull_req).await {
                         Ok(packets) => {
                             if packets.is_empty() {
                                 consecutive_empty += 1;
@@ -163,12 +161,20 @@ impl Protocol {
                                                             "join message joiner doesn't match packet sender - ignoring"
                                                         );
                                                     } else {
-                                                        let _ = add_topic_member_with_relay(
+                                                        let _ = add_topic_member(
                                                             &db_lock,
                                                             &topic_id,
                                                             &join.joiner,
-                                                            join.relay_url.as_deref(),
                                                         );
+                                                        // Store relay URL in peers table if provided
+                                                        if let Some(ref relay_url) = join.relay_url {
+                                                            let _ = update_peer_relay_url(
+                                                                &db_lock,
+                                                                &join.joiner,
+                                                                relay_url,
+                                                                current_timestamp(),
+                                                            );
+                                                        }
                                                     }
                                                 }
                                                 TopicMessage::Leave(leave) => {
@@ -253,6 +259,19 @@ impl Protocol {
                                                     });
                                                     let _ = event_tx.send(event).await;
                                                 }
+                                                // Stream signaling — route to LiveService
+                                                TopicMessage::StreamRequest(_)
+                                                | TopicMessage::StreamAccept(_)
+                                                | TopicMessage::StreamReject(_)
+                                                | TopicMessage::StreamQuery(_)
+                                                | TopicMessage::StreamActive(_)
+                                                | TopicMessage::StreamEnded(_) => {
+                                                    drop(db_lock);
+                                                    live_service.handle_signaling(
+                                                        msg, &topic_id, packet_info.sender_id,
+                                                        PacketSource::HarborPull,
+                                                    ).await;
+                                                }
                                             }
                                         }
 
@@ -276,7 +295,7 @@ impl Protocol {
                                             packet_id: packet_info.packet_id,
                                             recipient_id: our_id,
                                         };
-                                        let _ = HarborService::send_harbor_ack(&endpoint, harbor_node, &ack, connect_timeout).await;
+                                        let _ = harbor_service.send_harbor_ack(harbor_node, &ack).await;
                                     }
                                     Err(e) => {
                                         debug!(error = %e, "failed to verify pulled packet");

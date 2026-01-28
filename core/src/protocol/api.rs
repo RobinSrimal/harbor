@@ -244,6 +244,57 @@ impl Protocol {
             .await
             .map_err(|e| ProtocolError::Database(e.to_string()))
     }
+
+    // ========== Live Streaming API ==========
+
+    /// Request to stream to a peer in a topic
+    ///
+    /// Sends a stream request via signaling. The destination must accept
+    /// before media can flow. Returns the unique request ID.
+    pub async fn request_stream(
+        &self,
+        topic_id: &[u8; 32],
+        peer_id: &[u8; 32],
+        name: &str,
+        catalog: Vec<u8>,
+    ) -> Result<[u8; 32], ProtocolError> {
+        self.check_running().await?;
+        self.live_service
+            .request_stream(topic_id, peer_id, name, catalog)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Accept an incoming stream request
+    pub async fn accept_stream(&self, request_id: &[u8; 32]) -> Result<(), ProtocolError> {
+        self.check_running().await?;
+        self.live_service
+            .accept_stream(request_id)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Reject an incoming stream request
+    pub async fn reject_stream(
+        &self,
+        request_id: &[u8; 32],
+        reason: Option<String>,
+    ) -> Result<(), ProtocolError> {
+        self.check_running().await?;
+        self.live_service
+            .reject_stream(request_id, reason)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// End an active outgoing stream
+    pub async fn end_stream(&self, request_id: &[u8; 32]) -> Result<(), ProtocolError> {
+        self.check_running().await?;
+        self.live_service
+            .end_stream(request_id)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,10 @@ pub struct PeerInfo {
     pub latency_timestamp: Option<i64>,
     /// Timestamp when this peer was last seen
     pub last_seen: i64,
+    /// Optional relay URL for this peer
+    pub relay_url: Option<String>,
+    /// Timestamp when the relay URL was last confirmed working
+    pub relay_url_last_success: Option<i64>,
 }
 
 impl PeerInfo {
@@ -88,8 +92,9 @@ pub fn upsert_peer(conn: &Connection, peer: &PeerInfo) -> rusqlite::Result<()> {
 /// Get a peer by EndpointID
 pub fn get_peer(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite::Result<Option<PeerInfo>> {
     conn.query_row(
-        "SELECT endpoint_id, endpoint_address, address_timestamp, 
-                last_latency_ms, latency_timestamp, last_seen
+        "SELECT endpoint_id, endpoint_address, address_timestamp,
+                last_latency_ms, latency_timestamp, last_seen,
+                relay_url, relay_url_last_success
          FROM peers WHERE endpoint_id = ?1",
         [endpoint_id.as_slice()],
         |row| parse_peer_row(row),
@@ -100,7 +105,7 @@ pub fn get_peer(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite::Result<O
 /// Parse a PeerInfo from a database row
 fn parse_peer_row(row: &rusqlite::Row) -> rusqlite::Result<PeerInfo> {
     let id_vec: Vec<u8> = row.get(0)?;
-    
+
     if id_vec.len() != 32 {
         return Err(rusqlite::Error::InvalidColumnType(
             0,
@@ -108,10 +113,10 @@ fn parse_peer_row(row: &rusqlite::Row) -> rusqlite::Result<PeerInfo> {
             rusqlite::types::Type::Blob,
         ));
     }
-    
+
     let mut endpoint_id = [0u8; 32];
     endpoint_id.copy_from_slice(&id_vec);
-    
+
     Ok(PeerInfo {
         endpoint_id,
         endpoint_address: row.get(1)?,
@@ -119,7 +124,75 @@ fn parse_peer_row(row: &rusqlite::Row) -> rusqlite::Result<PeerInfo> {
         last_latency_ms: row.get(3)?,
         latency_timestamp: row.get(4)?,
         last_seen: row.get(5)?,
+        relay_url: row.get(6)?,
+        relay_url_last_success: row.get(7)?,
     })
+}
+
+/// Get a peer's relay URL and last success timestamp for connection routing
+pub fn get_peer_relay_info(
+    conn: &Connection,
+    endpoint_id: &[u8; 32],
+) -> rusqlite::Result<Option<(String, Option<i64>)>> {
+    conn.query_row(
+        "SELECT relay_url, relay_url_last_success FROM peers WHERE endpoint_id = ?1",
+        [endpoint_id.as_slice()],
+        |row| {
+            let relay_url: Option<String> = row.get(0)?;
+            let last_success: Option<i64> = row.get(1)?;
+            Ok(relay_url.map(|url| (url, last_success)))
+        },
+    )
+    .optional()
+    .map(|opt| opt.flatten())
+}
+
+/// Update a peer's relay URL and last success timestamp.
+///
+/// Only updates if the incoming timestamp is newer than what's stored:
+/// - If only the timestamp is newer (same relay URL): updates just the timestamp.
+/// - If the relay URL is also different: updates both.
+/// - If the incoming timestamp is older or equal: no update.
+///
+/// Uses upsert to create the peer record if it doesn't exist yet.
+pub fn update_peer_relay_url(
+    conn: &Connection,
+    endpoint_id: &[u8; 32],
+    relay_url: &str,
+    timestamp: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO peers (endpoint_id, relay_url, relay_url_last_success, last_seen)
+         VALUES (?1, ?2, ?3, ?3)
+         ON CONFLICT(endpoint_id) DO UPDATE SET
+             relay_url = CASE
+                 WHEN ?3 > COALESCE(relay_url_last_success, 0) THEN ?2
+                 ELSE relay_url
+             END,
+             relay_url_last_success = CASE
+                 WHEN ?3 > COALESCE(relay_url_last_success, 0) THEN ?3
+                 ELSE relay_url_last_success
+             END,
+             last_seen = MAX(last_seen, ?3)",
+        params![endpoint_id.as_slice(), relay_url, timestamp],
+    )?;
+    Ok(())
+}
+
+/// Store a relay URL for a peer without marking it as verified.
+///
+/// Only sets relay_url if the peer has no relay_url yet.
+/// Does NOT set relay_url_last_success, so smart connect treats it as stale.
+pub fn store_peer_relay_url_unverified(
+    conn: &Connection,
+    endpoint_id: &[u8; 32],
+    relay_url: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE peers SET relay_url = ?2 WHERE endpoint_id = ?1 AND relay_url IS NULL",
+        params![endpoint_id.as_slice(), relay_url],
+    )?;
+    Ok(())
 }
 
 /// Update peer's last seen timestamp
@@ -212,13 +285,14 @@ pub fn get_stale_peers(conn: &Connection, threshold: i64) -> rusqlite::Result<Ve
 /// Get peers with fresh addresses for direct dialing
 pub fn get_peers_with_fresh_addresses(conn: &Connection) -> rusqlite::Result<Vec<PeerInfo>> {
     let threshold = current_timestamp() - ADDRESS_FRESHNESS_THRESHOLD_SECS;
-    
+
     let mut stmt = conn.prepare(
-        "SELECT endpoint_id, endpoint_address, address_timestamp, 
-                last_latency_ms, latency_timestamp, last_seen
-         FROM peers 
-         WHERE endpoint_address IS NOT NULL 
-           AND address_timestamp IS NOT NULL 
+        "SELECT endpoint_id, endpoint_address, address_timestamp,
+                last_latency_ms, latency_timestamp, last_seen,
+                relay_url, relay_url_last_success
+         FROM peers
+         WHERE endpoint_address IS NOT NULL
+           AND address_timestamp IS NOT NULL
            AND address_timestamp > ?1",
     )?;
     
@@ -256,10 +330,12 @@ mod tests {
             last_latency_ms: Some(50),
             latency_timestamp: Some(current_timestamp()),
             last_seen: current_timestamp(),
+            relay_url: None,
+            relay_url_last_success: None,
         };
-        
+
         upsert_peer(&conn, &peer).unwrap();
-        
+
         let retrieved = get_peer(&conn, &endpoint_id).unwrap().unwrap();
         assert_eq!(retrieved.endpoint_id, endpoint_id);
         assert_eq!(retrieved.endpoint_address, peer.endpoint_address);
@@ -270,7 +346,7 @@ mod tests {
     fn test_upsert_updates_existing() {
         let conn = setup_db();
         let endpoint_id = test_endpoint_id(2);
-        
+
         // Insert initial peer
         let peer1 = PeerInfo {
             endpoint_id,
@@ -279,9 +355,11 @@ mod tests {
             last_latency_ms: Some(50),
             latency_timestamp: Some(current_timestamp()),
             last_seen: current_timestamp(),
+            relay_url: None,
+            relay_url_last_success: None,
         };
         upsert_peer(&conn, &peer1).unwrap();
-        
+
         // Upsert with new address
         let peer2 = PeerInfo {
             endpoint_id,
@@ -290,6 +368,8 @@ mod tests {
             last_latency_ms: None, // Should keep old value
             latency_timestamp: None,
             last_seen: current_timestamp(),
+            relay_url: None,
+            relay_url_last_success: None,
         };
         upsert_peer(&conn, &peer2).unwrap();
         
@@ -311,9 +391,11 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: now,
+            relay_url: None,
+            relay_url_last_success: None,
         };
         assert!(fresh_peer.has_fresh_address());
-        
+
         // Stale address (25 hours old)
         let stale_peer = PeerInfo {
             endpoint_id: test_endpoint_id(4),
@@ -322,9 +404,11 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: now,
+            relay_url: None,
+            relay_url_last_success: None,
         };
         assert!(!stale_peer.has_fresh_address());
-        
+
         // No address
         let no_addr_peer = PeerInfo {
             endpoint_id: test_endpoint_id(5),
@@ -333,6 +417,8 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: now,
+            relay_url: None,
+            relay_url_last_success: None,
         };
         assert!(!no_addr_peer.has_fresh_address());
     }
@@ -350,6 +436,8 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: old_time,
+            relay_url: None,
+            relay_url_last_success: None,
         };
         upsert_peer(&conn, &peer).unwrap();
         
@@ -372,9 +460,11 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: current_timestamp(),
+            relay_url: None,
+            relay_url_last_success: None,
         };
         upsert_peer(&conn, &peer).unwrap();
-        
+
         update_peer_address(&conn, &endpoint_id, "10.0.0.1:4433").unwrap();
         
         let retrieved = get_peer(&conn, &endpoint_id).unwrap().unwrap();
@@ -394,11 +484,13 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: current_timestamp(),
+            relay_url: None,
+            relay_url_last_success: None,
         };
         upsert_peer(&conn, &peer).unwrap();
-        
+
         assert!(get_peer(&conn, &endpoint_id).unwrap().is_some());
-        
+
         delete_peer(&conn, &endpoint_id).unwrap();
         
         assert!(get_peer(&conn, &endpoint_id).unwrap().is_none());
@@ -417,9 +509,11 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: now,
+            relay_url: None,
+            relay_url_last_success: None,
         };
         upsert_peer(&conn, &fresh).unwrap();
-        
+
         // Stale peer
         let stale = PeerInfo {
             endpoint_id: test_endpoint_id(10),
@@ -428,9 +522,11 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: now - 1000,
+            relay_url: None,
+            relay_url_last_success: None,
         };
         upsert_peer(&conn, &stale).unwrap();
-        
+
         let stale_peers = get_stale_peers(&conn, now - 500).unwrap();
         assert_eq!(stale_peers.len(), 1);
         assert_eq!(stale_peers[0], test_endpoint_id(10));
@@ -449,9 +545,11 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: now,
+            relay_url: None,
+            relay_url_last_success: None,
         };
         upsert_peer(&conn, &fresh).unwrap();
-        
+
         // Peer with stale address
         let stale = PeerInfo {
             endpoint_id: test_endpoint_id(12),
@@ -460,9 +558,11 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: now,
+            relay_url: None,
+            relay_url_last_success: None,
         };
         upsert_peer(&conn, &stale).unwrap();
-        
+
         // Peer with no address
         let no_addr = PeerInfo {
             endpoint_id: test_endpoint_id(13),
@@ -471,6 +571,8 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: now,
+            relay_url: None,
+            relay_url_last_success: None,
         };
         upsert_peer(&conn, &no_addr).unwrap();
         
@@ -492,6 +594,8 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: now,
+            relay_url: None,
+            relay_url_last_success: None,
         };
         upsert_peer(&conn, &recent).unwrap();
 
@@ -503,6 +607,8 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: now - PEER_RETENTION_SECS - 1000, // 3 months + buffer
+            relay_url: None,
+            relay_url_last_success: None,
         };
         upsert_peer(&conn, &stale).unwrap();
 

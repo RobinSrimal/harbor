@@ -7,25 +7,35 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use iroh::endpoint::Connection;
+use iroh::Endpoint;
 use rusqlite::Connection as DbConnection;
 use tokio::sync::Mutex;
 use tracing::info;
 
 use super::internal::api::{
-    ApiProtocol, AddCandidates, FindClosest, GetNodeRelayUrls, GetRoutingTable,
-    HandleFindNodeRequest, Lookup, NodesDead, NodesSeen, RandomLookup, SelfLookup,
-    SetNodeRelayUrls,
+    ApiProtocol, AddCandidates, ConfirmRelayUrls, FindClosest, GetNodeRelayUrls,
+    GetRoutingTable, HandleFindNodeRequest, Lookup, NodesDead, NodesSeen, RandomLookup,
+    SelfLookup, SetNodeRelayUrls,
 };
+use super::internal::bootstrap::{bootstrap_dial_info, bootstrap_node_ids};
+use super::internal::config::{create_dht_actor_with_buckets, DhtConfig};
 use super::internal::distance::Id;
-use super::internal::pool::{DhtPool, DhtPoolError as PoolError, DialInfo};
+use super::internal::pool::{DhtPool, DhtPoolConfig, DhtPoolError as PoolError, DialInfo};
+use super::internal::routing::Buckets;
 use super::protocol::{FindNode, FindNodeResponse, NodeInfo, RpcProtocol};
-use crate::data::dht::{clear_all_entries, current_timestamp, insert_dht_entry, upsert_peer, DhtEntry, PeerInfo};
+use crate::data::dht::{clear_all_entries, current_timestamp, insert_dht_entry, store_peer_relay_url_unverified, update_peer_relay_url, upsert_peer, DhtEntry, PeerInfo};
 use crate::network::rpc::ExistingConnection;
 
 /// DHT Service - the single entry point for all DHT operations
 ///
 /// Owns the connection pool and actor channel. All DHT operations
 /// (incoming handlers, outgoing RPCs, lookups) go through this service.
+impl std::fmt::Debug for DhtService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DhtService").finish_non_exhaustive()
+    }
+}
+
 pub struct DhtService {
     /// Connection pool for DHT peers
     pool: DhtPool,
@@ -33,16 +43,181 @@ pub struct DhtService {
     client: irpc::Client<ApiProtocol>,
     /// Database connection for persistence
     db: Arc<Mutex<DbConnection>>,
+    /// Our endpoint ID (for filtering self from DHT)
+    our_id: [u8; 32],
 }
 
 impl DhtService {
     /// Create a new DHT service
-    pub fn new(pool: DhtPool, client: irpc::Client<ApiProtocol>, db: Arc<Mutex<DbConnection>>) -> Arc<Self> {
+    pub fn new(pool: DhtPool, client: irpc::Client<ApiProtocol>, db: Arc<Mutex<DbConnection>>, our_id: [u8; 32]) -> Arc<Self> {
         Arc::new(Self {
             pool,
             client,
             db,
+            our_id,
         })
+    }
+
+    /// Initialize and start the DHT service, including pool, actor, and bootstrap registration.
+    ///
+    /// This encapsulates all DHT startup logic:
+    /// 1. Creates the connection pool
+    /// 2. Parses and registers bootstrap nodes
+    /// 3. Loads persisted routing table from DB
+    /// 4. Creates and spawns the DHT actor
+    /// 5. Restores relay URLs from DB
+    pub async fn start(
+        endpoint: Endpoint,
+        bootstrap_nodes: &[String],
+        db: Arc<Mutex<DbConnection>>,
+        our_id: [u8; 32],
+    ) -> Arc<Self> {
+        let local_dht_id = Id::new(our_id);
+        let dht_pool = DhtPool::new(endpoint.clone(), DhtPoolConfig::default());
+
+        // Parse and register bootstrap nodes from config
+        let mut bootstrap_ids: Vec<Id> = Vec::new();
+
+        for bootstrap_str in bootstrap_nodes {
+            let (endpoint_hex, relay_url) = if bootstrap_str.contains(':') {
+                if let Some(colon_pos) = bootstrap_str.find(':') {
+                    let first_part = &bootstrap_str[..colon_pos];
+                    if first_part.len() == 64 && first_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                        (
+                            first_part.to_string(),
+                            Some(bootstrap_str[colon_pos + 1..].to_string()),
+                        )
+                    } else {
+                        (bootstrap_str.clone(), None)
+                    }
+                } else {
+                    (bootstrap_str.clone(), None)
+                }
+            } else {
+                (bootstrap_str.clone(), None)
+            };
+
+            if let Ok(bytes) = hex::decode(&endpoint_hex) {
+                if bytes.len() == 32 {
+                    let mut id_bytes = [0u8; 32];
+                    id_bytes.copy_from_slice(&bytes);
+
+                    if let Ok(node_id) = iroh::EndpointId::from_bytes(&id_bytes) {
+                        let dial_info = if let Some(ref relay) = relay_url {
+                            DialInfo::from_node_id_with_relay(node_id, relay.clone())
+                        } else {
+                            DialInfo::from_node_id(node_id)
+                        };
+                        dht_pool.register_dial_info(dial_info).await;
+                        bootstrap_ids.push(Id::new(id_bytes));
+
+                        tracing::debug!(
+                            endpoint = %endpoint_hex[..16],
+                            relay = ?relay_url,
+                            "Registered bootstrap node"
+                        );
+                    }
+                }
+            }
+        }
+
+        // If no custom bootstrap nodes, use defaults
+        if bootstrap_ids.is_empty() {
+            for (node_id, relay_url) in bootstrap_dial_info() {
+                let dial_info = if let Some(relay) = relay_url {
+                    DialInfo::from_node_id_with_relay(node_id, relay)
+                } else {
+                    DialInfo::from_node_id(node_id)
+                };
+                dht_pool.register_dial_info(dial_info).await;
+            }
+            bootstrap_ids = bootstrap_node_ids()
+                .into_iter()
+                .map(Id::new)
+                .collect();
+        }
+
+        // Load persisted routing table and relay URLs from database
+        let (persisted_buckets, persisted_relay_urls): (Option<Buckets>, Vec<([u8; 32], String, Option<i64>)>) = {
+            let db_lock = db.lock().await;
+            match crate::data::dht::load_routing_table(&db_lock) {
+                Ok(bucket_vecs) => {
+                    let mut buckets = Buckets::new();
+                    let mut loaded_count = 0;
+                    for (idx, entries) in bucket_vecs.into_iter().enumerate() {
+                        if idx < super::BUCKET_COUNT {
+                            for id_bytes in entries {
+                                buckets
+                                    .get_mut(idx)
+                                    .add_node(Id::new(id_bytes));
+                                loaded_count += 1;
+                            }
+                        }
+                    }
+                    // Load relay URLs from peers table
+                    let relay_urls = crate::data::dht::load_routing_table_relay_urls(&db_lock)
+                        .unwrap_or_default();
+                    if loaded_count > 0 {
+                        info!(
+                            entries = loaded_count,
+                            relay_urls = relay_urls.len(),
+                            "DHT: loaded routing table from database"
+                        );
+                        (Some(buckets), relay_urls)
+                    } else {
+                        (None, Vec::new())
+                    }
+                }
+                Err(e) => {
+                    info!(error = %e, "DHT: no persisted routing table (starting fresh)");
+                    (None, Vec::new())
+                }
+            }
+        };
+
+        let bootstrap_count = bootstrap_ids.len();
+
+        let service_pool = dht_pool.clone();
+        let (mut dht_actor, dht_api_client) = create_dht_actor_with_buckets(
+            local_dht_id,
+            dht_pool,
+            DhtConfig::persistent(),
+            bootstrap_ids,
+            persisted_buckets,
+        );
+
+        let dht_service = Self::new(
+            service_pool,
+            dht_api_client,
+            db,
+            our_id,
+        );
+        dht_actor.set_service(WeakDhtService::new(&dht_service));
+        tokio::spawn(dht_actor.run());
+
+        // Restore relay URLs from database
+        if !persisted_relay_urls.is_empty() {
+            if let Err(e) = dht_service.set_node_relay_urls(persisted_relay_urls).await {
+                tracing::warn!(error = %e, "Failed to restore relay URLs from database");
+            }
+        }
+
+        info!(
+            bootstrap_count = bootstrap_count,
+            "DHT initialized with relay info"
+        );
+
+        dht_service
+    }
+
+    /// Get a reference to the database connection
+    pub(crate) fn db(&self) -> &Arc<Mutex<DbConnection>> {
+        &self.db
+    }
+
+    /// Get our endpoint ID
+    pub(crate) fn our_id(&self) -> [u8; 32] {
+        self.our_id
     }
 
     /// Get a reference to the connection pool
@@ -84,7 +259,7 @@ impl DhtService {
         requester: Option<[u8; 32]>,
         requester_relay_url: Option<String>,
     ) -> Result<FindNodeResponse, PoolError> {
-        let conn = self.pool.get_connection(dial_info).await?;
+        let (conn, _relay_confirmed) = self.pool.get_connection(dial_info).await?;
         Self::send_find_node_on_conn(conn.connection(), target, requester, requester_relay_url).await
     }
 
@@ -120,13 +295,18 @@ impl DhtService {
     }
 
     /// Get relay URLs for all known nodes (for persistence)
-    pub async fn get_node_relay_urls(&self) -> Result<Vec<([u8; 32], String)>, irpc::Error> {
+    pub async fn get_node_relay_urls(&self) -> Result<Vec<([u8; 32], String, Option<i64>)>, irpc::Error> {
         self.client.rpc(GetNodeRelayUrls).await
     }
 
     /// Set relay URLs for nodes (for restoration from database)
-    pub async fn set_node_relay_urls(&self, relay_urls: Vec<([u8; 32], String)>) -> Result<(), irpc::Error> {
+    pub async fn set_node_relay_urls(&self, relay_urls: Vec<([u8; 32], String, Option<i64>)>) -> Result<(), irpc::Error> {
         self.client.notify(SetNodeRelayUrls { relay_urls }).await
+    }
+
+    /// Confirm relay URLs after outbound connection verification
+    pub async fn confirm_relay_urls(&self, confirmed: Vec<([u8; 32], String, Option<i64>)>) -> Result<(), irpc::Error> {
+        self.client.notify(ConfirmRelayUrls { confirmed }).await
     }
 
     /// Perform a self-lookup to populate nearby buckets
@@ -167,10 +347,11 @@ impl DhtService {
         let buckets = self.get_routing_table().await
             .map_err(|e| DhtServiceError::Actor(e.to_string()))?;
 
-        // Get relay URLs for nodes
-        let relay_urls: HashMap<[u8; 32], String> = self.get_node_relay_urls().await
+        // Get relay URLs for nodes (with verification timestamps)
+        let relay_urls: HashMap<[u8; 32], (String, Option<i64>)> = self.get_node_relay_urls().await
             .map_err(|e| DhtServiceError::Actor(e.to_string()))?
             .into_iter()
+            .map(|(id, url, verified_at)| (id, (url, verified_at)))
             .collect();
 
         let timestamp = current_timestamp();
@@ -193,6 +374,8 @@ impl DhtService {
                     last_latency_ms: None,
                     latency_timestamp: None,
                     last_seen: timestamp,
+                    relay_url: None,
+                    relay_url_last_success: None,
                 };
                 upsert_peer(&tx, &peer)
                     .map_err(|e| DhtServiceError::Database(e.to_string()))?;
@@ -201,10 +384,24 @@ impl DhtService {
                     endpoint_id: *endpoint_id,
                     bucket_index: bucket_idx as u8,
                     added_at: timestamp,
-                    relay_url: relay_urls.get(endpoint_id).cloned(),
                 };
                 insert_dht_entry(&tx, &entry)
                     .map_err(|e| DhtServiceError::Database(e.to_string()))?;
+
+                // Write relay URL to peers table if known
+                if let Some((relay_url, verified_at)) = relay_urls.get(endpoint_id) {
+                    match verified_at {
+                        Some(ts) => {
+                            update_peer_relay_url(&tx, endpoint_id, relay_url, *ts)
+                                .map_err(|e| DhtServiceError::Database(e.to_string()))?;
+                        }
+                        None => {
+                            store_peer_relay_url_unverified(&tx, endpoint_id, relay_url)
+                                .map_err(|e| DhtServiceError::Database(e.to_string()))?;
+                        }
+                    }
+                }
+
                 entry_count += 1;
             }
         }

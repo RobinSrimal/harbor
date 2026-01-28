@@ -12,7 +12,7 @@ use crate::data::dht::{count_all_entries as count_dht_entries, get_bucket_entrie
 use crate::data::harbor::{get_active_harbor_ids, get_harbor_cache_stats};
 use crate::data::send::get_packets_needing_replication;
 use crate::data::{
-    current_timestamp, get_all_topics, get_topic_members, get_topic_members_with_info,
+    current_timestamp, get_all_topics, get_topic_members, get_peer_relay_info,
     LocalIdentity,
 };
 use crate::network::dht::DhtService;
@@ -209,19 +209,25 @@ impl StatsService {
         let db = self.db.lock().await;
         let our_id = self.identity.public_key;
 
-        let members_info = get_topic_members_with_info(&db, topic_id)
+        let member_ids = get_topic_members(&db, topic_id)
             .map_err(|e| StatsError::Database(e.to_string()))?;
 
-        if members_info.is_empty() {
+        if member_ids.is_empty() {
             return Err(StatsError::TopicNotFound);
         }
 
-        let members: Vec<TopicMemberInfo> = members_info
+        let members: Vec<TopicMemberInfo> = member_ids
             .into_iter()
-            .map(|m| TopicMemberInfo {
-                endpoint_id: hex::encode(m.endpoint_id),
-                relay_url: m.relay_url,
-                is_self: m.endpoint_id == our_id,
+            .map(|endpoint_id| {
+                let relay_url = get_peer_relay_info(&db, &endpoint_id)
+                    .ok()
+                    .flatten()
+                    .map(|(url, _)| url);
+                TopicMemberInfo {
+                    endpoint_id: hex::encode(endpoint_id),
+                    relay_url,
+                    is_self: endpoint_id == our_id,
+                }
             })
             .collect();
 

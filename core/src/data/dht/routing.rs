@@ -14,14 +14,12 @@ pub struct DhtEntry {
     pub bucket_index: u8,
     /// Timestamp when added to routing table
     pub added_at: i64,
-    /// Optional relay URL for connectivity
-    pub relay_url: Option<String>,
 }
 
 /// Parse a DhtEntry from a database row
 fn parse_dht_row(row: &rusqlite::Row) -> rusqlite::Result<DhtEntry> {
     let id_vec: Vec<u8> = row.get(0)?;
-    
+
     if id_vec.len() != 32 {
         return Err(rusqlite::Error::InvalidColumnType(
             0,
@@ -29,28 +27,26 @@ fn parse_dht_row(row: &rusqlite::Row) -> rusqlite::Result<DhtEntry> {
             rusqlite::types::Type::Blob,
         ));
     }
-    
+
     let mut endpoint_id = [0u8; 32];
     endpoint_id.copy_from_slice(&id_vec);
-    
+
     Ok(DhtEntry {
         endpoint_id,
         bucket_index: row.get::<_, i32>(1)? as u8,
         added_at: row.get(2)?,
-        relay_url: row.get(3)?,
     })
 }
 
 /// Insert a DHT routing entry
 pub fn insert_dht_entry(conn: &Connection, entry: &DhtEntry) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO dht_routing (endpoint_id, bucket_index, added_at, relay_url)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR REPLACE INTO dht_routing (endpoint_id, bucket_index, added_at)
+         VALUES (?1, ?2, ?3)",
         params![
             entry.endpoint_id.as_slice(),
             entry.bucket_index as i32,
             entry.added_at,
-            entry.relay_url.as_deref(),
         ],
     )?;
     Ok(())
@@ -68,31 +64,31 @@ pub fn remove_dht_entry(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite::
 /// Get all entries in a specific bucket
 pub fn get_bucket_entries(conn: &Connection, bucket_index: u8) -> rusqlite::Result<Vec<DhtEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT endpoint_id, bucket_index, added_at, relay_url 
-         FROM dht_routing 
-         WHERE bucket_index = ?1 
+        "SELECT endpoint_id, bucket_index, added_at
+         FROM dht_routing
+         WHERE bucket_index = ?1
          ORDER BY added_at DESC",
     )?;
-    
+
     let entries = stmt
         .query_map([bucket_index as i32], |row| parse_dht_row(row))?
         .collect::<Result<Vec<_>, _>>()?;
-    
+
     Ok(entries)
 }
 
 /// Get all DHT routing entries, grouped by bucket
 pub fn get_all_entries(conn: &Connection) -> rusqlite::Result<Vec<DhtEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT endpoint_id, bucket_index, added_at, relay_url 
-         FROM dht_routing 
+        "SELECT endpoint_id, bucket_index, added_at
+         FROM dht_routing
          ORDER BY bucket_index, added_at DESC",
     )?;
-    
+
     let entries = stmt
         .query_map([], |row| parse_dht_row(row))?
         .collect::<Result<Vec<_>, _>>()?;
-    
+
     Ok(entries)
 }
 
@@ -126,34 +122,47 @@ pub fn clear_all_entries(conn: &Connection) -> rusqlite::Result<()> {
 /// Returns entries grouped by bucket index (0-255)
 pub fn load_routing_table(conn: &Connection) -> rusqlite::Result<Vec<Vec<[u8; 32]>>> {
     let mut buckets: Vec<Vec<[u8; 32]>> = vec![Vec::new(); 256];
-    
+
     let entries = get_all_entries(conn)?;
     for entry in entries {
         // bucket_index is u8, so always 0-255 - direct indexing is safe
         buckets[entry.bucket_index as usize].push(entry.endpoint_id);
     }
-    
+
     Ok(buckets)
 }
 
-/// Restore routing table with relay URLs from database
-/// Returns (buckets, relay_urls_map)
-pub fn load_routing_table_with_relays(conn: &Connection) -> rusqlite::Result<(Vec<Vec<[u8; 32]>>, Vec<([u8; 32], String)>)> {
-    let mut buckets: Vec<Vec<[u8; 32]>> = vec![Vec::new(); 256];
-    let mut relay_urls: Vec<([u8; 32], String)> = Vec::new();
-    
-    let entries = get_all_entries(conn)?;
-    for entry in entries {
-        // bucket_index is u8, so always 0-255 - direct indexing is safe
-        buckets[entry.bucket_index as usize].push(entry.endpoint_id);
-        
-        // Collect relay URLs if present
-        if let Some(url) = entry.relay_url {
-            relay_urls.push((entry.endpoint_id, url));
-        }
-    }
-    
-    Ok((buckets, relay_urls))
+/// Load relay URLs for routing table nodes from the peers table
+///
+/// Returns a list of (endpoint_id, relay_url) pairs for nodes that have
+/// a relay URL stored in the peers table.
+pub fn load_routing_table_relay_urls(conn: &Connection) -> rusqlite::Result<Vec<([u8; 32], String, Option<i64>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.endpoint_id, p.relay_url, p.relay_url_last_success
+         FROM dht_routing r
+         JOIN peers p ON r.endpoint_id = p.endpoint_id
+         WHERE p.relay_url IS NOT NULL",
+    )?;
+
+    let relay_urls = stmt
+        .query_map([], |row| {
+            let id_vec: Vec<u8> = row.get(0)?;
+            let relay_url: String = row.get(1)?;
+            let last_success: Option<i64> = row.get(2)?;
+            if id_vec.len() != 32 {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    0,
+                    "endpoint_id".to_string(),
+                    rusqlite::types::Type::Blob,
+                ));
+            }
+            let mut endpoint_id = [0u8; 32];
+            endpoint_id.copy_from_slice(&id_vec);
+            Ok((endpoint_id, relay_url, last_success))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(relay_urls)
 }
 
 #[cfg(test)]
@@ -179,6 +188,8 @@ mod tests {
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: current_timestamp(),
+            relay_url: None,
+            relay_url_last_success: None,
         };
         upsert_peer(conn, &peer).unwrap();
         endpoint_id
@@ -188,38 +199,35 @@ mod tests {
     fn test_insert_and_get_entry() {
         let conn = setup_db();
         let endpoint_id = create_test_peer(&conn, 1);
-        
+
         let entry = DhtEntry {
             endpoint_id,
             bucket_index: 42,
             added_at: current_timestamp(),
-            relay_url: Some("https://relay.example.com/".to_string()),
         };
-        
+
         insert_dht_entry(&conn, &entry).unwrap();
-        
+
         let entries = get_bucket_entries(&conn, 42).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].endpoint_id, endpoint_id);
         assert_eq!(entries[0].bucket_index, 42);
-        assert_eq!(entries[0].relay_url, entry.relay_url);
     }
 
     #[test]
     fn test_remove_entry() {
         let conn = setup_db();
         let endpoint_id = create_test_peer(&conn, 2);
-        
+
         let entry = DhtEntry {
             endpoint_id,
             bucket_index: 10,
             added_at: current_timestamp(),
-            relay_url: None,
         };
         insert_dht_entry(&conn, &entry).unwrap();
-        
+
         assert!(remove_dht_entry(&conn, &endpoint_id).unwrap());
-        
+
         let entries = get_bucket_entries(&conn, 10).unwrap();
         assert!(entries.is_empty());
     }
@@ -227,7 +235,7 @@ mod tests {
     #[test]
     fn test_get_all_entries() {
         let conn = setup_db();
-        
+
         // Add entries to multiple buckets
         for i in 0..5u8 {
             let endpoint_id = create_test_peer(&conn, i);
@@ -235,11 +243,10 @@ mod tests {
                 endpoint_id,
                 bucket_index: i * 10,
                 added_at: current_timestamp(),
-                relay_url: None,
             };
             insert_dht_entry(&conn, &entry).unwrap();
         }
-        
+
         let entries = get_all_entries(&conn).unwrap();
         assert_eq!(entries.len(), 5);
     }
@@ -248,7 +255,7 @@ mod tests {
     fn test_count_bucket_entries() {
         let conn = setup_db();
         let bucket = 50u8;
-        
+
         // Add 3 entries to the same bucket
         for i in 0..3u8 {
             let endpoint_id = create_test_peer(&conn, i);
@@ -256,11 +263,10 @@ mod tests {
                 endpoint_id,
                 bucket_index: bucket,
                 added_at: current_timestamp(),
-                relay_url: None,
             };
             insert_dht_entry(&conn, &entry).unwrap();
         }
-        
+
         assert_eq!(count_bucket_entries(&conn, bucket).unwrap(), 3);
         assert_eq!(count_bucket_entries(&conn, 51).unwrap(), 0);
     }
@@ -268,7 +274,7 @@ mod tests {
     #[test]
     fn test_load_routing_table() {
         let conn = setup_db();
-        
+
         // Add entries to buckets 0, 5, and 10
         for (i, bucket) in [0u8, 5, 10].iter().enumerate() {
             let endpoint_id = create_test_peer(&conn, i as u8);
@@ -276,13 +282,12 @@ mod tests {
                 endpoint_id,
                 bucket_index: *bucket,
                 added_at: current_timestamp(),
-                relay_url: None,
             };
             insert_dht_entry(&conn, &entry).unwrap();
         }
-        
+
         let buckets = load_routing_table(&conn).unwrap();
-        
+
         assert_eq!(buckets.len(), 256);
         assert_eq!(buckets[0].len(), 1);
         assert_eq!(buckets[5].len(), 1);
@@ -293,22 +298,21 @@ mod tests {
     #[test]
     fn test_clear_all_entries() {
         let conn = setup_db();
-        
+
         for i in 0..5u8 {
             let endpoint_id = create_test_peer(&conn, i);
             let entry = DhtEntry {
                 endpoint_id,
                 bucket_index: i,
                 added_at: current_timestamp(),
-                relay_url: None,
             };
             insert_dht_entry(&conn, &entry).unwrap();
         }
-        
+
         assert_eq!(count_all_entries(&conn).unwrap(), 5);
-        
+
         clear_all_entries(&conn).unwrap();
-        
+
         assert_eq!(count_all_entries(&conn).unwrap(), 0);
     }
 
@@ -316,36 +320,75 @@ mod tests {
     fn test_replace_on_insert() {
         let conn = setup_db();
         let endpoint_id = create_test_peer(&conn, 100);
-        
+
         // Insert with bucket 10
         let entry1 = DhtEntry {
             endpoint_id,
             bucket_index: 10,
             added_at: 1000,
-            relay_url: None,
         };
         insert_dht_entry(&conn, &entry1).unwrap();
-        
+
         // Insert same endpoint with bucket 20 (should replace)
         let entry2 = DhtEntry {
             endpoint_id,
             bucket_index: 20,
             added_at: 2000,
-            relay_url: Some("https://relay.example.com/".to_string()),
         };
         insert_dht_entry(&conn, &entry2).unwrap();
-        
+
         // Should only have one entry total
         assert_eq!(count_all_entries(&conn).unwrap(), 1);
-        
+
         // Should be in bucket 20
         let entries = get_bucket_entries(&conn, 20).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].endpoint_id, endpoint_id);
-        
+
         // Bucket 10 should be empty
         let entries = get_bucket_entries(&conn, 10).unwrap();
         assert!(entries.is_empty());
     }
-}
 
+    #[test]
+    fn test_load_routing_table_relay_urls() {
+        let conn = setup_db();
+
+        // Create peer with relay URL
+        let endpoint_id = [1u8; 32];
+        let peer = PeerInfo {
+            endpoint_id,
+            endpoint_address: None,
+            address_timestamp: None,
+            last_latency_ms: None,
+            latency_timestamp: None,
+            last_seen: current_timestamp(),
+            relay_url: Some("https://relay.example.com/".to_string()),
+            relay_url_last_success: Some(current_timestamp()),
+        };
+        upsert_peer(&conn, &peer).unwrap();
+        crate::data::update_peer_relay_url(&conn, &endpoint_id, "https://relay.example.com/", current_timestamp()).unwrap();
+
+        let entry = DhtEntry {
+            endpoint_id,
+            bucket_index: 5,
+            added_at: current_timestamp(),
+        };
+        insert_dht_entry(&conn, &entry).unwrap();
+
+        // Create peer without relay URL
+        let endpoint_id2 = create_test_peer(&conn, 2);
+        let entry2 = DhtEntry {
+            endpoint_id: endpoint_id2,
+            bucket_index: 10,
+            added_at: current_timestamp(),
+        };
+        insert_dht_entry(&conn, &entry2).unwrap();
+
+        let relay_urls = load_routing_table_relay_urls(&conn).unwrap();
+        assert_eq!(relay_urls.len(), 1);
+        assert_eq!(relay_urls[0].0, endpoint_id);
+        assert_eq!(relay_urls[0].1, "https://relay.example.com/");
+        assert!(relay_urls[0].2.is_some(), "should have relay_url_last_success");
+    }
+}

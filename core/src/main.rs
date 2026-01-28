@@ -330,6 +330,22 @@ async fn main() {
                                 "Sync response received"
                             );
                         }
+                        harbor_core::ProtocolEvent::StreamRequest(ev) => {
+                            info!(
+                                request_id = %hex::encode(&ev.request_id[..8]),
+                                name = %ev.name,
+                                "Stream request received"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::StreamAccepted(ev) => {
+                            info!(request_id = %hex::encode(&ev.request_id[..8]), "Stream accepted");
+                        }
+                        harbor_core::ProtocolEvent::StreamRejected(ev) => {
+                            info!(request_id = %hex::encode(&ev.request_id[..8]), "Stream rejected");
+                        }
+                        harbor_core::ProtocolEvent::StreamEnded(ev) => {
+                            info!(request_id = %hex::encode(&ev.request_id[..8]), "Stream ended");
+                        }
                     }
                 }
             } else {

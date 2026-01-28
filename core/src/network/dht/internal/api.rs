@@ -48,7 +48,8 @@ pub enum ApiProtocol {
     GetRoutingTable,
 
     /// Get node relay URLs (for persistence)
-    #[rpc(tx = oneshot::Sender<Vec<([u8; 32], String)>>)]
+    /// Returns (node_id, relay_url, verified_at) tuples
+    #[rpc(tx = oneshot::Sender<Vec<([u8; 32], String, Option<i64>)>>)]
     #[wrap(GetNodeRelayUrls)]
     GetNodeRelayUrls,
 
@@ -56,8 +57,16 @@ pub enum ApiProtocol {
     #[rpc(tx = NoSender)]
     #[wrap(SetNodeRelayUrls)]
     SetNodeRelayUrls {
-        /// List of (node_id, relay_url) pairs
-        relay_urls: Vec<([u8; 32], String)>,
+        /// List of (node_id, relay_url, verified_at) tuples
+        relay_urls: Vec<([u8; 32], String, Option<i64>)>,
+    },
+
+    /// Confirm relay URLs after successful outbound connections
+    #[rpc(tx = NoSender)]
+    #[wrap(ConfirmRelayUrls)]
+    ConfirmRelayUrls {
+        /// (node_id, relay_url, verified_at) — verified_at is Some if relay confirmed, None if DNS fallback
+        confirmed: Vec<([u8; 32], String, Option<i64>)>,
     },
 
     /// Perform a self-lookup to populate nearby buckets

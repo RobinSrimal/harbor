@@ -32,6 +32,8 @@ pub struct DialInfo {
     pub address_timestamp: Option<i64>,
     /// Optional relay URL for cross-network connectivity
     pub relay_url: Option<String>,
+    /// When the relay URL was last confirmed working
+    pub relay_url_last_success: Option<i64>,
 }
 
 impl DialInfo {
@@ -42,6 +44,7 @@ impl DialInfo {
             address: None,
             address_timestamp: None,
             relay_url: None,
+            relay_url_last_success: None,
         }
     }
 
@@ -52,6 +55,7 @@ impl DialInfo {
             address: None,
             address_timestamp: None,
             relay_url: Some(relay_url),
+            relay_url_last_success: None,
         }
     }
 
@@ -64,7 +68,8 @@ impl DialInfo {
             node_id,
             address: peer.endpoint_address.clone(),
             address_timestamp: peer.address_timestamp,
-            relay_url: None,
+            relay_url: peer.relay_url.clone(),
+            relay_url_last_success: peer.relay_url_last_success,
         })
     }
 
@@ -141,7 +146,9 @@ impl DhtPool {
     }
 
     /// Get or create a connection to a peer
-    pub async fn get_connection(&self, dial_info: &DialInfo) -> Result<ConnectionRef, PoolError> {
+    ///
+    /// Returns the connection and whether the relay URL was confirmed working.
+    pub async fn get_connection(&self, dial_info: &DialInfo) -> Result<(ConnectionRef, bool), PoolError> {
         let node_id = dial_info.node_id;
 
         // Merge with known node info (e.g., bootstrap relay URLs)
@@ -154,15 +161,23 @@ impl DhtPool {
                     address: dial_info.address.clone().or_else(|| known_info.address.clone()),
                     address_timestamp: dial_info.address_timestamp.or(known_info.address_timestamp),
                     relay_url: dial_info.relay_url.clone().or_else(|| known_info.relay_url.clone()),
+                    relay_url_last_success: dial_info.relay_url_last_success.or(known_info.relay_url_last_success),
                 }
             } else {
                 dial_info.clone()
             }
         };
 
-        // Build node address and delegate to generic pool
-        let node_addr = merged_dial_info.to_node_addr();
-        self.pool.get_connection(node_addr).await
+        // Parse relay URL for the smart connect primitive
+        let parsed_relay: Option<iroh::RelayUrl> = merged_dial_info.relay_url
+            .as_ref()
+            .and_then(|url| url.parse().ok());
+
+        self.pool.get_connection(
+            node_id,
+            parsed_relay.as_ref(),
+            merged_dial_info.relay_url_last_success,
+        ).await
     }
 
     /// Close a specific connection
@@ -206,6 +221,7 @@ mod tests {
             address: Some("192.168.1.1:4433".to_string()),
             address_timestamp: Some(now - 3600), // 1 hour ago
             relay_url: None,
+            relay_url_last_success: None,
         };
         assert!(fresh.has_fresh_address());
 
@@ -214,6 +230,7 @@ mod tests {
             address: Some("192.168.1.1:4433".to_string()),
             address_timestamp: Some(now - 100000), // > 24 hours ago
             relay_url: None,
+            relay_url_last_success: None,
         };
         assert!(!stale.has_fresh_address());
     }
@@ -239,6 +256,7 @@ mod tests {
             address: Some("192.168.1.1:4433".to_string()),
             address_timestamp: Some(now),
             relay_url: None,
+            relay_url_last_success: None,
         };
         let addr = info_with_addr.to_node_addr();
         assert_eq!(addr.id, node_id);
@@ -298,6 +316,8 @@ mod tests {
             last_latency_ms: Some(50),
             latency_timestamp: Some(12345),
             last_seen: 67890,
+            relay_url: None,
+            relay_url_last_success: None,
         };
 
         let info = DialInfo::from_peer_info(&peer);
@@ -332,6 +352,7 @@ mod tests {
             address: Some("".to_string()),
             address_timestamp: Some(now),
             relay_url: None,
+            relay_url_last_success: None,
         };
         assert!(!info.has_fresh_address());
     }
@@ -346,6 +367,7 @@ mod tests {
             address: None,
             address_timestamp: None,
             relay_url: Some("https://relay.example.com/".to_string()),
+            relay_url_last_success: None,
         };
 
         let addr = info.to_node_addr();
@@ -364,6 +386,7 @@ mod tests {
             address: None,
             address_timestamp: None,
             relay_url: Some("not a valid url".to_string()),
+            relay_url_last_success: None,
         };
 
         let addr = info.to_node_addr();
@@ -386,6 +409,7 @@ mod tests {
             address: Some("not.a.valid.address".to_string()),
             address_timestamp: Some(now),
             relay_url: None,
+            relay_url_last_success: None,
         };
 
         let addr = info.to_node_addr();

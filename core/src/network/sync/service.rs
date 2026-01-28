@@ -9,14 +9,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::{Endpoint, EndpointId};
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::data::{get_topic_members_with_info, LocalIdentity};
-use crate::network::harbor::protocol::HarborPacketType;
-use crate::network::send::SendService;
+use crate::data::dht::peer::{get_peer_relay_info, update_peer_relay_url, current_timestamp};
+use crate::data::{get_topic_members, LocalIdentity};
+use crate::network::connect;
+use crate::network::send::{SendService, SendOptions};
 use crate::network::send::topic_messages::{TopicMessage, SyncUpdateMessage};
 use crate::protocol::{MemberInfo, ProtocolError, ProtocolEvent, SyncRequestEvent, SyncResponseEvent};
 
@@ -80,6 +81,12 @@ const MAX_MESSAGE_SIZE: usize = 512 * 1024;
 ///
 /// Owns incoming SYNC_ALPN handling and outgoing sync operations.
 /// Uses SendService for broadcasting updates/requests via the send protocol.
+impl std::fmt::Debug for SyncService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncService").finish_non_exhaustive()
+    }
+}
+
 pub struct SyncService {
     /// Iroh endpoint (for outgoing SYNC_ALPN connections)
     endpoint: Endpoint,
@@ -115,7 +122,7 @@ impl SyncService {
     }
 
     // ========== Incoming ==========
-    // handle_sync_connection is in handlers/incoming/sync.rs (impl SyncService)
+    // handle_sync_connection is in handlers/sync.rs (impl SyncService)
 
     /// Get the event sender (used by incoming handler)
     pub(crate) fn event_tx(&self) -> &mpsc::Sender<ProtocolEvent> {
@@ -146,26 +153,23 @@ impl SyncService {
         }
 
         // Get topic members
-        let members_with_info = {
+        let members = {
             let db = self.db.lock().await;
-            get_topic_members_with_info(&db, topic_id)
+            get_topic_members(&db, topic_id)
                 .map_err(|e| ProtocolError::Database(e.to_string()))?
         };
 
-        if members_with_info.is_empty() {
+        if members.is_empty() {
             return Err(ProtocolError::TopicNotFound);
         }
 
         let our_id = self.identity.public_key;
 
         // Get recipients (all members except us)
-        let recipients: Vec<MemberInfo> = members_with_info
+        let recipients: Vec<MemberInfo> = members
             .into_iter()
-            .filter(|m| m.endpoint_id != our_id)
-            .map(|m| MemberInfo {
-                endpoint_id: m.endpoint_id,
-                relay_url: m.relay_url,
-            })
+            .filter(|m| *m != our_id)
+            .map(|endpoint_id| MemberInfo::new(endpoint_id))
             .collect();
 
         if recipients.is_empty() {
@@ -178,7 +182,7 @@ impl SyncService {
 
         // Broadcast to all members via SendService
         self.send_service
-            .send_to_topic(topic_id, &encoded, &recipients, HarborPacketType::Content)
+            .send_to_topic(topic_id, &encoded, &recipients, SendOptions::content())
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
             .map(|_| ())
@@ -193,26 +197,23 @@ impl SyncService {
         topic_id: &[u8; 32],
     ) -> Result<(), ProtocolError> {
         // Get topic members
-        let members_with_info = {
+        let members = {
             let db = self.db.lock().await;
-            get_topic_members_with_info(&db, topic_id)
+            get_topic_members(&db, topic_id)
                 .map_err(|e| ProtocolError::Database(e.to_string()))?
         };
 
-        if members_with_info.is_empty() {
+        if members.is_empty() {
             return Err(ProtocolError::TopicNotFound);
         }
 
         let our_id = self.identity.public_key;
 
         // Get recipients (all members except us)
-        let recipients: Vec<MemberInfo> = members_with_info
+        let recipients: Vec<MemberInfo> = members
             .into_iter()
-            .filter(|m| m.endpoint_id != our_id)
-            .map(|m| MemberInfo {
-                endpoint_id: m.endpoint_id,
-                relay_url: m.relay_url,
-            })
+            .filter(|m| *m != our_id)
+            .map(|endpoint_id| MemberInfo::new(endpoint_id))
             .collect();
 
         if recipients.is_empty() {
@@ -231,7 +232,7 @@ impl SyncService {
 
         // Broadcast to all members via SendService
         self.send_service
-            .send_to_topic(topic_id, &encoded, &recipients, HarborPacketType::Content)
+            .send_to_topic(topic_id, &encoded, &recipients, SendOptions::content())
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
             .map(|_| ())
@@ -254,15 +255,29 @@ impl SyncService {
         let node_id = EndpointId::from_bytes(requester_id)
             .map_err(|e| ProtocolError::Network(format!("invalid node id: {}", e)))?;
 
-        let node_addr: EndpointAddr = node_id.into();
+        let relay_info = {
+            let db = self.db.lock().await;
+            get_peer_relay_info(&db, requester_id).unwrap_or(None)
+        };
+        let (relay_url_str, relay_last_success) = match &relay_info {
+            Some((url, ts)) => (Some(url.as_str()), *ts),
+            None => (None, None),
+        };
+        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
 
-        let conn = tokio::time::timeout(
-            self.config.connect_timeout,
-            self.endpoint.connect(node_addr, SYNC_ALPN),
+        let result = connect::connect(
+            &self.endpoint, node_id, parsed_relay.as_ref(), relay_last_success, SYNC_ALPN, self.config.connect_timeout,
         )
         .await
-        .map_err(|_| ProtocolError::Network("sync connect timeout".to_string()))?
         .map_err(|e| ProtocolError::Network(format!("connection failed: {}", e)))?;
+
+        let conn = result.connection;
+        if result.relay_url_confirmed {
+            if let Some(url) = &parsed_relay {
+                let db = self.db.lock().await;
+                let _ = update_peer_relay_url(&db, requester_id, &url.to_string(), current_timestamp());
+            }
+        }
 
         // Open unidirectional stream and send
         let mut send = conn

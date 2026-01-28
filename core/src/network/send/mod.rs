@@ -30,12 +30,11 @@ pub use protocol::{SEND_ALPN, Receipt};
 pub use service::SendConfig;
 
 // Outgoing (sending packets)
-pub use outgoing::{SendService, SendResult, SendError};
+pub use outgoing::{SendService, SendResult, SendError, SendOptions};
 
-// Incoming (receiving packets)
+// Incoming (types for receiving packets — logic is on SendService)
 pub use incoming::{
-    process_incoming_packet, ProcessResult, ProcessError,
-    receive_packet, process_receipt, ReceiveError,
+    ProcessResult, ProcessError, PacketSource, ReceiveError,
 };
 
 // Topic message types (payload format for Send packets)
@@ -43,4 +42,6 @@ pub use topic_messages::{
     get_verification_mode_from_payload, DecodeError as TopicMessageDecodeError,
     JoinMessage, LeaveMessage, MessageType as TopicMessageType, TopicMessage,
     FileAnnouncementMessage, CanSeedMessage, SyncUpdateMessage,
+    StreamRequestMessage, StreamAcceptMessage, StreamRejectMessage,
+    StreamQueryMessage, StreamActiveMessage, StreamEndedMessage,
 };

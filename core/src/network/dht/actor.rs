@@ -74,7 +74,8 @@ pub struct DhtActor {
     /// Timer for periodic candidate verification
     candidate_verify_ticker: Interval,
     /// Relay URLs for nodes we know about (used for FindNode responses)
-    node_relay_urls: HashMap<Id, String>,
+    /// Value: (relay_url, verified_at) where verified_at is Some(timestamp) if verified via outbound connection
+    node_relay_urls: HashMap<Id, (String, Option<i64>)>,
 }
 
 impl DhtActor {
@@ -239,7 +240,7 @@ impl DhtActor {
         );
 
         // Try to get/establish connection
-        let conn = self.pool.get_connection(&dial_info).await?;
+        let (conn, _relay_confirmed) = self.pool.get_connection(&dial_info).await?;
         
         // Send a FindNode RPC to verify the node is actually responsive
         // Use a random target - we don't care about the result, just that it responds
@@ -287,6 +288,13 @@ impl DhtActor {
             debug!(count = to_verify.len(), "verifying candidate nodes");
         }
 
+        // Collect known relay URLs for candidates being verified
+        let candidate_relay_urls: HashMap<Id, String> = to_verify.iter()
+            .filter_map(|id| {
+                self.node_relay_urls.get(id).map(|(url, _)| (*id, url.clone()))
+            })
+            .collect();
+
         // Verify each candidate by attempting connection and sending FindNode RPC
         let pool = self.pool.clone();
         let service = self.service.clone();
@@ -298,6 +306,8 @@ impl DhtActor {
         self.tasks.spawn(async move {
             let mut verified = Vec::new();
             let mut failed = Vec::new();
+            // Track relay URL confirmation results: (node_id, relay_url, verified_at)
+            let mut relay_confirmations: Vec<([u8; 32], String, Option<i64>)> = Vec::new();
 
             for id in to_verify {
                 let dial_info = DialInfo::from_node_id(
@@ -305,7 +315,7 @@ impl DhtActor {
                 );
 
                 match pool.get_connection(&dial_info).await {
-                    Ok(conn) => {
+                    Ok((conn, relay_confirmed)) => {
                         // Send a FindNode RPC to verify the node is actually responsive
                         let random_target = Id::new(rand::random());
                         let requester = if transient {
@@ -316,8 +326,18 @@ impl DhtActor {
 
                         match DhtService::send_find_node_on_conn(conn.connection(), random_target, requester, home_relay_url.clone()).await {
                             Ok(_) => {
-                                trace!(node = %id, "candidate verified - FindNode RPC succeeded");
+                                trace!(node = %id, relay_confirmed = relay_confirmed, "candidate verified - FindNode RPC succeeded");
                                 verified.push(*id.as_bytes());
+
+                                // Record relay URL verification result
+                                if let Some(relay_url) = candidate_relay_urls.get(&id) {
+                                    let verified_at = if relay_confirmed {
+                                        Some(crate::data::dht::peer::current_timestamp())
+                                    } else {
+                                        None // connected via DNS, relay URL is stale
+                                    };
+                                    relay_confirmations.push((*id.as_bytes(), relay_url.clone(), verified_at));
+                                }
                             }
                             Err(e) => {
                                 trace!(node = %id, error = %e, "candidate FindNode RPC failed");
@@ -338,6 +358,15 @@ impl DhtActor {
                 if let Some(ref svc_weak) = service {
                     if let Some(svc) = svc_weak.upgrade() {
                         svc.nodes_seen(&verified).await.ok();
+                    }
+                }
+            }
+
+            // Send relay URL confirmation results back to actor
+            if !relay_confirmations.is_empty() {
+                if let Some(ref svc_weak) = service {
+                    if let Some(svc) = svc_weak.upgrade() {
+                        svc.confirm_relay_urls(relay_confirmations).await.ok();
                     }
                 }
             }
@@ -449,20 +478,39 @@ impl DhtActor {
             }
 
             ApiMessage::GetNodeRelayUrls(msg) => {
-                let relay_urls: Vec<([u8; 32], String)> = self.node_relay_urls
+                let relay_urls: Vec<([u8; 32], String, Option<i64>)> = self.node_relay_urls
                     .iter()
-                    .map(|(id, url)| (*id.as_bytes(), url.clone()))
+                    .map(|(id, (url, verified_at))| (*id.as_bytes(), url.clone(), *verified_at))
                     .collect();
                 msg.tx.send(relay_urls).await.ok();
             }
 
             ApiMessage::SetNodeRelayUrls(msg) => {
                 // Restore relay URLs from database
-                for (id_bytes, url) in &msg.relay_urls {
+                for (id_bytes, url, verified_at) in &msg.relay_urls {
                     let id = Id::new(*id_bytes);
-                    self.node_relay_urls.insert(id, url.clone());
+                    self.node_relay_urls.insert(id, (url.clone(), *verified_at));
                 }
                 debug!(count = self.node_relay_urls.len(), "restored node relay URLs from database");
+            }
+
+            ApiMessage::ConfirmRelayUrls(msg) => {
+                for (id_bytes, url, verified_at) in &msg.confirmed {
+                    let id = Id::new(*id_bytes);
+                    match self.node_relay_urls.get(&id) {
+                        Some((existing_url, _)) if existing_url == url => {
+                            // Same URL — update verified_at
+                            self.node_relay_urls.insert(id, (url.clone(), *verified_at));
+                        }
+                        _ => {
+                            // URL changed or not present — store with new status
+                            self.node_relay_urls.insert(id, (url.clone(), *verified_at));
+                        }
+                    }
+                }
+                if !msg.confirmed.is_empty() {
+                    debug!(count = msg.confirmed.len(), "updated relay URL verification status");
+                }
             }
 
             ApiMessage::SelfLookup(msg) => {
@@ -526,15 +574,16 @@ impl DhtActor {
                                 use std::collections::hash_map::Entry;
                                 let is_new = match self.node_relay_urls.entry(id) {
                                     Entry::Vacant(e) => {
-                                        e.insert(relay_url.clone());
+                                        e.insert((relay_url.clone(), None)); // unverified
                                         true
                                     }
                                     Entry::Occupied(mut e) => {
-                                        if e.get() != relay_url {
-                                            e.insert(relay_url.clone());
+                                        let (existing_url, _) = e.get();
+                                        if existing_url != relay_url {
+                                            e.insert((relay_url.clone(), None)); // new URL, reset to unverified
                                             true
                                         } else {
-                                            false
+                                            false // same URL, keep existing verified_at
                                         }
                                     }
                                 };
@@ -562,7 +611,7 @@ impl DhtActor {
                 let nodes: Vec<NodeInfo> = closest
                     .iter()
                     .map(|id| {
-                        let relay_url = self.node_relay_urls.get(id).cloned();
+                        let relay_url = self.node_relay_urls.get(id).map(|(url, _)| url.clone());
                         NodeInfo::from_id_with_relay(id, relay_url)
                     })
                     .collect();

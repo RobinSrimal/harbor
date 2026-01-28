@@ -20,6 +20,18 @@ pub enum MessageType {
     SyncUpdate = 0x05,
     /// Sync request (asking peers for their state)
     SyncRequest = 0x06,
+    /// Live stream request
+    StreamRequest = 0x07,
+    /// Live stream accept
+    StreamAccept = 0x08,
+    /// Live stream reject
+    StreamReject = 0x09,
+    /// Live stream liveness query
+    StreamQuery = 0x0A,
+    /// Live stream is active (response to query)
+    StreamActive = 0x0B,
+    /// Live stream has ended (response to query)
+    StreamEnded = 0x0C,
 }
 
 impl MessageType {
@@ -40,6 +52,12 @@ impl MessageType {
             MessageType::CanSeed => VerificationMode::Full,
             MessageType::SyncUpdate => VerificationMode::Full,
             MessageType::SyncRequest => VerificationMode::Full,
+            MessageType::StreamRequest => VerificationMode::Full,
+            MessageType::StreamAccept => VerificationMode::Full,
+            MessageType::StreamReject => VerificationMode::Full,
+            MessageType::StreamQuery => VerificationMode::Full,
+            MessageType::StreamActive => VerificationMode::Full,
+            MessageType::StreamEnded => VerificationMode::Full,
         }
     }
 
@@ -61,6 +79,12 @@ impl TryFrom<u8> for MessageType {
             0x04 => Ok(MessageType::CanSeed),
             0x05 => Ok(MessageType::SyncUpdate),
             0x06 => Ok(MessageType::SyncRequest),
+            0x07 => Ok(MessageType::StreamRequest),
+            0x08 => Ok(MessageType::StreamAccept),
+            0x09 => Ok(MessageType::StreamReject),
+            0x0A => Ok(MessageType::StreamQuery),
+            0x0B => Ok(MessageType::StreamActive),
+            0x0C => Ok(MessageType::StreamEnded),
             _ => Err(()),
         }
     }
@@ -83,6 +107,18 @@ pub enum TopicMessage {
     SyncUpdate(SyncUpdateMessage),
     /// Sync request (asking peers for their current state)
     SyncRequest,
+    /// Live stream request (source → destination)
+    StreamRequest(StreamRequestMessage),
+    /// Live stream accept (destination → source)
+    StreamAccept(StreamAcceptMessage),
+    /// Live stream reject (destination → source)
+    StreamReject(StreamRejectMessage),
+    /// Live stream liveness query (destination → source, direct only)
+    StreamQuery(StreamQueryMessage),
+    /// Live stream is active (source → destination, direct only)
+    StreamActive(StreamActiveMessage),
+    /// Live stream has ended (source → destination, direct only)
+    StreamEnded(StreamEndedMessage),
 }
 
 /// CRDT sync update message (delta)
@@ -143,6 +179,48 @@ impl TopicMessage {
                 // No payload, just the type byte
                 vec![MessageType::SyncRequest as u8]
             }
+            TopicMessage::StreamRequest(msg) => {
+                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
+                let mut bytes = Vec::with_capacity(1 + payload.len());
+                bytes.push(MessageType::StreamRequest as u8);
+                bytes.extend_from_slice(&payload);
+                bytes
+            }
+            TopicMessage::StreamAccept(msg) => {
+                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
+                let mut bytes = Vec::with_capacity(1 + payload.len());
+                bytes.push(MessageType::StreamAccept as u8);
+                bytes.extend_from_slice(&payload);
+                bytes
+            }
+            TopicMessage::StreamReject(msg) => {
+                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
+                let mut bytes = Vec::with_capacity(1 + payload.len());
+                bytes.push(MessageType::StreamReject as u8);
+                bytes.extend_from_slice(&payload);
+                bytes
+            }
+            TopicMessage::StreamQuery(msg) => {
+                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
+                let mut bytes = Vec::with_capacity(1 + payload.len());
+                bytes.push(MessageType::StreamQuery as u8);
+                bytes.extend_from_slice(&payload);
+                bytes
+            }
+            TopicMessage::StreamActive(msg) => {
+                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
+                let mut bytes = Vec::with_capacity(1 + payload.len());
+                bytes.push(MessageType::StreamActive as u8);
+                bytes.extend_from_slice(&payload);
+                bytes
+            }
+            TopicMessage::StreamEnded(msg) => {
+                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
+                let mut bytes = Vec::with_capacity(1 + payload.len());
+                bytes.push(MessageType::StreamEnded as u8);
+                bytes.extend_from_slice(&payload);
+                bytes
+            }
         }
     }
 
@@ -188,6 +266,36 @@ impl TopicMessage {
                 // No payload
                 Ok(TopicMessage::SyncRequest)
             }
+            MessageType::StreamRequest => {
+                let msg: StreamRequestMessage = postcard::from_bytes(&bytes[1..])
+                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                Ok(TopicMessage::StreamRequest(msg))
+            }
+            MessageType::StreamAccept => {
+                let msg: StreamAcceptMessage = postcard::from_bytes(&bytes[1..])
+                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                Ok(TopicMessage::StreamAccept(msg))
+            }
+            MessageType::StreamReject => {
+                let msg: StreamRejectMessage = postcard::from_bytes(&bytes[1..])
+                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                Ok(TopicMessage::StreamReject(msg))
+            }
+            MessageType::StreamQuery => {
+                let msg: StreamQueryMessage = postcard::from_bytes(&bytes[1..])
+                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                Ok(TopicMessage::StreamQuery(msg))
+            }
+            MessageType::StreamActive => {
+                let msg: StreamActiveMessage = postcard::from_bytes(&bytes[1..])
+                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                Ok(TopicMessage::StreamActive(msg))
+            }
+            MessageType::StreamEnded => {
+                let msg: StreamEndedMessage = postcard::from_bytes(&bytes[1..])
+                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                Ok(TopicMessage::StreamEnded(msg))
+            }
         }
     }
 
@@ -220,6 +328,12 @@ impl TopicMessage {
             TopicMessage::CanSeed(_) => MessageType::CanSeed,
             TopicMessage::SyncUpdate(_) => MessageType::SyncUpdate,
             TopicMessage::SyncRequest => MessageType::SyncRequest,
+            TopicMessage::StreamRequest(_) => MessageType::StreamRequest,
+            TopicMessage::StreamAccept(_) => MessageType::StreamAccept,
+            TopicMessage::StreamReject(_) => MessageType::StreamReject,
+            TopicMessage::StreamQuery(_) => MessageType::StreamQuery,
+            TopicMessage::StreamActive(_) => MessageType::StreamActive,
+            TopicMessage::StreamEnded(_) => MessageType::StreamEnded,
         }
     }
 
@@ -354,6 +468,49 @@ impl CanSeedMessage {
     pub fn new(hash: [u8; 32], seeder_id: [u8; 32]) -> Self {
         Self { hash, seeder_id }
     }
+}
+
+/// Live stream request message
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamRequestMessage {
+    /// Unique stream session ID
+    pub request_id: [u8; 32],
+    /// Stream name (e.g., "camera", "screen")
+    pub name: String,
+    /// Serialized catalog metadata (codecs, renditions)
+    #[serde(with = "serde_bytes")]
+    pub catalog: Vec<u8>,
+}
+
+/// Live stream accept message
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamAcceptMessage {
+    pub request_id: [u8; 32],
+}
+
+/// Live stream reject message
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamRejectMessage {
+    pub request_id: [u8; 32],
+    pub reason: Option<String>,
+}
+
+/// Live stream liveness query message
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamQueryMessage {
+    pub request_id: [u8; 32],
+}
+
+/// Live stream active response message
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamActiveMessage {
+    pub request_id: [u8; 32],
+}
+
+/// Live stream ended response message
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamEndedMessage {
+    pub request_id: [u8; 32],
 }
 
 /// Error decoding a topic message
@@ -516,7 +673,13 @@ mod tests {
         assert_eq!(MessageType::try_from(0x04), Ok(MessageType::CanSeed));
         assert_eq!(MessageType::try_from(0x05), Ok(MessageType::SyncUpdate));
         assert_eq!(MessageType::try_from(0x06), Ok(MessageType::SyncRequest));
-        assert!(MessageType::try_from(0x07).is_err());
+        assert_eq!(MessageType::try_from(0x07), Ok(MessageType::StreamRequest));
+        assert_eq!(MessageType::try_from(0x08), Ok(MessageType::StreamAccept));
+        assert_eq!(MessageType::try_from(0x09), Ok(MessageType::StreamReject));
+        assert_eq!(MessageType::try_from(0x0A), Ok(MessageType::StreamQuery));
+        assert_eq!(MessageType::try_from(0x0B), Ok(MessageType::StreamActive));
+        assert_eq!(MessageType::try_from(0x0C), Ok(MessageType::StreamEnded));
+        assert!(MessageType::try_from(0x0D).is_err());
     }
 
     #[test]

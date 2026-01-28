@@ -11,22 +11,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::Endpoint;
+use iroh::protocol::Router;
 use rusqlite::Connection;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::info;
 
 use crate::data::{get_or_create_identity, start_db, LocalIdentity};
-use crate::network::dht::{
-    bootstrap_dial_info, bootstrap_node_ids, create_dht_actor_with_buckets,
-    Buckets, DhtConfig, DhtPool, DhtPoolConfig, DhtService, DialInfo, DHT_ALPN,
-    service::WeakDhtService,
-};
+use crate::network::dht::DhtService;
 use crate::data::BlobStore;
 use crate::network::harbor::HarborService;
-use crate::network::harbor::protocol::HARBOR_ALPN;
-use crate::network::send::{SendService, protocol::SEND_ALPN};
-use crate::network::share::{ShareConfig, ShareService, SHARE_ALPN};
-use crate::network::sync::{SyncService, SYNC_ALPN};
+use crate::network::live::LiveService;
+use crate::network::send::SendService;
+use crate::network::share::{ShareConfig, ShareService};
+use crate::network::sync::SyncService;
 use crate::network::topic::TopicService;
 
 use super::config::ProtocolConfig;
@@ -69,6 +66,8 @@ pub struct Protocol {
     pub(crate) share_service: Arc<ShareService>,
     /// Sync service for CRDT synchronization
     pub(crate) sync_service: Arc<SyncService>,
+    /// Live streaming service
+    pub(crate) live_service: Arc<LiveService>,
     /// Topic service for topic lifecycle
     pub(crate) topic_service: Arc<TopicService>,
     /// Stats service for monitoring
@@ -83,6 +82,8 @@ pub struct Protocol {
     pub(crate) tasks: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
     /// Shutdown signal sender
     shutdown_tx: mpsc::Sender<()>,
+    /// Iroh Router for ALPN-based connection dispatch
+    router: Router,
 }
 
 impl Protocol {
@@ -125,164 +126,24 @@ impl Protocol {
 
         // Create Iroh endpoint with our identity's secret key
         let secret_key = iroh::SecretKey::from_bytes(&identity.private_key);
-        let alpns = vec![
-            SEND_ALPN.to_vec(),
-            HARBOR_ALPN.to_vec(),
-            DHT_ALPN.to_vec(),
-            SHARE_ALPN.to_vec(),
-            SYNC_ALPN.to_vec(),
-        ];
         let endpoint = Endpoint::builder()
             .secret_key(secret_key)
-            .alpns(alpns)
             .bind()
             .await
             .map_err(|e| ProtocolError::StartFailed(format!("failed to create endpoint: {}", e)))?;
 
         info!(endpoint_id = %endpoint.id(), "Protocol started");
 
-        // Initialize DHT
-        let local_dht_id = crate::network::dht::Id::new(identity.public_key);
-        let dht_pool = DhtPool::new(endpoint.clone(), DhtPoolConfig::default());
-
-        // Parse and register bootstrap nodes from config
-        let mut bootstrap_ids: Vec<crate::network::dht::Id> = Vec::new();
-
-        for bootstrap_str in &config.bootstrap_nodes {
-            // Parse "endpoint_id" or "endpoint_id:relay_url" format
-            let (endpoint_hex, relay_url) = if bootstrap_str.contains(':') {
-                // Check if it's endpoint_id:relay_url format
-                if let Some(colon_pos) = bootstrap_str.find(':') {
-                    let first_part = &bootstrap_str[..colon_pos];
-                    if first_part.len() == 64 && first_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                        (
-                            first_part.to_string(),
-                            Some(bootstrap_str[colon_pos + 1..].to_string()),
-                        )
-                    } else {
-                        // Just an endpoint ID with colons (shouldn't happen, but handle it)
-                        (bootstrap_str.clone(), None)
-                    }
-                } else {
-                    (bootstrap_str.clone(), None)
-                }
-            } else {
-                (bootstrap_str.clone(), None)
-            };
-
-            // Parse endpoint ID from hex
-            if let Ok(bytes) = hex::decode(&endpoint_hex) {
-                if bytes.len() == 32 {
-                    let mut id_bytes = [0u8; 32];
-                    id_bytes.copy_from_slice(&bytes);
-
-                    // Create node ID
-                    if let Ok(node_id) = iroh::EndpointId::from_bytes(&id_bytes) {
-                        // Register dial info with relay URL if available
-                        let dial_info = if let Some(ref relay) = relay_url {
-                            DialInfo::from_node_id_with_relay(node_id, relay.clone())
-                        } else {
-                            DialInfo::from_node_id(node_id)
-                        };
-                        dht_pool.register_dial_info(dial_info).await;
-
-                        // Add to bootstrap IDs
-                        bootstrap_ids.push(crate::network::dht::Id::new(id_bytes));
-
-                        tracing::debug!(
-                            endpoint = %endpoint_hex[..16],
-                            relay = ?relay_url,
-                            "Registered bootstrap node"
-                        );
-                    }
-                }
-            }
-        }
-
-        // If no custom bootstrap nodes, use defaults
-        if bootstrap_ids.is_empty() {
-            for (node_id, relay_url) in bootstrap_dial_info() {
-                let dial_info = if let Some(relay) = relay_url {
-                    DialInfo::from_node_id_with_relay(node_id, relay)
-                } else {
-                    DialInfo::from_node_id(node_id)
-                };
-                dht_pool.register_dial_info(dial_info).await;
-            }
-            bootstrap_ids = bootstrap_node_ids()
-                .into_iter()
-                .map(crate::network::dht::Id::new)
-                .collect();
-        }
-
-        // Load persisted routing table and relay URLs from database
-        let (persisted_buckets, persisted_relay_urls): (Option<Buckets>, Vec<([u8; 32], String)>) = 
-            match crate::data::dht::load_routing_table_with_relays(&db) {
-                Ok((bucket_vecs, relay_urls)) => {
-                    // Convert Vec<Vec<[u8; 32]>> to Buckets
-                    let mut buckets = Buckets::new();
-                    let mut loaded_count = 0;
-                    for (idx, entries) in bucket_vecs.into_iter().enumerate() {
-                        if idx < crate::network::dht::BUCKET_COUNT {
-                            for id_bytes in entries {
-                                buckets
-                                    .get_mut(idx)
-                                    .add_node(crate::network::dht::Id::new(id_bytes));
-                                loaded_count += 1;
-                            }
-                        }
-                    }
-                    if loaded_count > 0 {
-                        info!(
-                            entries = loaded_count,
-                            relay_urls = relay_urls.len(),
-                            "DHT: loaded routing table from database"
-                        );
-                        (Some(buckets), relay_urls)
-                    } else {
-                        (None, Vec::new())
-                    }
-                }
-                Err(e) => {
-                    info!(error = %e, "DHT: no persisted routing table (starting fresh)");
-                    (None, Vec::new())
-                }
-            };
-
-        let bootstrap_count = bootstrap_ids.len();
-
         // Wrap db in Arc<Mutex<>> for sharing with services
         let db = Arc::new(Mutex::new(db));
 
-        let service_pool = dht_pool.clone();
-        let (mut dht_actor, dht_api_client) = create_dht_actor_with_buckets(
-            local_dht_id,
-            dht_pool,
-            DhtConfig::persistent(),
-            bootstrap_ids,
-            persisted_buckets,
-        );
-
-        // Create DhtService, set weak ref on actor, then spawn
-        let dht_service = DhtService::new(
-            service_pool,
-            dht_api_client,
+        // Initialize DHT
+        let dht_service = DhtService::start(
+            endpoint.clone(),
+            &config.bootstrap_nodes,
             db.clone(),
-        );
-        dht_actor.set_service(WeakDhtService::new(&dht_service));
-        tokio::spawn(dht_actor.run());
-
-        // Restore relay URLs from database
-        if !persisted_relay_urls.is_empty() {
-            if let Err(e) = dht_service.set_node_relay_urls(persisted_relay_urls).await {
-                tracing::warn!(error = %e, "Failed to restore relay URLs from database");
-            }
-        }
-
-        info!(
-            bootstrap_count = bootstrap_count,
-            "DHT initialized with relay info"
-        );
+            identity.public_key,
+        ).await;
 
         // Create event channel
         let (event_tx, event_rx) = mpsc::channel(1000);
@@ -355,6 +216,18 @@ impl Protocol {
             send_service.clone(),
         ));
 
+        // Initialize Live streaming service
+        let live_service = LiveService::new(
+            endpoint.clone(),
+            identity.clone(),
+            db.clone(),
+            event_tx.clone(),
+            send_service.clone(),
+        );
+
+        // Give SendService access to LiveService (for routing stream signaling)
+        send_service.set_live_service(live_service.clone()).await;
+
         // Initialize Topic service
         let topic_service = Arc::new(TopicService::new(
             endpoint.clone(),
@@ -371,6 +244,17 @@ impl Protocol {
             dht_service.clone(),
         ));
 
+        // Build the iroh Router for ALPN-based connection dispatch
+        let router = crate::handlers::build_router(
+            endpoint.clone(),
+            send_service.clone(),
+            dht_service.clone(),
+            harbor_service.clone(),
+            share_service.clone(),
+            sync_service.clone(),
+            live_service.clone(),
+        );
+
         let protocol = Self {
             config,
             endpoint,
@@ -381,6 +265,7 @@ impl Protocol {
             harbor_service,
             share_service,
             sync_service,
+            live_service,
             topic_service,
             stats_service,
             event_tx,
@@ -388,6 +273,7 @@ impl Protocol {
             running: Arc::new(RwLock::new(true)),
             tasks: Arc::new(RwLock::new(Vec::new())),
             shutdown_tx,
+            router,
         };
 
         // Start background tasks
@@ -425,8 +311,8 @@ impl Protocol {
             }
         }
 
-        // Close endpoint
-        self.endpoint.close().await;
+        // Shutdown the Router (closes endpoint and all protocol handlers)
+        let _ = self.router.shutdown().await;
 
         info!("Protocol stopped");
     }

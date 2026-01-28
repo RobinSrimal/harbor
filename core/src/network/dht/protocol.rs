@@ -171,8 +171,6 @@ mod tests {
         assert!(response.nodes.is_empty());
     }
 
-    // Tests moved from handlers/outgoing/dht.rs
-
     #[test]
     fn test_find_node_request_no_requester() {
         let request = FindNode {

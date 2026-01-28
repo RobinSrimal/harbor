@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use iroh::endpoint::Connection;
-use iroh::Endpoint;
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -21,8 +20,9 @@ use crate::data::{
     get_all_topics, BlobState, BlobStore, CHUNK_SIZE,
 };
 use crate::network::share::protocol::{
-    ChunkRequest, ShareMessage, SHARE_ALPN,
+    ChunkRequest, ShareMessage,
 };
+use crate::network::share::ShareService;
 use crate::protocol::{ProtocolEvent, FileProgressEvent, FileCompleteEvent};
 
 /// Tracks retry state for a blob
@@ -73,7 +73,7 @@ impl BlobRetryState {
 /// Run the share pull background task
 pub async fn run_share_pull_task(
     db: Arc<Mutex<DbConnection>>,
-    endpoint: Endpoint,
+    share_service: Arc<ShareService>,
     our_id: [u8; 32],
     running: Arc<RwLock<bool>>,
     check_interval: Duration,
@@ -190,7 +190,7 @@ pub async fn run_share_pull_task(
             // Try to pull from peers (only from topic members to prevent spam)
             let success = pull_missing_chunks(
                 &db,
-                &endpoint,
+                &share_service,
                 &blob_store,
                 &hash,
                 &topic_id,
@@ -262,7 +262,7 @@ fn find_incomplete_blobs(db: &DbConnection) -> Vec<([u8; 32], [u8; 32], [u8; 32]
 /// Only pulls from topic members to prevent spam attacks
 async fn pull_missing_chunks(
     db: &Arc<Mutex<DbConnection>>,
-    endpoint: &Endpoint,
+    share_service: &Arc<ShareService>,
     blob_store: &BlobStore,
     hash: &[u8; 32],
     topic_id: &[u8; 32],
@@ -363,7 +363,7 @@ async fn pull_missing_chunks(
     let section_futures: Vec<_> = section_targets
         .into_iter()
         .map(|(section_id, chunks, target_id)| {
-            let endpoint = endpoint.clone();
+            let share_service = share_service.clone();
             let blob_store = blob_store.clone();
             let hash = *hash;
             let source_id = *source_id;
@@ -372,7 +372,7 @@ async fn pull_missing_chunks(
 
             async move {
                 pull_section(
-                    &endpoint,
+                    &share_service,
                     &blob_store,
                     &hash,
                     section_id,
@@ -408,7 +408,7 @@ async fn pull_missing_chunks(
 /// Pull a single section from a target peer
 /// Returns the number of chunks received
 async fn pull_section(
-    endpoint: &Endpoint,
+    share_service: &ShareService,
     blob_store: &BlobStore,
     hash: &[u8; 32],
     section_id: u8,
@@ -428,7 +428,14 @@ async fn pull_section(
     );
 
     // Try to connect to target
-    match connect_for_share(endpoint, &target_id).await {
+    let target_node_id = match iroh::EndpointId::from_bytes(&target_id) {
+        Ok(id) => id,
+        Err(e) => {
+            debug!(error = %e, "Invalid target node ID");
+            return 0;
+        }
+    };
+    match share_service.connect_for_share(target_node_id).await {
         Ok(conn) => {
             // Request chunks
             let result = request_chunks_from_peer(&conn, blob_store, hash, chunks, total_size).await;
@@ -466,7 +473,11 @@ async fn pull_section(
                         "Trying suggested peer (verified topic member)"
                     );
 
-                    if let Ok(suggested_conn) = connect_for_share(endpoint, &suggested_peer).await {
+                    let suggested_node_id = match iroh::EndpointId::from_bytes(&suggested_peer) {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    };
+                    if let Ok(suggested_conn) = share_service.connect_for_share(suggested_node_id).await {
                         let suggested_result =
                             request_chunks_from_peer(&suggested_conn, blob_store, hash, chunks, total_size)
                                 .await;
@@ -496,7 +507,11 @@ async fn pull_section(
             // If this wasn't the source, try the source as fallback
             // (source was already validated as topic member in caller)
             if target_id != *source_id {
-                if let Ok(conn) = connect_for_share(endpoint, source_id).await {
+                let source_node_id = match iroh::EndpointId::from_bytes(source_id) {
+                    Ok(id) => id,
+                    Err(_) => return chunks_received,
+                };
+                if let Ok(conn) = share_service.connect_for_share(source_node_id).await {
                     let result =
                         request_chunks_from_peer(&conn, blob_store, hash, chunks, total_size).await;
                     chunks_received += result.received;
@@ -506,25 +521,6 @@ async fn pull_section(
     }
 
     chunks_received
-}
-
-/// Connect to a peer using the Share ALPN
-async fn connect_for_share(
-    endpoint: &Endpoint,
-    peer_id: &[u8; 32],
-) -> Result<Connection, String> {
-    let node_id = iroh::EndpointId::from_bytes(peer_id)
-        .map_err(|e| format!("Invalid node ID: {}", e))?;
-
-    let node_addr = iroh::EndpointAddr::from(node_id);
-
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        endpoint.connect(node_addr, SHARE_ALPN),
-    )
-    .await
-    .map_err(|_| "Connection timeout".to_string())?
-    .map_err(|e| format!("Connection failed: {}", e))
 }
 
 /// Result of requesting chunks from a peer

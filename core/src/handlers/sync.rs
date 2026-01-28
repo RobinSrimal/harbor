@@ -9,10 +9,21 @@
 //! - Maintaining its own CRDT state
 //! - Responding to SyncRequest events via Protocol::respond_sync()
 
+use iroh::protocol::{AcceptError, ProtocolHandler};
 use tracing::{debug, info, warn};
 
 use crate::network::sync::service::{SyncService, process_incoming_sync_message};
 use crate::protocol::ProtocolError;
+
+impl ProtocolHandler for SyncService {
+    async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
+        let sender_id = *conn.remote_id().as_bytes();
+        if let Err(e) = self.handle_sync_connection(conn, sender_id).await {
+            debug!(error = %e, sender = %hex::encode(sender_id), "Sync connection handler error");
+        }
+        Ok(())
+    }
+}
 
 impl SyncService {
     /// Handle an incoming direct sync connection (SyncRequest or SyncResponse)

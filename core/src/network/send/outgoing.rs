@@ -12,19 +12,83 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
-use iroh::{Endpoint, EndpointId, EndpointAddr};
+use iroh::{Endpoint, EndpointId};
 use iroh::endpoint::Connection;
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
+use crate::data::dht::peer::{get_peer_relay_info, update_peer_relay_url, current_timestamp};
 use crate::data::send::store_outgoing_packet;
-use crate::data::{get_topic_members_with_info, LocalIdentity, WILDCARD_RECIPIENT};
+use crate::data::send::acknowledge_receipt as db_acknowledge_receipt;
+use crate::data::{
+    get_topic_members, LocalIdentity, WILDCARD_RECIPIENT,
+    add_topic_member, remove_topic_member, mark_pulled,
+    get_blob, insert_blob, init_blob_sections, record_peer_can_seed, CHUNK_SIZE,
+};
+use crate::network::connect;
 use crate::network::harbor::protocol::HarborPacketType;
+use crate::network::send::topic_messages::TopicMessage;
+use crate::network::send::topic_messages::get_verification_mode_from_payload;
+use crate::resilience::{PoWConfig, verify_pow};
+use crate::security::{
+    SendPacket, PacketError, verify_and_decrypt_packet, verify_and_decrypt_packet_with_mode,
+    send_target_id, VerificationMode,
+};
+use super::incoming::{ProcessError, ProcessResult, PacketSource, ReceiveError};
+
+/// Options controlling how a packet is sent and stored
+#[derive(Debug, Clone)]
+pub struct SendOptions {
+    /// Packet type for harbor storage semantics
+    pub packet_type: HarborPacketType,
+    /// If true, skip storing in outgoing table (direct delivery only, no harbor replication)
+    pub skip_harbor: bool,
+    /// Override default harbor TTL. None = use default (PACKET_LIFETIME_SECS)
+    pub ttl: Option<Duration>,
+}
+
+impl Default for SendOptions {
+    fn default() -> Self {
+        Self {
+            packet_type: HarborPacketType::Content,
+            skip_harbor: false,
+            ttl: None,
+        }
+    }
+}
+
+impl SendOptions {
+    /// Content packet with default harbor behavior
+    pub fn content() -> Self {
+        Self::default()
+    }
+
+    /// Direct-only delivery (no harbor storage)
+    pub fn direct_only() -> Self {
+        Self {
+            packet_type: HarborPacketType::Content,
+            skip_harbor: true,
+            ttl: None,
+        }
+    }
+
+    /// With a specific packet type
+    pub fn with_packet_type(mut self, packet_type: HarborPacketType) -> Self {
+        self.packet_type = packet_type;
+        self
+    }
+
+    /// With a custom harbor TTL
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+}
 use crate::network::rpc::ExistingConnection;
 use crate::protocol::{MemberInfo, ProtocolEvent};
 use crate::security::{
-    PacketError, create_packet, harbor_id_from_topic,
+    create_packet, harbor_id_from_topic,
 };
 use super::protocol::{SEND_ALPN, Receipt, DeliverPacket, SendRpcProtocol};
 
@@ -84,6 +148,12 @@ pub struct SendResult {
 ///
 /// Owns connection cache, identity, and provides both outgoing
 /// (send_to_topic) and incoming (handle_send_connection) operations.
+impl std::fmt::Debug for SendService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendService").finish_non_exhaustive()
+    }
+}
+
 pub struct SendService {
     /// Iroh endpoint
     endpoint: Endpoint,
@@ -97,6 +167,8 @@ pub struct SendService {
     send_timeout: Duration,
     /// Active connections cache
     connections: Arc<RwLock<HashMap<EndpointId, Connection>>>,
+    /// Live service for stream signaling routing (set after construction)
+    live_service: RwLock<Option<Arc<crate::network::live::LiveService>>>,
 }
 
 impl SendService {
@@ -114,7 +186,18 @@ impl SendService {
             event_tx,
             send_timeout: Duration::from_secs(5),
             connections: Arc::new(RwLock::new(HashMap::new())),
+            live_service: RwLock::new(None),
         }
+    }
+
+    /// Set the LiveService reference (called after both services are constructed)
+    pub async fn set_live_service(&self, live: Arc<crate::network::live::LiveService>) {
+        *self.live_service.write().await = Some(live);
+    }
+
+    /// Get the LiveService reference (if set)
+    pub(crate) async fn live_service(&self) -> Option<Arc<crate::network::live::LiveService>> {
+        self.live_service.read().await.clone()
     }
 
     /// Get our EndpointID
@@ -150,35 +233,32 @@ impl SendService {
     ) -> Result<(), SendError> {
         let our_id = self.endpoint_id();
 
-        // Get topic members with relay info
-        let members_with_info = {
+        // Get topic members
+        let members = {
             let db = self.db.lock().await;
-            get_topic_members_with_info(&db, topic_id)
+            get_topic_members(&db, topic_id)
                 .map_err(|e| SendError::Database(e.to_string()))?
         };
 
         trace!(
             topic = %hex::encode(topic_id),
-            member_count = members_with_info.len(),
+            member_count = members.len(),
             "sending message"
         );
 
-        if members_with_info.is_empty() {
+        if members.is_empty() {
             return Err(SendError::TopicNotFound);
         }
 
-        if !members_with_info.iter().any(|m| m.endpoint_id == our_id) {
+        if !members.iter().any(|m| *m == our_id) {
             return Err(SendError::NotMember);
         }
 
         // Get recipients (all members except us)
-        let recipients: Vec<MemberInfo> = members_with_info
+        let recipients: Vec<MemberInfo> = members
             .into_iter()
-            .filter(|m| m.endpoint_id != our_id)
-            .map(|m| MemberInfo {
-                endpoint_id: m.endpoint_id,
-                relay_url: m.relay_url,
-            })
+            .filter(|m| *m != our_id)
+            .map(|endpoint_id| MemberInfo::new(endpoint_id))
             .collect();
 
         if recipients.is_empty() {
@@ -190,7 +270,7 @@ impl SendService {
         let content_msg = super::topic_messages::TopicMessage::Content(payload.to_vec());
         let encoded_payload = content_msg.encode();
 
-        self.send_to_topic(topic_id, &encoded_payload, &recipients, HarborPacketType::Content)
+        self.send_to_topic(topic_id, &encoded_payload, &recipients, SendOptions::content())
             .await?;
 
         Ok(())
@@ -205,13 +285,13 @@ impl SendService {
     /// * `topic_id` - The topic to send on
     /// * `encoded_payload` - Pre-encoded TopicMessage bytes (from TopicMessage::encode())
     /// * `recipients` - MemberInfo for topic members to send to
-    /// * `packet_type` - Type of packet (Content, Join, Leave, etc.)
+    /// * `options` - Send options (packet type, harbor storage, TTL)
     pub async fn send_to_topic(
         &self,
         topic_id: &[u8; 32],
         encoded_payload: &[u8],
         recipients: &[MemberInfo],
-        packet_type: HarborPacketType,
+        options: SendOptions,
     ) -> Result<SendResult, SendError> {
         if recipients.is_empty() {
             return Err(SendError::NoRecipients);
@@ -233,8 +313,8 @@ impl SendService {
         let packet_bytes = packet.to_bytes()
             .map_err(SendError::PacketCreation)?;
 
-        // Store in outgoing table for tracking
-        {
+        // Store in outgoing table for tracking (unless skip_harbor)
+        if !options.skip_harbor {
             let mut db = self.db.lock().await;
             store_outgoing_packet(
                 &mut db,
@@ -243,7 +323,7 @@ impl SendService {
                 &harbor_id,
                 &packet_bytes,
                 &recipient_ids,
-                packet_type as u8,
+                options.packet_type as u8,
             ).map_err(|e| SendError::Database(e.to_string()))?;
         }
 
@@ -334,19 +414,8 @@ impl SendService {
         let node_id = EndpointId::from_bytes(&member.endpoint_id)
             .map_err(|e| SendError::Connection(e.to_string()))?;
 
-        // Build EndpointAddr with relay URL if available
-        let node_addr = if let Some(ref relay_url) = member.relay_url {
-            if let Ok(relay) = relay_url.parse::<iroh::RelayUrl>() {
-                EndpointAddr::new(node_id).with_relay_url(relay)
-            } else {
-                EndpointAddr::from(node_id)
-            }
-        } else {
-            EndpointAddr::from(node_id)
-        };
-
-        // Get or create connection
-        let conn = self.get_connection(node_id, node_addr).await?;
+        // Get or create connection (relay URL looked up from peers table)
+        let conn = self.get_connection(node_id).await?;
 
         // Send via irpc RPC - DeliverPacket request, Receipt response
         let client = irpc::Client::<SendRpcProtocol>::boxed(
@@ -361,7 +430,7 @@ impl SendService {
     }
 
     /// Get or create a connection to a node
-    async fn get_connection(&self, node_id: EndpointId, node_addr: EndpointAddr) -> Result<Connection, SendError> {
+    async fn get_connection(&self, node_id: EndpointId) -> Result<Connection, SendError> {
         // Check cache
         {
             let connections = self.connections.read().await;
@@ -372,14 +441,39 @@ impl SendService {
             }
         }
 
-        // Create new connection
-        let conn = tokio::time::timeout(
+        // Look up relay info from peers table
+        let endpoint_id_bytes: [u8; 32] = *node_id.as_bytes();
+        let relay_info = {
+            let db = self.db.lock().await;
+            get_peer_relay_info(&db, &endpoint_id_bytes).unwrap_or(None)
+        };
+        let (relay_url_str, relay_last_success) = match &relay_info {
+            Some((url, ts)) => (Some(url.as_str()), *ts),
+            None => (None, None),
+        };
+        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
+
+        // Create new connection via smart connect
+        let result = connect::connect(
+            &self.endpoint,
+            node_id,
+            parsed_relay.as_ref(),
+            relay_last_success,
+            SEND_ALPN,
             self.send_timeout,
-            self.endpoint.connect(node_addr, SEND_ALPN),
         )
         .await
-        .map_err(|_| SendError::Connection("timeout".to_string()))?
         .map_err(|e| SendError::Connection(e.to_string()))?;
+
+        let conn = result.connection;
+
+        // Update relay URL timestamp if confirmed
+        if result.relay_url_confirmed {
+            if let Some(url) = &parsed_relay {
+                let db = self.db.lock().await;
+                let _ = update_peer_relay_url(&db, &endpoint_id_bytes, &url.to_string(), current_timestamp());
+            }
+        }
 
         // Cache it
         {
@@ -396,6 +490,366 @@ impl SendService {
         if let Some(conn) = connections.remove(&node_id) {
             conn.close(0u32.into(), b"close");
         }
+    }
+
+    // ========== Incoming ==========
+
+    /// Process an incoming packet using service-owned db, event_tx, identity, and live_service.
+    pub async fn process_incoming_packet(
+        &self,
+        packet: &SendPacket,
+        topic_id: &[u8; 32],
+        sender_id: [u8; 32],
+        source: PacketSource,
+    ) -> Result<ProcessResult, ProcessError> {
+        let our_id = self.endpoint_id();
+        let db = &self.db;
+        let event_tx = &self.event_tx;
+        let live = self.live_service().await;
+
+        // Determine verification mode from payload prefix
+        let mode = get_verification_mode_from_payload(&packet.ciphertext)
+            .unwrap_or(VerificationMode::Full);
+
+        // Verify and decrypt
+        let plaintext = verify_and_decrypt_packet_with_mode(packet, topic_id, mode)
+            .map_err(|e| ProcessError::VerificationFailed(e.to_string()))?;
+
+        info!(plaintext_len = plaintext.len(), "packet decrypted successfully");
+
+        // Parse topic message
+        let topic_msg = match TopicMessage::decode(&plaintext) {
+            Ok(msg) => {
+                info!(msg_type = ?msg.message_type(), "decoded TopicMessage");
+                Some(msg)
+            }
+            Err(e) => {
+                warn!(
+                    topic = %hex::encode(&topic_id[..8]),
+                    error = %e,
+                    plaintext_len = plaintext.len(),
+                    first_byte = ?plaintext.first(),
+                    "failed to decode TopicMessage"
+                );
+                None
+            }
+        };
+
+        // Handle SyncUpdate - emit event for app to handle
+        if let Some(TopicMessage::SyncUpdate(ref sync_msg)) = topic_msg {
+            info!(
+                topic = %hex::encode(&topic_id[..8]),
+                sender = %hex::encode(&sender_id[..8]),
+                size = sync_msg.data.len(),
+                "SYNC: received update from peer"
+            );
+
+            let event = crate::protocol::ProtocolEvent::SyncUpdate(crate::protocol::SyncUpdateEvent {
+                topic_id: *topic_id,
+                sender_id,
+                data: sync_msg.data.clone(),
+            });
+            let _ = event_tx.send(event).await;
+
+            {
+                let db_lock = db.lock().await;
+                let _ = mark_pulled(&db_lock, topic_id, &packet.packet_id);
+            }
+
+            return Ok(ProcessResult {
+                receipt: super::protocol::Receipt::new(packet.packet_id, our_id),
+                content_payload: None,
+            });
+        }
+
+        // Handle SyncRequest - emit event for app to respond
+        if let Some(TopicMessage::SyncRequest) = topic_msg {
+            info!(
+                topic = %hex::encode(&topic_id[..8]),
+                sender = %hex::encode(&sender_id[..8]),
+                "SYNC: received sync request from peer"
+            );
+
+            let event = crate::protocol::ProtocolEvent::SyncRequest(crate::protocol::SyncRequestEvent {
+                topic_id: *topic_id,
+                sender_id,
+            });
+            let _ = event_tx.send(event).await;
+
+            {
+                let db_lock = db.lock().await;
+                let _ = mark_pulled(&db_lock, topic_id, &packet.packet_id);
+            }
+
+            return Ok(ProcessResult {
+                receipt: super::protocol::Receipt::new(packet.packet_id, our_id),
+                content_payload: None,
+            });
+        }
+
+        // Handle control messages
+        if let Some(ref msg) = topic_msg {
+            let db_lock = db.lock().await;
+            match msg {
+                TopicMessage::Join(join) => {
+                    if join.joiner != sender_id {
+                        warn!(
+                            joiner = %hex::encode(join.joiner),
+                            sender = %hex::encode(sender_id),
+                            "join message joiner doesn't match packet sender - ignoring"
+                        );
+                    } else {
+                        trace!(
+                            joiner = %hex::encode(join.joiner),
+                            relay = ?join.relay_url,
+                            topic = %hex::encode(topic_id),
+                            "received join message"
+                        );
+
+                        if let Err(e) = add_topic_member(
+                            &db_lock,
+                            topic_id,
+                            &join.joiner,
+                        ) {
+                            warn!(error = %e, "failed to add member");
+                        }
+
+                        if let Some(ref relay_url) = join.relay_url {
+                            let _ = crate::data::update_peer_relay_url(
+                                &db_lock,
+                                &join.joiner,
+                                relay_url,
+                                crate::data::current_timestamp(),
+                            );
+                        }
+
+                        debug!(
+                            joiner = hex::encode(join.joiner),
+                            relay = ?join.relay_url,
+                            "member joined"
+                        );
+                    }
+                }
+                TopicMessage::Leave(leave) => {
+                    if leave.leaver != sender_id {
+                        warn!(
+                            leaver = %hex::encode(leave.leaver),
+                            sender = %hex::encode(sender_id),
+                            "leave message leaver doesn't match packet sender - ignoring"
+                        );
+                    } else {
+                        if let Err(e) = remove_topic_member(&db_lock, topic_id, &leave.leaver) {
+                            warn!(error = %e, "failed to remove member");
+                        }
+                        debug!(leaver = hex::encode(leave.leaver), "member left");
+                    }
+                }
+                TopicMessage::FileAnnouncement(ann) => {
+                    if ann.source_id != sender_id {
+                        warn!(
+                            source = %hex::encode(ann.source_id),
+                            sender = %hex::encode(sender_id),
+                            "file announcement source doesn't match packet sender - ignoring"
+                        );
+                    } else {
+                        info!(
+                            hash = hex::encode(&ann.hash[..8]),
+                            source = hex::encode(&ann.source_id[..8]),
+                            name = ann.display_name,
+                            size = ann.total_size,
+                            chunks = ann.total_chunks,
+                            sections = ann.num_sections,
+                            "SHARE: Received file announcement"
+                        );
+
+                        let existing = get_blob(&db_lock, &ann.hash);
+                        if existing.is_ok() && existing.as_ref().unwrap().is_some() {
+                            debug!(
+                                hash = hex::encode(&ann.hash[..8]),
+                                "blob already known, skipping insert"
+                            );
+                        } else {
+                            if let Err(e) = insert_blob(
+                                &db_lock,
+                                &ann.hash,
+                                topic_id,
+                                &ann.source_id,
+                                &ann.display_name,
+                                ann.total_size,
+                                ann.num_sections,
+                            ) {
+                                warn!(error = %e, "failed to store blob metadata");
+                            } else {
+                                let total_chunks = ((ann.total_size + CHUNK_SIZE - 1)
+                                    / CHUNK_SIZE) as u32;
+                                if let Err(e) = init_blob_sections(
+                                    &db_lock,
+                                    &ann.hash,
+                                    ann.num_sections,
+                                    total_chunks,
+                                ) {
+                                    warn!(error = %e, "failed to init blob sections");
+                                }
+                                debug!(
+                                    hash = hex::encode(&ann.hash[..8]),
+                                    "blob stored, will pull via background task"
+                                );
+
+                                // Drop db_lock before sending event to avoid deadlock
+                                drop(db_lock);
+                                let file_event = crate::protocol::ProtocolEvent::FileAnnounced(crate::protocol::FileAnnouncedEvent {
+                                    topic_id: *topic_id,
+                                    source_id: ann.source_id,
+                                    hash: ann.hash,
+                                    display_name: ann.display_name.clone(),
+                                    total_size: ann.total_size,
+                                    total_chunks,
+                                    timestamp: crate::data::current_timestamp(),
+                                });
+                                if event_tx.send(file_event).await.is_err() {
+                                    debug!("event receiver dropped");
+                                }
+
+                                {
+                                    let db_lock = db.lock().await;
+                                    let _ = mark_pulled(&db_lock, topic_id, &packet.packet_id);
+                                }
+                                return Ok(ProcessResult {
+                                    receipt: super::protocol::Receipt::new(packet.packet_id, our_id),
+                                    content_payload: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                TopicMessage::CanSeed(can_seed) => {
+                    if can_seed.seeder_id != sender_id {
+                        warn!(
+                            seeder = %hex::encode(can_seed.seeder_id),
+                            sender = %hex::encode(sender_id),
+                            "can seed message seeder doesn't match packet sender - ignoring"
+                        );
+                    } else {
+                        info!(
+                            hash = hex::encode(&can_seed.hash[..8]),
+                            peer = hex::encode(&can_seed.seeder_id[..8]),
+                            "SHARE: Peer can seed file"
+                        );
+
+                        if let Err(e) = record_peer_can_seed(
+                            &db_lock,
+                            &can_seed.hash,
+                            &can_seed.seeder_id,
+                        ) {
+                            warn!(error = %e, "failed to record peer can seed");
+                        }
+                    }
+                }
+                TopicMessage::Content(_) => {}
+                TopicMessage::SyncUpdate(_) => {}
+                TopicMessage::SyncRequest => {}
+                // Stream signaling — route to LiveService
+                TopicMessage::StreamRequest(_)
+                | TopicMessage::StreamAccept(_)
+                | TopicMessage::StreamReject(_)
+                | TopicMessage::StreamQuery(_)
+                | TopicMessage::StreamActive(_)
+                | TopicMessage::StreamEnded(_) => {
+                    drop(db_lock);
+                    if let Some(ref live) = live {
+                        live.handle_signaling(msg, topic_id, sender_id, source).await;
+                    }
+
+                    {
+                        let db_lock = db.lock().await;
+                        let _ = mark_pulled(&db_lock, topic_id, &packet.packet_id);
+                    }
+                    return Ok(ProcessResult {
+                        receipt: super::protocol::Receipt::new(packet.packet_id, our_id),
+                        content_payload: None,
+                    });
+                }
+            }
+        }
+
+        // Extract content payload if this is a Content message
+        let content_payload = if let Some(TopicMessage::Content(data)) = topic_msg {
+            let event = crate::protocol::ProtocolEvent::Message(crate::protocol::IncomingMessage {
+                topic_id: *topic_id,
+                sender_id,
+                payload: data.clone(),
+                timestamp: crate::data::current_timestamp(),
+            });
+
+            if event_tx.send(event).await.is_err() {
+                debug!("event receiver dropped");
+            }
+            Some(data)
+        } else {
+            None
+        };
+
+        // Mark packet as seen (dedup)
+        {
+            let db_lock = db.lock().await;
+            let _ = mark_pulled(&db_lock, topic_id, &packet.packet_id);
+        }
+
+        Ok(ProcessResult {
+            receipt: super::protocol::Receipt::new(packet.packet_id, our_id),
+            content_payload,
+        })
+    }
+
+    /// Verify and decrypt a packet (no PoW verification)
+    pub fn receive_packet(
+        packet: &SendPacket,
+        topic_id: &[u8; 32],
+        our_id: [u8; 32],
+    ) -> Result<(Vec<u8>, super::protocol::Receipt), PacketError> {
+        let plaintext = verify_and_decrypt_packet(packet, topic_id)?;
+        let receipt = super::protocol::Receipt::new(packet.packet_id, our_id);
+        Ok((plaintext, receipt))
+    }
+
+    /// Verify and decrypt a packet with PoW verification
+    pub fn receive_packet_with_pow(
+        packet: &SendPacket,
+        proof_of_work: &crate::resilience::ProofOfWork,
+        topic_id: &[u8; 32],
+        our_id: [u8; 32],
+        pow_config: &PoWConfig,
+    ) -> Result<(Vec<u8>, super::protocol::Receipt), ReceiveError> {
+        if !pow_config.enabled {
+            let (plaintext, receipt) = Self::receive_packet(packet, topic_id, our_id)?;
+            return Ok((plaintext, receipt));
+        }
+
+        let expected_target = send_target_id(topic_id, &our_id);
+        if proof_of_work.harbor_id != expected_target {
+            return Err(ReceiveError::PoWTargetMismatch);
+        }
+
+        if proof_of_work.packet_id != packet.packet_id {
+            return Err(ReceiveError::PoWTargetMismatch);
+        }
+
+        let result = verify_pow(proof_of_work, pow_config);
+        if !result.is_valid() {
+            return Err(ReceiveError::InvalidPoW(result));
+        }
+
+        let plaintext = verify_and_decrypt_packet(packet, topic_id)?;
+        let receipt = super::protocol::Receipt::new(packet.packet_id, our_id);
+        Ok((plaintext, receipt))
+    }
+
+    /// Process an incoming receipt - update tracking in database
+    pub fn process_receipt(
+        receipt: &super::protocol::Receipt,
+        conn: &rusqlite::Connection,
+    ) -> Result<bool, rusqlite::Error> {
+        db_acknowledge_receipt(conn, &receipt.packet_id, &receipt.sender)
     }
 }
 

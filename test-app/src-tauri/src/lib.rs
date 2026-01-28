@@ -459,6 +459,11 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                             data: ev.data,
                         })
                     }
+                    // Stream events — not yet surfaced to test-app frontend
+                    ProtocolEvent::StreamRequest(_)
+                    | ProtocolEvent::StreamAccepted(_)
+                    | ProtocolEvent::StreamRejected(_)
+                    | ProtocolEvent::StreamEnded(_) => continue,
                 };
                 events.push(app_event);
             }

@@ -19,6 +19,7 @@ pub mod send;
 pub mod share;
 pub mod sync;
 pub mod topic;
+pub mod live;
 
 // Re-export commonly used items
 pub use service::ServiceDeps;
@@ -32,6 +33,7 @@ pub use sync::{
     SyncMessage, SyncMessageType, SyncUpdate, InitialSyncRequest, InitialSyncResponse,
     DecodeError as SyncDecodeError, SYNC_MESSAGE_PREFIX, SYNC_ALPN, SyncService,
 };
+pub use live::{LiveService, LiveError, LiveSession, LIVE_ALPN, STREAM_SIGNAL_TTL};
 
 // Topic message types (payload format for Send packets)
 pub use send::{
@@ -46,6 +48,8 @@ pub use send::{
     SyncUpdateMessage,
 };
 
+
+pub mod connect;
 
 // Sample files are kept for reference but not compiled
 // See src/network/connection_pool_sample.rs.bak and src/network/dht/dht_sample.rs.bak

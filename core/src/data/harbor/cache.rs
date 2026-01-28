@@ -130,8 +130,25 @@ pub fn cache_packet(
     recipients: &[[u8; 32]],
     synced: bool,
 ) -> rusqlite::Result<()> {
+    cache_packet_with_ttl(conn, packet_id, harbor_id, sender_id, packet_data, packet_type, recipients, synced, None)
+}
+
+/// Store a packet in the harbor cache with an optional custom TTL
+///
+/// If `ttl_secs` is None, uses the default PACKET_LIFETIME_SECS (3 months).
+pub fn cache_packet_with_ttl(
+    conn: &mut Connection,
+    packet_id: &[u8; 32],
+    harbor_id: &[u8; 32],
+    sender_id: &[u8; 32],
+    packet_data: &[u8],
+    packet_type: PacketType,
+    recipients: &[[u8; 32]],
+    synced: bool,
+    ttl_secs: Option<i64>,
+) -> rusqlite::Result<()> {
     let now = current_timestamp();
-    let expires_at = now + PACKET_LIFETIME_SECS;
+    let expires_at = now + ttl_secs.unwrap_or(PACKET_LIFETIME_SECS);
 
     let tx = conn.transaction()?;
 

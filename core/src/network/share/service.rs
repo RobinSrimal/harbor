@@ -11,18 +11,20 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::{Endpoint, EndpointId};
 use iroh::endpoint::Connection;
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, trace, warn};
 
+use crate::data::dht::peer::{get_peer_relay_info, update_peer_relay_url, current_timestamp};
+use crate::network::connect;
 use crate::network::send::SendService;
 
 use crate::data::{
     BlobMetadata, BlobState, BlobStore, CHUNK_SIZE, LocalIdentity, SectionTrace,
     add_blob_recipient, get_blob, get_blobs_for_topic, get_section_peer_suggestion,
-    get_section_traces, get_topic_members_with_info, init_blob_sections, insert_blob,
+    get_section_traces, get_topic_members, init_blob_sections, insert_blob,
     mark_blob_complete, record_section_received,
 };
 use super::protocol::{
@@ -215,6 +217,12 @@ struct ActiveTransfer {
 }
 
 /// Share service for the Harbor protocol
+impl std::fmt::Debug for ShareService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShareService").finish_non_exhaustive()
+    }
+}
+
 pub struct ShareService {
     /// Iroh endpoint
     endpoint: Endpoint,
@@ -636,15 +644,12 @@ impl ShareService {
         use crate::protocol::MemberInfo;
 
         let db_lock = self.db.lock().await;
-        let members = get_topic_members_with_info(&db_lock, topic_id)
+        let members = get_topic_members(&db_lock, topic_id)
             .map_err(|e| ShareError::Database(e.to_string()))?;
 
         Ok(members
             .into_iter()
-            .map(|m| MemberInfo {
-                endpoint_id: m.endpoint_id,
-                relay_url: m.relay_url,
-            })
+            .map(|endpoint_id| MemberInfo::new(endpoint_id))
             .collect())
     }
 
@@ -845,7 +850,7 @@ impl ShareService {
                 topic_id,
                 &plan.message_bytes,
                 &plan.recipients,
-                crate::network::harbor::protocol::HarborPacketType::Content,
+                crate::network::send::SendOptions::content(),
             )
             .await
             .map_err(|e| ShareError::Connection(e.to_string()))?;
@@ -860,6 +865,7 @@ impl ShareService {
         for push in plan.section_pushes {
             let service = self.blob_store.clone();
             let endpoint = self.endpoint.clone();
+            let db = self.db.clone();
             let hash_copy = hash;
 
             tokio::spawn(async move {
@@ -870,14 +876,22 @@ impl ShareService {
                         return;
                     }
                 };
-                let node_addr: EndpointAddr = node_id.into();
 
-                let conn = match tokio::time::timeout(
-                    Duration::from_secs(15),
-                    endpoint.connect(node_addr, SHARE_ALPN),
+                let relay_info = {
+                    let db = db.lock().await;
+                    get_peer_relay_info(&db, &push.peer_id).unwrap_or(None)
+                };
+                let (relay_url_str, relay_last_success) = match &relay_info {
+                    Some((url, ts)) => (Some(url.clone()), *ts),
+                    None => (None, None),
+                };
+                let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.as_deref().and_then(|u| u.parse().ok());
+
+                let result = match connect::connect(
+                    &endpoint, node_id, parsed_relay.as_ref(), relay_last_success, SHARE_ALPN, Duration::from_secs(15),
                 ).await {
-                    Ok(Ok(c)) => c,
-                    _ => {
+                    Ok(r) => r,
+                    Err(_) => {
                         warn!(
                             peer = hex::encode(&push.peer_id[..8]),
                             section = push.section_id,
@@ -886,6 +900,14 @@ impl ShareService {
                         return;
                     }
                 };
+
+                let conn = result.connection;
+                if result.relay_url_confirmed {
+                    if let Some(url) = &parsed_relay {
+                        let db = db.lock().await;
+                        let _ = update_peer_relay_url(&db, &push.peer_id, &url.to_string(), current_timestamp());
+                    }
+                }
 
                 for chunk_index in push.chunk_start..push.chunk_end {
                     let data = match service.read_chunk(&hash_copy, chunk_index) {
@@ -1088,15 +1110,32 @@ impl ShareService {
     // ========================================================================
 
     /// Connect to a peer for Share protocol
-    async fn connect_for_share(&self, node_id: EndpointId) -> Result<Connection, ShareError> {
-        let node_addr: EndpointAddr = node_id.into();
-        tokio::time::timeout(
-            self.config.connect_timeout,
-            self.endpoint.connect(node_addr, SHARE_ALPN),
+    pub async fn connect_for_share(&self, node_id: EndpointId) -> Result<Connection, ShareError> {
+        let endpoint_id_bytes: [u8; 32] = *node_id.as_bytes();
+        let relay_info = {
+            let db = self.db.lock().await;
+            get_peer_relay_info(&db, &endpoint_id_bytes).unwrap_or(None)
+        };
+        let (relay_url_str, relay_last_success) = match &relay_info {
+            Some((url, ts)) => (Some(url.as_str()), *ts),
+            None => (None, None),
+        };
+        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
+
+        let result = connect::connect(
+            &self.endpoint, node_id, parsed_relay.as_ref(), relay_last_success, SHARE_ALPN, self.config.connect_timeout,
         )
         .await
-        .map_err(|_| ShareError::Connection("timeout".to_string()))?
-        .map_err(|e| ShareError::Connection(e.to_string()))
+        .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        if result.relay_url_confirmed {
+            if let Some(url) = &parsed_relay {
+                let db = self.db.lock().await;
+                let _ = update_peer_relay_url(&db, &endpoint_id_bytes, &url.to_string(), current_timestamp());
+            }
+        }
+
+        Ok(result.connection)
     }
 
     /// Request a single chunk from a peer (1:1 RPC)
@@ -1193,7 +1232,7 @@ impl ShareService {
                 topic_id,
                 &topic_msg.encode(),
                 recipients,
-                crate::network::harbor::protocol::HarborPacketType::Content,
+                crate::network::send::SendOptions::content(),
             )
             .await
             .map_err(|e| ShareError::Connection(e.to_string()))?;
@@ -1216,15 +1255,30 @@ impl ShareService {
     ) -> Result<(), ShareError> {
         let node_id = EndpointId::from_bytes(peer_id)
             .map_err(|e| ShareError::Connection(e.to_string()))?;
-        let node_addr: EndpointAddr = node_id.into();
 
-        let conn = tokio::time::timeout(
-            Duration::from_secs(15),
-            self.endpoint.connect(node_addr, SHARE_ALPN),
+        let relay_info = {
+            let db = self.db.lock().await;
+            get_peer_relay_info(&db, peer_id).unwrap_or(None)
+        };
+        let (relay_url_str, relay_last_success) = match &relay_info {
+            Some((url, ts)) => (Some(url.as_str()), *ts),
+            None => (None, None),
+        };
+        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
+
+        let result = connect::connect(
+            &self.endpoint, node_id, parsed_relay.as_ref(), relay_last_success, SHARE_ALPN, Duration::from_secs(15),
         )
         .await
-        .map_err(|_| ShareError::Connection("timeout".to_string()))?
         .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        let conn = result.connection;
+        if result.relay_url_confirmed {
+            if let Some(url) = &parsed_relay {
+                let db = self.db.lock().await;
+                let _ = update_peer_relay_url(&db, peer_id, &url.to_string(), current_timestamp());
+            }
+        }
 
         info!(
             peer = hex::encode(&peer_id[..8]),
@@ -1416,14 +1470,14 @@ impl ShareService {
         // Get topic members
         let members = {
             let db_lock = self.db.lock().await;
-            get_topic_members_with_info(&db_lock, topic_id)
+            get_topic_members(&db_lock, topic_id)
                 .map_err(|e| ShareError::Database(e.to_string()))?
         };
 
         // Filter out self
         let other_members: Vec<_> = members
             .iter()
-            .filter(|m| m.endpoint_id != self.identity.public_key)
+            .filter(|m| **m != self.identity.public_key)
             .collect();
 
         // Create the FileAnnouncement message
@@ -1438,13 +1492,10 @@ impl ShareService {
 
         let message_bytes = topic_msg.encode();
 
-        // Convert to MemberInfo with relay URLs
+        // Convert to MemberInfo
         let recipients: Vec<MemberInfo> = members
             .iter()
-            .map(|m| MemberInfo {
-                endpoint_id: m.endpoint_id,
-                relay_url: m.relay_url.clone(),
-            })
+            .map(|endpoint_id| MemberInfo::new(*endpoint_id))
             .collect();
 
         // Calculate section pushes (up to 5 initial recipients)
@@ -1458,7 +1509,7 @@ impl ShareService {
             let chunk_end = std::cmp::min(chunk_start + chunks_per_section, total_chunks);
 
             section_pushes.push(SectionPush {
-                peer_id: member.endpoint_id,
+                peer_id: **member,
                 section_id,
                 chunk_start,
                 chunk_end,

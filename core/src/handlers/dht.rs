@@ -5,7 +5,8 @@
 
 use std::sync::Arc;
 
-use rusqlite::Connection;
+use iroh::protocol::{AcceptError, ProtocolHandler};
+use rusqlite::Connection as DbConnection;
 use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
@@ -16,18 +17,28 @@ use crate::network::dht::service::DhtService;
 
 use crate::protocol::ProtocolError;
 
+impl ProtocolHandler for DhtService {
+    async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
+        let sender_id = *conn.remote_id().as_bytes();
+        if let Err(e) = self.handle_dht_connection(conn, sender_id).await {
+            debug!(error = %e, sender = %hex::encode(sender_id), "DHT connection handler error");
+        }
+        Ok(())
+    }
+}
+
 impl DhtService {
     /// Handle an incoming DHT connection
     ///
     /// Uses irpc_iroh for wire framing (varint length-prefix + postcard).
     /// Processes FindNode requests via the actor and persists requesters to the database.
-    pub async fn handle_dht_connection(
+    pub(crate) async fn handle_dht_connection(
         &self,
         conn: iroh::endpoint::Connection,
-        db: Arc<Mutex<Connection>>,
         sender_id: [u8; 32],
-        our_id: [u8; 32],
     ) -> Result<(), ProtocolError> {
+        let our_id = self.our_id();
+        let db = self.db().clone();
         trace!(sender = %hex::encode(sender_id), "handling DHT connection");
 
         loop {
@@ -85,6 +96,8 @@ impl DhtService {
                     find_node_msg.tx.send(response).await.ok();
 
                     // Persist requester to database for recovery after restart
+                    // Note: relay URL is NOT written here — it flows through the in-memory
+                    // node_relay_urls map → save_routing_table → DB with correct freshness
                     if let Some(requester_id) = requester {
                         if requester_id != our_id {
                             let db_lock = db.lock().await;
@@ -92,7 +105,6 @@ impl DhtService {
                                 endpoint_id: requester_id,
                                 bucket_index: 0, // Will be recalculated on load
                                 added_at: current_timestamp(),
-                                relay_url: requester_relay_url,
                             };
                             // Ignore errors - best effort
                             let _ = crate::data::dht::insert_dht_entry(&db_lock, &entry);
@@ -107,7 +119,7 @@ impl DhtService {
 
     /// Helper: find closest nodes from database (fallback when DHT actor unavailable)
     async fn find_closest_from_db(
-        db: &Arc<Mutex<Connection>>,
+        db: &Arc<Mutex<DbConnection>>,
         target: &Id,
     ) -> FindNodeResponse {
         let db_lock = db.lock().await;

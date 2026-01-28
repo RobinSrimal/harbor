@@ -11,11 +11,13 @@
 //! - Maintenance (cleanup)
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use iroh::{Endpoint, EndpointId};
+use iroh::EndpointId;
 use rusqlite::Connection;
 use tracing::{debug, info, trace};
+
+use crate::data::dht::peer::{get_peer_relay_info, update_peer_relay_url, current_timestamp};
+use crate::network::connect;
 
 use crate::data::harbor::{
     cache_packet, cleanup_expired, get_active_harbor_ids, get_cached_packet, get_packets_for_sync,
@@ -349,22 +351,41 @@ impl HarborService {
 
     /// Send a StoreRequest to a Harbor Node
     pub async fn send_harbor_store(
-        endpoint: &Endpoint,
+        &self,
         harbor_node: &[u8; 32],
         request: &StoreRequest,
-        connect_timeout: Duration,
-        response_timeout: Duration,
     ) -> Result<bool, ProtocolError> {
+        let endpoint = self.endpoint();
+        let db = self.db();
+        let connect_timeout = self.connect_timeout;
+        let response_timeout = self.response_timeout;
+
         let node_id = EndpointId::from_bytes(harbor_node)
             .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
-        let conn = tokio::time::timeout(
-            connect_timeout,
-            endpoint.connect(node_id, HARBOR_ALPN),
+        let relay_info = {
+            let db = db.lock().await;
+            get_peer_relay_info(&db, harbor_node).unwrap_or(None)
+        };
+        let (relay_url_str, relay_last_success) = match &relay_info {
+            Some((url, ts)) => (Some(url.as_str()), *ts),
+            None => (None, None),
+        };
+        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
+
+        let result = connect::connect(
+            endpoint, node_id, parsed_relay.as_ref(), relay_last_success, HARBOR_ALPN, connect_timeout,
         )
         .await
-        .map_err(|_| ProtocolError::Network("connect timeout".to_string()))?
         .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        let conn = result.connection;
+        if result.relay_url_confirmed {
+            if let Some(url) = &parsed_relay {
+                let db = db.lock().await;
+                let _ = update_peer_relay_url(&db, harbor_node, &url.to_string(), current_timestamp());
+            }
+        }
 
         let message = HarborMessage::Store(request.clone());
         let encoded = message.encode();
@@ -400,22 +421,41 @@ impl HarborService {
 
     /// Send a PullRequest to a Harbor Node
     pub async fn send_harbor_pull(
-        endpoint: &Endpoint,
+        &self,
         harbor_node: &[u8; 32],
         request: &PullRequest,
-        connect_timeout: Duration,
-        response_timeout: Duration,
     ) -> Result<Vec<PacketInfo>, ProtocolError> {
+        let endpoint = self.endpoint();
+        let db = self.db();
+        let connect_timeout = self.connect_timeout;
+        let response_timeout = self.response_timeout;
+
         let node_id = EndpointId::from_bytes(harbor_node)
             .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
-        let conn = tokio::time::timeout(
-            connect_timeout,
-            endpoint.connect(node_id, HARBOR_ALPN),
+        let relay_info = {
+            let db = db.lock().await;
+            get_peer_relay_info(&db, harbor_node).unwrap_or(None)
+        };
+        let (relay_url_str, relay_last_success) = match &relay_info {
+            Some((url, ts)) => (Some(url.as_str()), *ts),
+            None => (None, None),
+        };
+        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
+
+        let result = connect::connect(
+            endpoint, node_id, parsed_relay.as_ref(), relay_last_success, HARBOR_ALPN, connect_timeout,
         )
         .await
-        .map_err(|_| ProtocolError::Network("connect timeout".to_string()))?
         .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        let conn = result.connection;
+        if result.relay_url_confirmed {
+            if let Some(url) = &parsed_relay {
+                let db = db.lock().await;
+                let _ = update_peer_relay_url(&db, harbor_node, &url.to_string(), current_timestamp());
+            }
+        }
 
         let message = HarborMessage::Pull(request.clone());
         let encoded = message.encode();
@@ -451,21 +491,40 @@ impl HarborService {
 
     /// Send a DeliveryAck to a Harbor Node (fire-and-forget)
     pub async fn send_harbor_ack(
-        endpoint: &Endpoint,
+        &self,
         harbor_node: &[u8; 32],
         ack: &DeliveryAck,
-        connect_timeout: Duration,
     ) -> Result<(), ProtocolError> {
+        let endpoint = self.endpoint();
+        let db = self.db();
+        let connect_timeout = self.connect_timeout;
+
         let node_id = EndpointId::from_bytes(harbor_node)
             .map_err(|e| ProtocolError::Network(e.to_string()))?;
 
-        let conn = tokio::time::timeout(
-            connect_timeout,
-            endpoint.connect(node_id, HARBOR_ALPN),
+        let relay_info = {
+            let db = db.lock().await;
+            get_peer_relay_info(&db, harbor_node).unwrap_or(None)
+        };
+        let (relay_url_str, relay_last_success) = match &relay_info {
+            Some((url, ts)) => (Some(url.as_str()), *ts),
+            None => (None, None),
+        };
+        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
+
+        let result = connect::connect(
+            endpoint, node_id, parsed_relay.as_ref(), relay_last_success, HARBOR_ALPN, connect_timeout,
         )
         .await
-        .map_err(|_| ProtocolError::Network("connect timeout".to_string()))?
         .map_err(|e| ProtocolError::Network(e.to_string()))?;
+
+        let conn = result.connection;
+        if result.relay_url_confirmed {
+            if let Some(url) = &parsed_relay {
+                let db = db.lock().await;
+                let _ = update_peer_relay_url(&db, harbor_node, &url.to_string(), current_timestamp());
+            }
+        }
 
         let message = HarborMessage::Ack(ack.clone());
         let encoded = message.encode();
@@ -483,23 +542,46 @@ impl HarborService {
 
     /// Send a SyncRequest to another Harbor Node
     pub async fn send_harbor_sync(
-        endpoint: &Endpoint,
+        &self,
         harbor_node: &[u8; 32],
         request: &SyncRequest,
     ) -> Result<SyncResponse, ProtocolError> {
+        let endpoint = self.endpoint();
+        let db = self.db();
+        let connect_timeout = self.connect_timeout;
+
         let node_hex = hex::encode(harbor_node);
         debug!(partner = %node_hex, "Harbor sync: connecting to partner");
 
         let node_id = EndpointId::from_bytes(harbor_node)
             .map_err(|_| ProtocolError::Network("invalid node id".into()))?;
 
-        let conn = endpoint
-            .connect(node_id, HARBOR_ALPN)
-            .await
-            .map_err(|e| {
-                debug!(partner = %node_hex, error = %e, "Harbor sync: connection failed");
-                ProtocolError::Network(e.to_string())
-            })?;
+        let relay_info = {
+            let db = db.lock().await;
+            get_peer_relay_info(&db, harbor_node).unwrap_or(None)
+        };
+        let (relay_url_str, relay_last_success) = match &relay_info {
+            Some((url, ts)) => (Some(url.as_str()), *ts),
+            None => (None, None),
+        };
+        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
+
+        let result = connect::connect(
+            endpoint, node_id, parsed_relay.as_ref(), relay_last_success, HARBOR_ALPN, connect_timeout,
+        )
+        .await
+        .map_err(|e| {
+            debug!(partner = %node_hex, error = %e, "Harbor sync: connection failed");
+            ProtocolError::Network(e.to_string())
+        })?;
+
+        let conn = result.connection;
+        if result.relay_url_confirmed {
+            if let Some(url) = &parsed_relay {
+                let db = db.lock().await;
+                let _ = update_peer_relay_url(&db, harbor_node, &url.to_string(), current_timestamp());
+            }
+        }
 
         debug!(partner = %node_hex, "Harbor sync: connection established, opening stream");
 

@@ -51,6 +51,7 @@ pub use error::ProtocolError;
 pub use events::{
     FileAnnouncedEvent, FileCompleteEvent, FileProgressEvent, IncomingMessage, ProtocolEvent,
     SyncUpdateEvent, SyncRequestEvent, SyncResponseEvent,
+    StreamRequestEvent, StreamAcceptedEvent, StreamRejectedEvent, StreamEndedEvent,
 };
 
 // Domain types (from TopicService)

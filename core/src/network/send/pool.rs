@@ -3,7 +3,7 @@
 //! Provides connection pooling for the Send protocol (messages, receipts, sync updates/requests).
 //! Uses the generic ConnectionPool with SEND_ALPN.
 
-use iroh::{Endpoint, EndpointId, EndpointAddr};
+use iroh::{Endpoint, EndpointId, RelayUrl};
 
 use crate::network::pool::{ConnectionPool, PoolConfig, PoolError, ConnectionRef};
 
@@ -34,8 +34,13 @@ impl SendPool {
     }
 
     /// Get or create a connection to a peer
-    pub async fn get_connection(&self, node_addr: EndpointAddr) -> Result<ConnectionRef, PoolError> {
-        self.pool.get_connection(node_addr).await
+    pub async fn get_connection(
+        &self,
+        node_id: EndpointId,
+        relay_url: Option<&RelayUrl>,
+        relay_url_last_success: Option<i64>,
+    ) -> Result<(ConnectionRef, bool), PoolError> {
+        self.pool.get_connection(node_id, relay_url, relay_url_last_success).await
     }
 
     /// Close a specific connection

@@ -35,6 +35,12 @@ use crate::resilience::{StorageConfig, StorageManager};
 /// - Rate limiting (per-connection and per-HarborID limits)
 /// - Proof of Work (requires computational work before storing)
 /// - Storage limits (total and per-HarborID quotas)
+impl std::fmt::Debug for HarborService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HarborService").finish_non_exhaustive()
+    }
+}
+
 pub struct HarborService {
     // === Primary resources (shared with other services) ===
     /// Iroh QUIC endpoint for outgoing connections
@@ -676,8 +682,6 @@ mod tests {
             );
         }
     }
-
-    // Tests moved from handlers/outgoing/harbor.rs
 
     #[test]
     fn test_harbor_connect_timeout_default_is_reasonable() {

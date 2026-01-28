@@ -6,12 +6,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::Endpoint;
-use rusqlite::Connection;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::network::dht::DhtService;
 use crate::network::harbor::HarborService;
 
 use crate::protocol::Protocol;
@@ -22,18 +19,17 @@ impl Protocol {
     /// Periodically syncs with other Harbor Nodes to ensure redundancy.
     /// Picks 1 random node from the top N closest to each HarborID.
     pub(crate) async fn run_harbor_sync_loop(
-        db: Arc<Mutex<Connection>>,
-        endpoint: Endpoint,
+        harbor_service: Arc<HarborService>,
         our_id: [u8; 32],
-        dht_service: Option<Arc<DhtService>>,
         running: Arc<RwLock<bool>>,
         sync_interval: Duration,
         sync_candidates: usize,
     ) {
         use rand::seq::SliceRandom;
 
-        let harbor_service = HarborService::without_rate_limiting(our_id);
-        
+        let db = harbor_service.db().clone();
+        let dht_service = harbor_service.dht_service().clone();
+
         info!(
             our_id = hex::encode(our_id),
             interval_secs = sync_interval.as_secs(),
@@ -130,7 +126,7 @@ impl Protocol {
                 );
 
                 // Connect and sync
-                match HarborService::send_harbor_sync(&endpoint, &sync_partner, &sync_request).await {
+                match harbor_service.send_harbor_sync(&sync_partner, &sync_request).await {
                     Ok(response) => {
                         let missing_count = response.missing_packets.len();
                         let delivery_updates = response.delivery_updates.len();

@@ -23,6 +23,14 @@ pub enum ProtocolEvent {
     SyncRequest(SyncRequestEvent),
     /// Response to our sync request (full CRDT state)
     SyncResponse(SyncResponseEvent),
+    /// A peer wants to stream to us (app should accept/reject)
+    StreamRequest(StreamRequestEvent),
+    /// Our stream request was accepted
+    StreamAccepted(StreamAcceptedEvent),
+    /// Our stream request was rejected
+    StreamRejected(StreamRejectedEvent),
+    /// An active stream has ended
+    StreamEnded(StreamEndedEvent),
 }
 
 /// An incoming message from the event bus
@@ -120,6 +128,48 @@ pub struct SyncResponseEvent {
     pub topic_id: [u8; 32],
     /// Full CRDT state bytes
     pub data: Vec<u8>,
+}
+
+/// Event: A peer wants to stream to us
+///
+/// Application should accept or reject via `protocol.accept_stream()` / `reject_stream()`.
+#[derive(Debug, Clone)]
+pub struct StreamRequestEvent {
+    /// The topic this stream is scoped to
+    pub topic_id: [u8; 32],
+    /// The peer requesting to stream
+    pub peer_id: [u8; 32],
+    /// Unique identifier for this stream request
+    pub request_id: [u8; 32],
+    /// Human-readable stream name
+    pub name: String,
+    /// Catalog metadata (codecs, renditions) serialized bytes
+    pub catalog: Vec<u8>,
+}
+
+/// Event: Our stream request was accepted by the destination
+#[derive(Debug, Clone)]
+pub struct StreamAcceptedEvent {
+    /// The request that was accepted
+    pub request_id: [u8; 32],
+}
+
+/// Event: Our stream request was rejected by the destination
+#[derive(Debug, Clone)]
+pub struct StreamRejectedEvent {
+    /// The request that was rejected
+    pub request_id: [u8; 32],
+    /// Optional reason for rejection
+    pub reason: Option<String>,
+}
+
+/// Event: An active stream has ended
+#[derive(Debug, Clone)]
+pub struct StreamEndedEvent {
+    /// The stream that ended
+    pub request_id: [u8; 32],
+    /// The peer whose stream ended
+    pub peer_id: [u8; 32],
 }
 
 #[cfg(test)]

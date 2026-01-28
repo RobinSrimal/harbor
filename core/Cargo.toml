@@ -55,6 +55,11 @@ dirs = "5.0"
 # Async utilities
 futures = "0.3"
 
+# Live streaming (MOQ over QUIC)
+moq-lite = "0.12.0"
+web-transport-iroh = "0.1.1"
+hang = "0.11.0"
+
 [dev-dependencies]
 tempfile = "3.10"
 

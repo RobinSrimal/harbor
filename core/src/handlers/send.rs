@@ -9,32 +9,39 @@
 //! - Delegating business logic to the service layer
 //! - Responding with receipts via irpc
 
-use std::sync::Arc;
-
-use rusqlite::Connection;
-use tokio::sync::Mutex;
+use iroh::protocol::{AcceptError, ProtocolHandler};
 use tracing::{debug, trace};
 
 use crate::data::get_topics_for_member;
 use crate::network::send::protocol::{Receipt, SendRpcMessage, SendRpcProtocol};
-use crate::network::send::{process_incoming_packet, ProcessError};
+use crate::network::send::{ProcessError, PacketSource};
 use crate::security::harbor_id_from_topic;
 
 use crate::network::send::SendService;
 use crate::protocol::ProtocolError;
+
+impl ProtocolHandler for SendService {
+    async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
+        let sender_id = *conn.remote_id().as_bytes();
+        if let Err(e) = self.handle_send_connection(conn, sender_id).await {
+            debug!(error = %e, sender = %hex::encode(sender_id), "Send connection handler error");
+        }
+        Ok(())
+    }
+}
 
 impl SendService {
     /// Handle a single incoming Send protocol connection
     ///
     /// Uses irpc for wire framing (varint length-prefix + postcard).
     /// Processes DeliverPacket requests and responds with Receipts.
-    pub async fn handle_send_connection(
+    pub(crate) async fn handle_send_connection(
         &self,
         conn: iroh::endpoint::Connection,
-        db: Arc<Mutex<Connection>>,
         sender_id: [u8; 32],
-        our_id: [u8; 32],
     ) -> Result<(), ProtocolError> {
+        let our_id = self.endpoint_id();
+        let db = self.db().clone();
         trace!(sender = %hex::encode(sender_id), "handling Send connection");
 
         loop {
@@ -79,7 +86,7 @@ impl SendService {
                         trace!(topic = %hex::encode(&topic_id[..8]), "found matching topic for packet");
 
                         // Delegate business logic to the service layer
-                        match process_incoming_packet(&packet, &topic_id, sender_id, our_id, &db, self.event_tx()).await {
+                        match self.process_incoming_packet(&packet, &topic_id, sender_id, PacketSource::Direct).await {
                             Ok(result) => {
                                 receipt = Some(result.receipt);
                                 break;

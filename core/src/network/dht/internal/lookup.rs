@@ -79,7 +79,7 @@ pub async fn iterative_find_node(
                 );
 
                 match pool.get_connection(&dial_info).await {
-                    Ok(conn) => {
+                    Ok((conn, _relay_confirmed)) => {
                         // Send actual FindNode RPC over the connection
                         match DhtService::send_find_node_on_conn(conn.connection(), target_for_rpc, requester_for_rpc, relay_url_for_rpc).await {
                             Ok(response) => {
@@ -125,7 +125,7 @@ pub async fn iterative_find_node(
                     // Add new candidates for lookup AND notify DHT about discovered nodes
                     // Also register relay URLs for future connectivity AND store for sharing
                     let mut discovered: Vec<[u8; 32]> = Vec::new();
-                    let mut discovered_relay_urls: Vec<([u8; 32], String)> = Vec::new();
+                    let mut discovered_relay_urls: Vec<([u8; 32], String, Option<i64>)> = Vec::new();
                     for info in node_infos {
                         let node = Id::new(info.node_id);
                         if node != local_id && !queried.contains(&node) {
@@ -139,8 +139,8 @@ pub async fn iterative_find_node(
                                     .expect("valid node id");
                                 let dial_info = DialInfo::from_node_id_with_relay(node_id, relay_url.clone());
                                 pool.register_dial_info(dial_info).await;
-                                // Store for sharing with other nodes in FindNode responses
-                                discovered_relay_urls.push((info.node_id, relay_url));
+                                // Store for sharing with other nodes in FindNode responses (unverified)
+                                discovered_relay_urls.push((info.node_id, relay_url, None));
                             }
                         }
                     }

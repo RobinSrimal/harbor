@@ -12,10 +12,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::{Endpoint, EndpointId, EndpointAddr};
+use iroh::{Endpoint, EndpointId, RelayUrl};
 use iroh::endpoint::Connection;
 use tokio::sync::{oneshot, RwLock};
 use tracing::{debug, trace, warn};
+
+use crate::network::connect;
 
 /// Configuration for a connection pool
 #[derive(Debug, Clone)]
@@ -133,10 +135,17 @@ impl ConnectionPool {
         self.alpn
     }
 
-    /// Get or create a connection to a peer
-    pub async fn get_connection(&self, node_addr: EndpointAddr) -> Result<ConnectionRef, PoolError> {
-        let node_id = node_addr.id;
-
+    /// Get or create a connection to a peer.
+    ///
+    /// Uses smart connection logic: if `relay_url` is fresh (based on
+    /// `relay_url_last_success`), connects via relay first, falling back
+    /// to DNS discovery. Returns whether the relay URL was confirmed working.
+    pub async fn get_connection(
+        &self,
+        node_id: EndpointId,
+        relay_url: Option<&RelayUrl>,
+        relay_url_last_success: Option<i64>,
+    ) -> Result<(ConnectionRef, bool), PoolError> {
         // Check for cached connection
         {
             let connections = self.connections.read().await;
@@ -148,23 +157,26 @@ impl ConnectionPool {
                         target = %node_id,
                         "reusing cached connection"
                     );
-                    return Ok(ConnectionRef {
+                    return Ok((ConnectionRef {
                         connection: cached.connection.clone(),
                         node_id,
                         _drop_notify: None,
-                    });
+                    }, false));
                 }
             }
         }
 
         // Need to establish new connection
-        self.connect(node_addr).await
+        self.connect_smart(node_id, relay_url, relay_url_last_success).await
     }
 
-    /// Establish a new connection
-    async fn connect(&self, node_addr: EndpointAddr) -> Result<ConnectionRef, PoolError> {
-        let node_id = node_addr.id;
-
+    /// Establish a new connection using smart relay/DNS logic.
+    async fn connect_smart(
+        &self,
+        node_id: EndpointId,
+        relay_url: Option<&RelayUrl>,
+        relay_url_last_success: Option<i64>,
+    ) -> Result<(ConnectionRef, bool), PoolError> {
         // Check connection limit
         {
             let connections = self.connections.read().await;
@@ -190,12 +202,21 @@ impl ConnectionPool {
             "establishing new connection"
         );
 
-        // Connect with timeout
-        let connect_fut = self.endpoint.connect(node_addr, self.alpn);
-        let connection = tokio::time::timeout(self.config.connect_timeout, connect_fut)
-            .await
-            .map_err(|_| PoolError::Timeout)?
-            .map_err(|e| PoolError::ConnectionFailed(e.to_string()))?;
+        let result = connect::connect(
+            &self.endpoint,
+            node_id,
+            relay_url,
+            relay_url_last_success,
+            self.alpn,
+            self.config.connect_timeout,
+        )
+        .await
+        .map_err(|e| match e {
+            connect::ConnectError::Timeout => PoolError::Timeout,
+            connect::ConnectError::Failed(msg) => PoolError::ConnectionFailed(msg),
+        })?;
+
+        let relay_url_confirmed = result.relay_url_confirmed;
 
         // Cache the connection
         {
@@ -203,7 +224,7 @@ impl ConnectionPool {
             let mut lru = self.lru_order.write().await;
 
             connections.insert(node_id, CachedConnection {
-                connection: connection.clone(),
+                connection: result.connection.clone(),
                 last_used: std::time::Instant::now(),
             });
 
@@ -212,11 +233,11 @@ impl ConnectionPool {
             lru.push_back(node_id);
         }
 
-        Ok(ConnectionRef {
-            connection,
+        Ok((ConnectionRef {
+            connection: result.connection,
             node_id,
             _drop_notify: None,
-        })
+        }, relay_url_confirmed))
     }
 
     /// Evict the least recently used idle connection
