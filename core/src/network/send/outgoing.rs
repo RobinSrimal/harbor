@@ -34,6 +34,7 @@ use crate::resilience::{PoWConfig, verify_pow};
 use crate::security::{
     SendPacket, PacketError, verify_and_decrypt_packet, verify_and_decrypt_packet_with_mode,
     send_target_id, VerificationMode,
+    create_dm_packet, verify_and_decrypt_dm_packet,
 };
 use super::incoming::{ProcessError, ProcessResult, PacketSource, ReceiveError};
 
@@ -226,7 +227,7 @@ impl SendService {
     ///
     /// Looks up topic members, validates membership, filters out self,
     /// encodes as Content message, and delivers to all recipients.
-    pub async fn send_content(
+    pub async fn send_topic(
         &self,
         topic_id: &[u8; 32],
         payload: &[u8],
@@ -272,6 +273,81 @@ impl SendService {
 
         self.send_to_topic(topic_id, &encoded_payload, &recipients, SendOptions::content())
             .await?;
+
+        Ok(())
+    }
+
+    /// Send a direct message to a single peer (API layer)
+    ///
+    /// Wraps the payload as DmMessage::Content and delegates to send_to_dm.
+    pub async fn send_dm(
+        &self,
+        recipient_id: &[u8; 32],
+        payload: &[u8],
+    ) -> Result<(), SendError> {
+        use crate::network::send::dm_messages::DmMessage;
+
+        let encoded = DmMessage::Content(payload.to_vec()).encode();
+        self.send_to_dm(recipient_id, &encoded).await
+    }
+
+    /// Send pre-encoded DM bytes to a single peer (service layer)
+    ///
+    /// Used by other services to send arbitrary DM message types
+    /// (e.g., FileAnnouncement, CanSeed, SyncUpdate).
+    /// Callers encode the DmMessage themselves.
+    ///
+    /// Encrypts with ECDH using the recipient's public key.
+    /// The packet is delivered directly and stored on harbor using the
+    /// recipient's endpoint_id as harbor_id.
+    pub async fn send_to_dm(
+        &self,
+        recipient_id: &[u8; 32],
+        encoded_payload: &[u8],
+    ) -> Result<(), SendError> {
+        let packet = create_dm_packet(
+            &self.identity.private_key,
+            &self.identity.public_key,
+            recipient_id,
+            encoded_payload,
+        )?;
+
+        let packet_id = packet.packet_id;
+        let harbor_id = *recipient_id;
+        let packet_bytes = packet.to_bytes().map_err(SendError::PacketCreation)?;
+
+        // Store in outgoing table for harbor replication
+        {
+            let mut db = self.db.lock().await;
+            store_outgoing_packet(
+                &mut db,
+                &packet_id,
+                recipient_id, // use recipient_id as "topic_id" for DM tracking
+                &harbor_id,
+                &packet_bytes,
+                &[*recipient_id],
+                HarborPacketType::Content as u8,
+            ).map_err(|e| SendError::Database(e.to_string()))?;
+        }
+
+        // Try direct delivery
+        let member = MemberInfo::new(*recipient_id);
+        match self.deliver_to_member(&member, packet).await {
+            Ok(receipt) => {
+                trace!(
+                    recipient = hex::encode(recipient_id),
+                    receipt_from = hex::encode(receipt.sender),
+                    "DM delivered with receipt"
+                );
+            }
+            Err(e) => {
+                debug!(
+                    recipient = hex::encode(recipient_id),
+                    error = %e,
+                    "DM direct delivery failed, will rely on harbor"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -672,7 +748,7 @@ impl SendService {
                             if let Err(e) = insert_blob(
                                 &db_lock,
                                 &ann.hash,
-                                topic_id,
+                                topic_id, // scope_id: topic scopes the blob
                                 &ann.source_id,
                                 &ann.display_name,
                                 ann.total_size,
@@ -749,12 +825,7 @@ impl SendService {
                 TopicMessage::SyncUpdate(_) => {}
                 TopicMessage::SyncRequest => {}
                 // Stream signaling — route to LiveService
-                TopicMessage::StreamRequest(_)
-                | TopicMessage::StreamAccept(_)
-                | TopicMessage::StreamReject(_)
-                | TopicMessage::StreamQuery(_)
-                | TopicMessage::StreamActive(_)
-                | TopicMessage::StreamEnded(_) => {
+                TopicMessage::StreamRequest(_) => {
                     drop(db_lock);
                     if let Some(ref live) = live {
                         live.handle_signaling(msg, topic_id, sender_id, source).await;
@@ -798,6 +869,85 @@ impl SendService {
         Ok(ProcessResult {
             receipt: super::protocol::Receipt::new(packet.packet_id, our_id),
             content_payload,
+        })
+    }
+
+    /// Process an incoming DM packet
+    pub async fn process_incoming_dm_packet(
+        &self,
+        packet: &SendPacket,
+    ) -> Result<ProcessResult, ProcessError> {
+        use crate::network::send::dm_messages::DmMessage;
+
+        let our_id = self.endpoint_id();
+
+        // Verify signature + ECDH decrypt
+        let plaintext = verify_and_decrypt_dm_packet(packet, &self.identity.private_key)
+            .map_err(|e| ProcessError::VerificationFailed(e.to_string()))?;
+
+        info!(plaintext_len = plaintext.len(), "DM packet decrypted");
+
+        // Decode DmMessage
+        let dm_msg = DmMessage::decode(&plaintext)
+            .map_err(|e| ProcessError::VerificationFailed(format!("DM decode: {}", e)))?;
+
+        match dm_msg {
+            DmMessage::Content(data) => {
+                let event = crate::protocol::ProtocolEvent::DmReceived(
+                    crate::protocol::DmReceivedEvent {
+                        sender_id: packet.endpoint_id,
+                        payload: data,
+                        timestamp: crate::data::current_timestamp(),
+                    },
+                );
+                let _ = self.event_tx.send(event).await;
+            }
+            DmMessage::SyncUpdate(data) => {
+                let event = crate::protocol::ProtocolEvent::DmSyncUpdate(
+                    crate::protocol::DmSyncUpdateEvent {
+                        sender_id: packet.endpoint_id,
+                        data,
+                    },
+                );
+                let _ = self.event_tx.send(event).await;
+            }
+            DmMessage::SyncRequest => {
+                let event = crate::protocol::ProtocolEvent::DmSyncRequest(
+                    crate::protocol::DmSyncRequestEvent {
+                        sender_id: packet.endpoint_id,
+                    },
+                );
+                let _ = self.event_tx.send(event).await;
+            }
+            DmMessage::FileAnnouncement(msg) => {
+                let event = crate::protocol::ProtocolEvent::DmFileAnnounced(
+                    crate::protocol::DmFileAnnouncedEvent {
+                        sender_id: packet.endpoint_id,
+                        hash: msg.hash,
+                        display_name: msg.display_name,
+                        total_size: msg.total_size,
+                        total_chunks: msg.total_chunks,
+                        num_sections: msg.num_sections,
+                        timestamp: crate::data::current_timestamp(),
+                    },
+                );
+                let _ = self.event_tx.send(event).await;
+            }
+            // DM stream signaling — route to LiveService
+            DmMessage::StreamAccept(_)
+            | DmMessage::StreamReject(_)
+            | DmMessage::StreamQuery(_)
+            | DmMessage::StreamActive(_)
+            | DmMessage::StreamEnded(_) => {
+                if let Some(live) = self.live_service().await {
+                    live.handle_dm_signaling(&dm_msg, packet.endpoint_id).await;
+                }
+            }
+        }
+
+        Ok(ProcessResult {
+            receipt: super::protocol::Receipt::new(packet.packet_id, our_id),
+            content_payload: None,
         })
     }
 

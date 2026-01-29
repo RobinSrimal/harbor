@@ -68,6 +68,20 @@ impl SendService {
                         "received DeliverPacket request"
                     );
 
+                    // Check if this is a DM packet
+                    if packet.is_dm() {
+                        let result = self.process_incoming_dm_packet(&packet).await;
+                        let response = match result {
+                            Ok(r) => r.receipt,
+                            Err(e) => {
+                                debug!(error = %e, "DM packet processing error");
+                                Receipt::new(packet.packet_id, our_id)
+                            }
+                        };
+                        deliver_msg.tx.send(response).await.ok();
+                        continue;
+                    }
+
                     // Find which topic this packet belongs to
                     let topics = {
                         let db_lock = db.lock().await;

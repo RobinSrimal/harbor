@@ -18,8 +18,9 @@ use crate::data::dht::peer::{get_peer_relay_info, update_peer_relay_url, current
 use crate::data::{get_topic_members, LocalIdentity};
 use crate::network::connect;
 use crate::network::send::{SendService, SendOptions};
+use crate::network::send::dm_messages::DmMessage;
 use crate::network::send::topic_messages::{TopicMessage, SyncUpdateMessage};
-use crate::protocol::{MemberInfo, ProtocolError, ProtocolEvent, SyncRequestEvent, SyncResponseEvent};
+use crate::protocol::{MemberInfo, ProtocolError, ProtocolEvent, SyncRequestEvent, SyncResponseEvent, DmSyncResponseEvent};
 
 use super::protocol::SYNC_ALPN;
 
@@ -29,6 +30,8 @@ pub mod sync_message_type {
     pub const SYNC_REQUEST: u8 = 0x01;
     /// SyncResponse - peer is providing their state
     pub const SYNC_RESPONSE: u8 = 0x02;
+    /// DmSyncResponse - peer is providing their DM sync state
+    pub const DM_SYNC_RESPONSE: u8 = 0x03;
 }
 
 /// Error during sync message processing
@@ -123,11 +126,6 @@ impl SyncService {
 
     // ========== Incoming ==========
     // handle_sync_connection is in handlers/sync.rs (impl SyncService)
-
-    /// Get the event sender (used by incoming handler)
-    pub(crate) fn event_tx(&self) -> &mpsc::Sender<ProtocolEvent> {
-        &self.event_tx
-    }
 
     /// Get the sync config (used by incoming handler)
     pub(crate) fn config(&self) -> &SyncConfig {
@@ -307,6 +305,111 @@ impl SyncService {
 
         Ok(())
     }
+
+    // ========== DM Sync Outgoing ==========
+
+    /// Send a DM sync update to a single peer
+    ///
+    /// Max size: 512 KB (uses DM via send protocol)
+    pub async fn send_dm_sync_update(
+        &self,
+        recipient_id: &[u8; 32],
+        data: Vec<u8>,
+    ) -> Result<(), ProtocolError> {
+        if data.len() > MAX_MESSAGE_SIZE {
+            return Err(ProtocolError::MessageTooLarge);
+        }
+
+        let encoded = DmMessage::SyncUpdate(data).encode();
+
+        self.send_service
+            .send_to_dm(recipient_id, &encoded)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Request DM sync state from a peer
+    ///
+    /// When the peer responds, you'll receive a `ProtocolEvent::DmSyncResponse` event.
+    pub async fn request_dm_sync(
+        &self,
+        recipient_id: &[u8; 32],
+    ) -> Result<(), ProtocolError> {
+        let encoded = DmMessage::SyncRequest.encode();
+
+        info!(
+            recipient = %hex::encode(&recipient_id[..8]),
+            "Sending DM sync request"
+        );
+
+        self.send_service
+            .send_to_dm(recipient_id, &encoded)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Respond to a DM sync request with current state
+    ///
+    /// Call this when you receive `ProtocolEvent::DmSyncRequest`.
+    /// Uses direct SYNC_ALPN connection - no size limit.
+    pub async fn respond_dm_sync(
+        &self,
+        recipient_id: &[u8; 32],
+        data: Vec<u8>,
+    ) -> Result<(), ProtocolError> {
+        let message = encode_dm_sync_response(&self.identity.public_key, &data);
+
+        let node_id = EndpointId::from_bytes(recipient_id)
+            .map_err(|e| ProtocolError::Network(format!("invalid node id: {}", e)))?;
+
+        let relay_info = {
+            let db = self.db.lock().await;
+            get_peer_relay_info(&db, recipient_id).unwrap_or(None)
+        };
+        let (relay_url_str, relay_last_success) = match &relay_info {
+            Some((url, ts)) => (Some(url.as_str()), *ts),
+            None => (None, None),
+        };
+        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
+
+        let result = connect::connect(
+            &self.endpoint, node_id, parsed_relay.as_ref(), relay_last_success, SYNC_ALPN, self.config.connect_timeout,
+        )
+        .await
+        .map_err(|e| ProtocolError::Network(format!("connection failed: {}", e)))?;
+
+        let conn = result.connection;
+        if result.relay_url_confirmed {
+            if let Some(url) = &parsed_relay {
+                let db = self.db.lock().await;
+                let _ = update_peer_relay_url(&db, recipient_id, &url.to_string(), current_timestamp());
+            }
+        }
+
+        let mut send = conn
+            .open_uni()
+            .await
+            .map_err(|e| ProtocolError::Network(format!("failed to open stream: {}", e)))?;
+
+        tokio::io::AsyncWriteExt::write_all(&mut send, &message)
+            .await
+            .map_err(|e| ProtocolError::Network(format!("failed to write: {}", e)))?;
+
+        send.finish()
+            .map_err(|e| ProtocolError::Network(format!("failed to finish: {}", e)))?;
+
+        send.stopped()
+            .await
+            .map_err(|e| ProtocolError::Network(format!("stream error: {}", e)))?;
+
+        info!(
+            recipient = %hex::encode(&recipient_id[..8]),
+            size = data.len(),
+            "Sent DM sync response via SYNC_ALPN"
+        );
+
+        Ok(())
+    }
 }
 
 // ========== Free functions (kept for backward compat and tests) ==========
@@ -322,87 +425,124 @@ pub fn encode_sync_response(topic_id: &[u8; 32], data: &[u8]) -> Vec<u8> {
     message
 }
 
-/// Process an incoming sync message - handles all business logic
-pub async fn process_incoming_sync_message(
-    buf: &[u8],
-    sender_id: [u8; 32],
-    event_tx: &mpsc::Sender<ProtocolEvent>,
-) -> Result<(), ProcessSyncError> {
-    // Check minimum size: 32 bytes topic_id + at least 1 byte message type
-    if buf.len() < 33 {
-        warn!(
-            len = buf.len(),
-            sender = %hex::encode(&sender_id[..8]),
-            "SYNC_SERVICE: message too short"
-        );
-        return Err(ProcessSyncError::MessageTooShort(buf.len()));
+/// Encode a DM sync response message for transmission via SYNC_ALPN
+///
+/// Format: [32 bytes sender_peer_id][1 byte type = 0x03][data]
+pub fn encode_dm_sync_response(sender_id: &[u8; 32], data: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(32 + 1 + data.len());
+    message.extend_from_slice(sender_id);
+    message.push(sync_message_type::DM_SYNC_RESPONSE);
+    message.extend_from_slice(data);
+    message
+}
+
+impl SyncService {
+    /// Process an incoming sync message - handles all business logic
+    pub async fn process_incoming_message(
+        &self,
+        buf: &[u8],
+        sender_id: [u8; 32],
+    ) -> Result<(), ProcessSyncError> {
+        Self::process_sync_message(buf, sender_id, &self.event_tx).await
     }
 
-    // First 32 bytes are the topic_id
-    let mut topic_id = [0u8; 32];
-    topic_id.copy_from_slice(&buf[..32]);
-    let message_bytes = &buf[32..];
+    /// Core sync message processing logic (static for testability)
+    pub(crate) async fn process_sync_message(
+        buf: &[u8],
+        sender_id: [u8; 32],
+        event_tx: &mpsc::Sender<ProtocolEvent>,
+    ) -> Result<(), ProcessSyncError> {
+        // Check minimum size: 32 bytes topic_id + at least 1 byte message type
+        if buf.len() < 33 {
+            warn!(
+                len = buf.len(),
+                sender = %hex::encode(&sender_id[..8]),
+                "SYNC_SERVICE: message too short"
+            );
+            return Err(ProcessSyncError::MessageTooShort(buf.len()));
+        }
 
-    info!(
-        topic = %hex::encode(&topic_id[..8]),
-        sender = %hex::encode(&sender_id[..8]),
-        message_len = message_bytes.len(),
-        "SYNC_SERVICE: received message"
-    );
+        // First 32 bytes are the topic_id
+        let mut topic_id = [0u8; 32];
+        topic_id.copy_from_slice(&buf[..32]);
+        let message_bytes = &buf[32..];
 
-    // Check for empty payload
-    if message_bytes.is_empty() {
-        warn!(
+        info!(
             topic = %hex::encode(&topic_id[..8]),
             sender = %hex::encode(&sender_id[..8]),
-            "SYNC_SERVICE: empty message payload"
+            message_len = message_bytes.len(),
+            "SYNC_SERVICE: received message"
         );
-        return Err(ProcessSyncError::EmptyPayload);
-    }
 
-    // Message type byte determines what kind of message this is
-    let event = match message_bytes[0] {
-        sync_message_type::SYNC_REQUEST => {
-            info!(
+        // Check for empty payload
+        if message_bytes.is_empty() {
+            warn!(
                 topic = %hex::encode(&topic_id[..8]),
                 sender = %hex::encode(&sender_id[..8]),
-                "SYNC_SERVICE: received SyncRequest"
+                "SYNC_SERVICE: empty message payload"
             );
-            ProtocolEvent::SyncRequest(SyncRequestEvent {
-                topic_id,
-                sender_id,
-            })
+            return Err(ProcessSyncError::EmptyPayload);
         }
-        sync_message_type::SYNC_RESPONSE => {
-            let data = message_bytes[1..].to_vec();
 
-            info!(
-                topic = %hex::encode(&topic_id[..8]),
-                sender = %hex::encode(&sender_id[..8]),
-                data_len = data.len(),
-                "SYNC_SERVICE: received SyncResponse"
-            );
-            ProtocolEvent::SyncResponse(SyncResponseEvent {
-                topic_id,
-                data,
-            })
-        }
-        other => {
-            debug!(
-                topic = %hex::encode(&topic_id[..8]),
-                first_byte = other,
-                "SYNC_SERVICE: unknown message type"
-            );
-            return Err(ProcessSyncError::UnknownMessageType(other));
-        }
-    };
+        // Message type byte determines what kind of message this is
+        let event = match message_bytes[0] {
+            sync_message_type::SYNC_REQUEST => {
+                info!(
+                    topic = %hex::encode(&topic_id[..8]),
+                    sender = %hex::encode(&sender_id[..8]),
+                    "SYNC_SERVICE: received SyncRequest"
+                );
+                ProtocolEvent::SyncRequest(SyncRequestEvent {
+                    topic_id,
+                    sender_id,
+                })
+            }
+            sync_message_type::SYNC_RESPONSE => {
+                let data = message_bytes[1..].to_vec();
 
-    // Emit the event
-    if event_tx.send(event).await.is_err() {
-        debug!("event receiver dropped");
+                info!(
+                    topic = %hex::encode(&topic_id[..8]),
+                    sender = %hex::encode(&sender_id[..8]),
+                    data_len = data.len(),
+                    "SYNC_SERVICE: received SyncResponse"
+                );
+                ProtocolEvent::SyncResponse(SyncResponseEvent {
+                    topic_id,
+                    data,
+                })
+            }
+            sync_message_type::DM_SYNC_RESPONSE => {
+                // For DM sync responses, the 32-byte prefix is the sender's peer_id
+                // (not a topic_id). sender_id from the QUIC connection is the authoritative source.
+                let data = message_bytes[1..].to_vec();
+
+                info!(
+                    sender = %hex::encode(&sender_id[..8]),
+                    data_len = data.len(),
+                    "SYNC_SERVICE: received DmSyncResponse"
+                );
+                ProtocolEvent::DmSyncResponse(DmSyncResponseEvent {
+                    sender_id,
+                    data,
+                })
+            }
+            other => {
+                debug!(
+                    topic = %hex::encode(&topic_id[..8]),
+                    first_byte = other,
+                    "SYNC_SERVICE: unknown message type"
+                );
+                return Err(ProcessSyncError::UnknownMessageType(other));
+            }
+        };
+
+        // Emit the event
+        if event_tx.send(event).await.is_err() {
+            debug!("event receiver dropped");
+        }
+
+        Ok(())
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -426,7 +566,7 @@ mod tests {
         buf.extend_from_slice(&test_topic());
         buf.push(sync_message_type::SYNC_REQUEST);
 
-        process_incoming_sync_message(&buf, test_sender(), &tx).await.unwrap();
+        SyncService::process_sync_message(&buf, test_sender(), &tx).await.unwrap();
 
         let event = rx.recv().await.unwrap();
         match event {
@@ -447,7 +587,7 @@ mod tests {
         buf.push(sync_message_type::SYNC_RESPONSE);
         buf.extend_from_slice(b"test data");
 
-        process_incoming_sync_message(&buf, test_sender(), &tx).await.unwrap();
+        SyncService::process_sync_message(&buf, test_sender(), &tx).await.unwrap();
 
         let event = rx.recv().await.unwrap();
         match event {
@@ -463,7 +603,7 @@ mod tests {
     async fn test_message_too_short() {
         let (tx, _rx) = mpsc::channel(10);
         let buf = vec![0u8; 32]; // Only topic_id, no type byte
-        let result = process_incoming_sync_message(&buf, test_sender(), &tx).await;
+        let result = SyncService::process_sync_message(&buf, test_sender(), &tx).await;
         assert!(matches!(result, Err(ProcessSyncError::MessageTooShort(_))));
     }
 
@@ -475,7 +615,7 @@ mod tests {
         buf.extend_from_slice(&test_topic());
         buf.push(0xFF); // Unknown type
 
-        let result = process_incoming_sync_message(&buf, test_sender(), &tx).await;
+        let result = SyncService::process_sync_message(&buf, test_sender(), &tx).await;
         assert!(matches!(result, Err(ProcessSyncError::UnknownMessageType(0xFF))));
     }
 

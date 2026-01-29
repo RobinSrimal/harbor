@@ -47,8 +47,8 @@ impl LiveService {
         let wt_session = QuicRequest::accept(conn).ok();
 
         // 2. Find which accepted stream this connection corresponds to.
-        //    Look through pending_incoming for a request from this peer.
-        let pending = self.find_pending_incoming_for_peer(&peer_id).await;
+        //    Look through accepted_incoming for a request from this peer.
+        let pending = self.find_accepted_for_peer(&peer_id).await;
 
         let pending = match pending {
             Some(p) => p,
@@ -65,10 +65,8 @@ impl LiveService {
         let origin = moq_lite::Origin::produce();
 
         // 4. Perform MOQ handshake as server
-        //    - with_publish: we provide OriginConsumer so the remote (source) can publish to us
-        //    - with_consume: we provide OriginProducer so the remote can subscribe from us
+        //    Destination only consumes — no .with_publish() to avoid bidirectional subscribe loops
         let moq_server = moq_lite::Server::new()
-            .with_publish(origin.consumer.clone())
             .with_consume(origin.producer.clone());
 
         let moq_session = moq_server.accept(wt_session).await
@@ -91,7 +89,21 @@ impl LiveService {
 
         self.store_session(pending.request_id, live_session).await;
 
-        // 6. Wait for session to close (keeps the handler alive while media flows)
+        // Clean up accepted_incoming now that MOQ handshake succeeded
+        self.remove_accepted(&pending.request_id).await;
+
+        // 6. Emit StreamConnected for destination side
+        let event = crate::protocol::ProtocolEvent::StreamConnected(
+            crate::protocol::StreamConnectedEvent {
+                request_id: pending.request_id,
+                topic_id: pending.topic_id,
+                peer_id,
+                is_source: false,
+            },
+        );
+        let _ = self.event_tx().send(event).await;
+
+        // 7. Wait for session to close (keeps the handler alive while media flows)
         if let Some(session) = self.get_session(&pending.request_id).await {
             let _ = session.session().closed().await;
             info!(

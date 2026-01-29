@@ -19,8 +19,10 @@ use crate::network::harbor::protocol::HarborPacketType;
 use crate::network::send::topic_messages::TopicMessage;
 use crate::security::{
     verify_and_decrypt_packet_with_mode, harbor_id_from_topic,
+    verify_and_decrypt_dm_packet,
     VerificationMode, SendPacket,
 };
+use crate::network::send::dm_messages::DmMessage;
 
 use crate::network::live::LiveService;
 use crate::network::send::PacketSource;
@@ -60,6 +62,139 @@ impl Protocol {
                 }
             };
 
+            // === Pull DM packets (harbor_id = our endpoint_id) ===
+            {
+                let dm_harbor_id = our_id;
+                let harbor_nodes = HarborService::find_harbor_nodes(&dht_service, &dm_harbor_id).await;
+
+                if !harbor_nodes.is_empty() {
+                    let already_have: Vec<[u8; 32]> = {
+                        let db_lock = db.lock().await;
+                        // Use our_id as "topic_id" for DM dedup tracking
+                        crate::data::harbor::get_pulled_packet_ids(&db_lock, &our_id)
+                            .unwrap_or_default()
+                    };
+
+                    let pull_req = crate::network::harbor::protocol::PullRequest {
+                        harbor_id: dm_harbor_id,
+                        recipient_id: our_id,
+                        since_timestamp: 0,
+                        already_have,
+                        relay_url: None,
+                    };
+
+                    for harbor_node in harbor_nodes.iter().take(pull_max_nodes) {
+                        match harbor_service.send_harbor_pull(harbor_node, &pull_req).await {
+                            Ok(packets) => {
+                                for packet_info in packets {
+                                    {
+                                        let db_lock = db.lock().await;
+                                        if was_pulled(&db_lock, &our_id, &packet_info.packet_id).unwrap_or(true) {
+                                            continue;
+                                        }
+                                    }
+
+                                    let send_packet = match SendPacket::from_bytes(&packet_info.packet_data) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            debug!(error = %e, "failed to parse pulled DM packet");
+                                            continue;
+                                        }
+                                    };
+
+                                    if !send_packet.is_dm() {
+                                        debug!("pulled packet from DM harbor_id is not a DM packet, skipping");
+                                        continue;
+                                    }
+
+                                    // Decrypt DM
+                                    // We need the identity private key - get it from harbor_service context
+                                    let private_key = {
+                                        let db_lock = db.lock().await;
+                                        match crate::data::identity::get_identity(&db_lock) {
+                                            Ok(Some(id)) => id.private_key,
+                                            _ => {
+                                                debug!("no identity for DM decryption");
+                                                continue;
+                                            }
+                                        }
+                                    };
+
+                                    match verify_and_decrypt_dm_packet(&send_packet, &private_key) {
+                                        Ok(plaintext) => {
+                                            {
+                                                let db_lock = db.lock().await;
+                                                let _ = mark_pulled(&db_lock, &our_id, &packet_info.packet_id);
+                                            }
+
+                                            match DmMessage::decode(&plaintext) {
+                                                Ok(DmMessage::Content(data)) => {
+                                                    let event = ProtocolEvent::DmReceived(crate::protocol::DmReceivedEvent {
+                                                        sender_id: packet_info.sender_id,
+                                                        payload: data,
+                                                        timestamp: packet_info.created_at,
+                                                    });
+                                                    let _ = event_tx.send(event).await;
+                                                }
+                                                Ok(DmMessage::SyncUpdate(data)) => {
+                                                    let event = ProtocolEvent::DmSyncUpdate(crate::protocol::DmSyncUpdateEvent {
+                                                        sender_id: packet_info.sender_id,
+                                                        data,
+                                                    });
+                                                    let _ = event_tx.send(event).await;
+                                                }
+                                                Ok(DmMessage::SyncRequest) => {
+                                                    let event = ProtocolEvent::DmSyncRequest(crate::protocol::DmSyncRequestEvent {
+                                                        sender_id: packet_info.sender_id,
+                                                    });
+                                                    let _ = event_tx.send(event).await;
+                                                }
+                                                Ok(DmMessage::FileAnnouncement(msg)) => {
+                                                    let event = ProtocolEvent::DmFileAnnounced(crate::protocol::DmFileAnnouncedEvent {
+                                                        sender_id: packet_info.sender_id,
+                                                        hash: msg.hash,
+                                                        display_name: msg.display_name,
+                                                        total_size: msg.total_size,
+                                                        total_chunks: msg.total_chunks,
+                                                        num_sections: msg.num_sections,
+                                                        timestamp: packet_info.created_at,
+                                                    });
+                                                    let _ = event_tx.send(event).await;
+                                                }
+                                                // DM stream signaling — route to LiveService
+                                                Ok(ref dm_msg @ DmMessage::StreamAccept(_))
+                                                | Ok(ref dm_msg @ DmMessage::StreamReject(_))
+                                                | Ok(ref dm_msg @ DmMessage::StreamQuery(_))
+                                                | Ok(ref dm_msg @ DmMessage::StreamActive(_))
+                                                | Ok(ref dm_msg @ DmMessage::StreamEnded(_)) => {
+                                                    live_service.handle_dm_signaling(dm_msg, packet_info.sender_id).await;
+                                                }
+                                                Err(e) => {
+                                                    debug!(error = %e, "failed to decode pulled DM message");
+                                                }
+                                            }
+
+                                            let ack = crate::network::harbor::protocol::DeliveryAck {
+                                                packet_id: packet_info.packet_id,
+                                                recipient_id: our_id,
+                                            };
+                                            let _ = harbor_service.send_harbor_ack(harbor_node, &ack).await;
+                                        }
+                                        Err(e) => {
+                                            debug!(error = %e, "failed to decrypt pulled DM packet");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, "failed to pull DMs from Harbor Node");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // === Pull topic packets ===
             for topic_id in topics {
                 let harbor_id = harbor_id_from_topic(&topic_id);
 
@@ -205,7 +340,7 @@ impl Protocol {
                                                             if let Err(e) = insert_blob(
                                                                 &db_lock,
                                                                 &ann.hash,
-                                                                &topic_id,
+                                                                &topic_id, // scope_id: topic scopes the blob
                                                                 &ann.source_id,
                                                                 &ann.display_name,
                                                                 ann.total_size,
@@ -260,12 +395,7 @@ impl Protocol {
                                                     let _ = event_tx.send(event).await;
                                                 }
                                                 // Stream signaling — route to LiveService
-                                                TopicMessage::StreamRequest(_)
-                                                | TopicMessage::StreamAccept(_)
-                                                | TopicMessage::StreamReject(_)
-                                                | TopicMessage::StreamQuery(_)
-                                                | TopicMessage::StreamActive(_)
-                                                | TopicMessage::StreamEnded(_) => {
+                                                TopicMessage::StreamRequest(_) => {
                                                     drop(db_lock);
                                                     live_service.handle_signaling(
                                                         msg, &topic_id, packet_info.sender_id,

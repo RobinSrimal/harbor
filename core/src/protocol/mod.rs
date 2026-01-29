@@ -52,6 +52,9 @@ pub use events::{
     FileAnnouncedEvent, FileCompleteEvent, FileProgressEvent, IncomingMessage, ProtocolEvent,
     SyncUpdateEvent, SyncRequestEvent, SyncResponseEvent,
     StreamRequestEvent, StreamAcceptedEvent, StreamRejectedEvent, StreamEndedEvent,
+    StreamConnectedEvent,
+    DmReceivedEvent, DmSyncUpdateEvent, DmSyncRequestEvent, DmSyncResponseEvent,
+    DmFileAnnouncedEvent,
 };
 
 // Domain types (from TopicService)
@@ -65,3 +68,8 @@ pub use stats::{
 
 // Share types
 pub use api::ShareStatus;
+
+// Target types (Topic vs DM)
+mod target;
+pub use target::Target;
+

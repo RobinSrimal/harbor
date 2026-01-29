@@ -12,7 +12,7 @@
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tracing::{debug, info, warn};
 
-use crate::network::sync::service::{SyncService, process_incoming_sync_message};
+use crate::network::sync::service::SyncService;
 use crate::protocol::ProtocolError;
 
 impl ProtocolHandler for SyncService {
@@ -58,7 +58,7 @@ impl SyncService {
             };
 
             // Delegate all business logic (parsing, validation, event emission) to service
-            if let Err(e) = process_incoming_sync_message(&buf, sender_id, self.event_tx()).await {
+            if let Err(e) = self.process_incoming_message(&buf, sender_id).await {
                 debug!(error = %e, "SYNC_HANDLER: failed to process message");
             }
         }

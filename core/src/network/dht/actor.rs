@@ -23,7 +23,6 @@ use tracing::{debug, error, info, trace};
 use super::internal::api::ApiMessage;
 use super::internal::config::DhtConfig;
 use super::internal::distance::Id;
-use super::internal::lookup::iterative_find_node;
 use super::internal::pool::{DhtPool, DhtPoolError as PoolError, DialInfo};
 use super::internal::routing::{AddNodeResult, Buckets, RoutingTable, BUCKET_COUNT};
 use super::protocol::NodeInfo;
@@ -450,7 +449,7 @@ impl DhtActor {
                 let tx = msg.tx;
 
                 self.tasks.spawn(async move {
-                    let result = iterative_find_node(
+                    let result = DhtService::iterative_find_node(
                         target,
                         initial,
                         local_id,
@@ -525,7 +524,7 @@ impl DhtActor {
                 let tx = msg.tx;
 
                 self.tasks.spawn(async move {
-                    iterative_find_node(local_id, initial, local_id, pool, config, service).await;
+                    DhtService::iterative_find_node(local_id, initial, local_id, pool, config, service).await;
                     tx.send(()).await.ok();
                 });
             }
@@ -543,7 +542,7 @@ impl DhtActor {
                 let tx = msg.tx;
 
                 self.tasks.spawn(async move {
-                    iterative_find_node(random_id, initial, local_id, pool, config, service).await;
+                    DhtService::iterative_find_node(random_id, initial, local_id, pool, config, service).await;
                     tx.send(()).await.ok();
                 });
             }

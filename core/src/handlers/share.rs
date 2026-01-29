@@ -16,7 +16,7 @@ use tracing::{debug, trace};
 
 use crate::data::CHUNK_SIZE;
 use crate::network::share::protocol::ShareMessage;
-use crate::network::share::service::{process_incoming_share_message, ShareService};
+use crate::network::share::service::ShareService;
 
 /// Maximum message size for share protocol (chunk size + overhead)
 const MAX_READ_SIZE: usize = (CHUNK_SIZE as usize) + 1024;
@@ -38,7 +38,6 @@ impl ShareService {
         conn: iroh::endpoint::Connection,
         sender_id: [u8; 32],
     ) -> Result<(), crate::protocol::ProtocolError> {
-        let our_id = self.endpoint_id();
         trace!(sender = %hex::encode(sender_id), "share connection established");
 
         loop {
@@ -70,12 +69,9 @@ impl ShareService {
             };
 
             // Delegate business logic to service layer
-            let responses = process_incoming_share_message(
+            let responses = self.process_incoming_message(
                 message,
                 sender_id,
-                our_id,
-                &self.db(),
-                self.blob_store(),
             ).await;
 
             // Send all responses

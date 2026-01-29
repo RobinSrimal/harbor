@@ -23,5 +23,5 @@ pub use protocol::{
     ChunkResponse, DecodeError, FileAnnouncement, InitialRecipient, PeerChunks, PeerSuggestion,
     ShareMessage, ShareMessageType, SHARE_ALPN,
 };
-pub use service::{ProcessShareError, ShareConfig, ShareError, ShareService, ShareStatus, process_incoming_share_message};
+pub use service::{ProcessShareError, ShareConfig, ShareError, ShareService, ShareStatus};
 

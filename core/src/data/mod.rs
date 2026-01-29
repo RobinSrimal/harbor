@@ -68,7 +68,7 @@ pub use start::{start_db, start_memory_db, StartError};
 
 // Re-export commonly used items from share/
 pub use share::{
-    add_blob_recipient, delete_blob, get_blob, get_blobs_for_topic, get_section_peer_suggestion,
+    add_blob_recipient, delete_blob, get_blob, get_blobs_for_scope, get_section_peer_suggestion,
     get_section_traces, init_blob_sections, insert_blob, is_distribution_complete,
     mark_blob_complete, mark_recipient_complete, record_peer_can_seed, record_section_received,
     BlobMetadata, BlobState, SectionTrace, CHUNK_SIZE,

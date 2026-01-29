@@ -91,37 +91,57 @@ impl Protocol {
     /// - The message exceeds 512KB
     /// - The topic doesn't exist
     /// - The caller is not a member of the topic
-    pub async fn send(&self, topic_id: &[u8; 32], payload: &[u8]) -> Result<(), ProtocolError> {
+    pub async fn send(&self, target: super::Target, payload: &[u8]) -> Result<(), ProtocolError> {
         self.check_running().await?;
 
         if payload.len() > MAX_MESSAGE_SIZE {
             return Err(ProtocolError::MessageTooLarge);
         }
 
-        self.send_service
-            .send_content(topic_id, payload)
-            .await
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
+        match target {
+            super::Target::Topic(topic_id) => {
+                self.send_service
+                    .send_topic(&topic_id, payload)
+                    .await
+                    .map_err(|e| ProtocolError::Network(e.to_string()))?;
+            }
+            super::Target::Dm(recipient_id) => {
+                self.send_service
+                    .send_dm(&recipient_id, payload)
+                    .await
+                    .map_err(|e| ProtocolError::Network(e.to_string()))?;
+            }
+        }
 
         Ok(())
     }
 
     // ========== Share API ==========
 
-    /// Share a file with all members of a topic
+    /// Share a file
+    ///
+    /// - `Target::Topic(id)` — share with all topic members
+    /// - `Target::Dm(id)` — share directly with a single peer
     ///
     /// The file must be at least 512KB. For smaller files, use the regular `send()` method.
     ///
     /// Returns the BLAKE3 hash of the file on success.
     pub async fn share_file(
         &self,
-        topic_id: &[u8; 32],
+        target: super::Target,
         file_path: impl AsRef<Path>,
     ) -> Result<[u8; 32], ProtocolError> {
-        self.share_service
-            .share_and_announce(topic_id, file_path.as_ref())
-            .await
-            .map_err(|e| ProtocolError::Database(e.to_string()))
+        self.check_running().await?;
+        match target {
+            super::Target::Topic(id) => self.share_service
+                .share_and_announce(&id, file_path.as_ref())
+                .await
+                .map_err(|e| ProtocolError::Database(e.to_string())),
+            super::Target::Dm(id) => self.share_service
+                .share_dm_file(&id, file_path.as_ref())
+                .await
+                .map_err(|e| ProtocolError::Database(e.to_string())),
+        }
     }
 
     /// Get the status of a shared file
@@ -170,38 +190,54 @@ impl Protocol {
     // Thin delegates to SyncService.
     // Applications bring their own CRDT (Loro, Yjs, Automerge, etc.).
 
-    /// Send a sync update to all topic members
+    /// Send a sync update
     ///
-    /// Max size: 512 KB (uses broadcast via send protocol)
+    /// - `Target::Topic(id)` — broadcast to all topic members (max 512 KB)
+    /// - `Target::Dm(id)` — send to a single peer via DM (max 512 KB)
     pub async fn send_sync_update(
         &self,
-        topic_id: &[u8; 32],
+        target: super::Target,
         data: Vec<u8>,
     ) -> Result<(), ProtocolError> {
         self.check_running().await?;
-        self.sync_service.send_sync_update(topic_id, data).await
+        match target {
+            super::Target::Topic(id) => self.sync_service.send_sync_update(&id, data).await,
+            super::Target::Dm(id) => self.sync_service.send_dm_sync_update(&id, data).await,
+        }
     }
 
-    /// Request sync state from topic members
+    /// Request sync state
+    ///
+    /// - `Target::Topic(id)` — request from all topic members
+    /// - `Target::Dm(id)` — request from a single peer
     pub async fn request_sync(
         &self,
-        topic_id: &[u8; 32],
+        target: super::Target,
     ) -> Result<(), ProtocolError> {
         self.check_running().await?;
-        self.sync_service.request_sync(topic_id).await
+        match target {
+            super::Target::Topic(id) => self.sync_service.request_sync(&id).await,
+            super::Target::Dm(id) => self.sync_service.request_dm_sync(&id).await,
+        }
     }
 
     /// Respond to a sync request with current state
     ///
     /// Uses direct SYNC_ALPN connection - no size limit.
+    ///
+    /// - `Target::Topic(id)` — respond to a topic sync request from `requester_id`
+    /// - `Target::Dm(id)` — respond to a DM sync request (target peer is the recipient)
     pub async fn respond_sync(
         &self,
-        topic_id: &[u8; 32],
+        target: super::Target,
         requester_id: &[u8; 32],
         data: Vec<u8>,
     ) -> Result<(), ProtocolError> {
         self.check_running().await?;
-        self.sync_service.respond_sync(topic_id, requester_id, data).await
+        match target {
+            super::Target::Topic(id) => self.sync_service.respond_sync(&id, requester_id, data).await,
+            super::Target::Dm(id) => self.sync_service.respond_dm_sync(&id, data).await,
+        }
     }
 
     // ========== Stats API ==========
@@ -294,6 +330,59 @@ impl Protocol {
             .end_stream(request_id)
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Get an active MOQ session for a stream
+    ///
+    /// Returns the session after `StreamConnected` has been emitted.
+    /// Use `create_broadcast` / `consume_broadcast` on the returned session.
+    pub async fn get_live_session(
+        &self,
+        request_id: &[u8; 32],
+    ) -> Result<std::sync::Arc<crate::network::live::session::LiveSession>, ProtocolError> {
+        self.check_running().await?;
+        self.live_service
+            .get_session(request_id)
+            .await
+            .ok_or_else(|| ProtocolError::NotFound("live session not found".into()))
+    }
+
+    /// Create a broadcast producer on an active MOQ session (source side)
+    ///
+    /// Call after receiving `StreamConnected` with `is_source: true`.
+    /// Returns a `BroadcastProducer` that the app feeds media data into.
+    pub async fn publish_to_stream(
+        &self,
+        request_id: &[u8; 32],
+        broadcast_name: &str,
+    ) -> Result<moq_lite::BroadcastProducer, ProtocolError> {
+        self.check_running().await?;
+        let session = self.live_service
+            .get_session(request_id)
+            .await
+            .ok_or_else(|| ProtocolError::NotFound("live session not found".into()))?;
+        session
+            .create_broadcast(broadcast_name)
+            .ok_or_else(|| ProtocolError::Network("failed to create broadcast".into()))
+    }
+
+    /// Consume a broadcast from an active MOQ session (destination side)
+    ///
+    /// Call after receiving `StreamConnected` with `is_source: false`.
+    /// Returns a `BroadcastConsumer` that the app reads media data from.
+    pub async fn consume_stream(
+        &self,
+        request_id: &[u8; 32],
+        broadcast_name: &str,
+    ) -> Result<moq_lite::BroadcastConsumer, ProtocolError> {
+        self.check_running().await?;
+        let session = self.live_service
+            .get_session(request_id)
+            .await
+            .ok_or_else(|| ProtocolError::NotFound("live session not found".into()))?;
+        session
+            .consume_broadcast(broadcast_name)
+            .ok_or_else(|| ProtocolError::Network("broadcast not available".into()))
     }
 }
 

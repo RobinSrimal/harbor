@@ -295,15 +295,14 @@ pub fn create_share_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS blobs (
             hash BLOB PRIMARY KEY NOT NULL CHECK (length(hash) = 32),
-            topic_id BLOB NOT NULL CHECK (length(topic_id) = 32),
+            scope_id BLOB NOT NULL CHECK (length(scope_id) = 32),
             source_id BLOB NOT NULL CHECK (length(source_id) = 32),
             display_name TEXT NOT NULL,
             total_size INTEGER NOT NULL,
             total_chunks INTEGER NOT NULL,
             num_sections INTEGER NOT NULL,
             state INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            FOREIGN KEY (topic_id) REFERENCES topics(topic_id)
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
         )",
         [],
     )?;
@@ -339,7 +338,7 @@ pub fn create_share_tables(conn: &Connection) -> rusqlite::Result<()> {
 
     // Indexes for efficient queries
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_blobs_topic ON blobs(topic_id)",
+        "CREATE INDEX IF NOT EXISTS idx_blobs_scope ON blobs(scope_id)",
         [],
     )?;
     conn.execute(

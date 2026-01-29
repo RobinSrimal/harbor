@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::data::{
-    get_blob, get_blobs_for_topic, get_section_peer_suggestion,
+    get_blob, get_blobs_for_scope, get_section_peer_suggestion,
     get_all_topics, BlobState, BlobStore, CHUNK_SIZE,
 };
 use crate::network::share::protocol::{
@@ -243,7 +243,7 @@ fn find_incomplete_blobs(db: &DbConnection) -> Vec<([u8; 32], [u8; 32], [u8; 32]
     // Check each topic for incomplete blobs
     for topic in topics {
         let topic_id = topic.topic_id;
-        let blobs = match get_blobs_for_topic(db, &topic_id) {
+        let blobs = match get_blobs_for_scope(db, &topic_id) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -781,7 +781,7 @@ mod tests {
         conn.execute(
             "CREATE TABLE blobs (
                 hash BLOB PRIMARY KEY,
-                topic_id BLOB NOT NULL,
+                scope_id BLOB NOT NULL,
                 source_id BLOB NOT NULL,
                 display_name TEXT NOT NULL,
                 total_size INTEGER NOT NULL,
@@ -805,7 +805,7 @@ mod tests {
         
         // Insert partial blob (state = 0 = Partial)
         conn.execute(
-            "INSERT INTO blobs (hash, topic_id, source_id, display_name, total_size, total_chunks, state)
+            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
              VALUES (?1, ?2, ?3, 'test.bin', 1048576, 2, 0)",
             rusqlite::params![hash.as_slice(), topic_id.as_slice(), source_id.as_slice()],
         ).unwrap();
@@ -836,7 +836,7 @@ mod tests {
         conn.execute(
             "CREATE TABLE blobs (
                 hash BLOB PRIMARY KEY,
-                topic_id BLOB NOT NULL,
+                scope_id BLOB NOT NULL,
                 source_id BLOB NOT NULL,
                 display_name TEXT NOT NULL,
                 total_size INTEGER NOT NULL,
@@ -860,7 +860,7 @@ mod tests {
         
         // Insert complete blob (state = 1 = Complete)
         conn.execute(
-            "INSERT INTO blobs (hash, topic_id, source_id, display_name, total_size, total_chunks, state)
+            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
              VALUES (?1, ?2, ?3, 'test.bin', 1048576, 2, 1)",
             rusqlite::params![hash.as_slice(), topic_id.as_slice(), source_id.as_slice()],
         ).unwrap();
@@ -887,7 +887,7 @@ mod tests {
         conn.execute(
             "CREATE TABLE blobs (
                 hash BLOB PRIMARY KEY,
-                topic_id BLOB NOT NULL,
+                scope_id BLOB NOT NULL,
                 source_id BLOB NOT NULL,
                 display_name TEXT NOT NULL,
                 total_size INTEGER NOT NULL,
@@ -918,17 +918,17 @@ mod tests {
         
         // Insert partial blobs in both topics
         conn.execute(
-            "INSERT INTO blobs (hash, topic_id, source_id, display_name, total_size, total_chunks, state)
+            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
              VALUES (?1, ?2, ?3, 'file1.bin', 1048576, 2, 0)",
             rusqlite::params![hash1.as_slice(), topic1.as_slice(), source.as_slice()],
         ).unwrap();
         conn.execute(
-            "INSERT INTO blobs (hash, topic_id, source_id, display_name, total_size, total_chunks, state)
+            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
              VALUES (?1, ?2, ?3, 'file2.bin', 2097152, 4, 0)",
             rusqlite::params![hash2.as_slice(), topic1.as_slice(), source.as_slice()],
         ).unwrap();
         conn.execute(
-            "INSERT INTO blobs (hash, topic_id, source_id, display_name, total_size, total_chunks, state)
+            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
              VALUES (?1, ?2, ?3, 'file3.bin', 3145728, 6, 0)",
             rusqlite::params![hash3.as_slice(), topic2.as_slice(), source.as_slice()],
         ).unwrap();

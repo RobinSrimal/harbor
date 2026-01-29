@@ -18,6 +18,7 @@
 //! - `pool.rs` - Connection pooling
 //! - `topic_messages.rs` - TopicMessage format
 
+pub mod dm_messages;
 pub mod incoming;
 pub mod outgoing;
 pub mod pool;
@@ -37,11 +38,13 @@ pub use incoming::{
     ProcessResult, ProcessError, PacketSource, ReceiveError,
 };
 
+// DM message types
+pub use dm_messages::{DmMessage, DmMessageType, DmDecodeError, is_dm_message_type};
+
 // Topic message types (payload format for Send packets)
 pub use topic_messages::{
     get_verification_mode_from_payload, DecodeError as TopicMessageDecodeError,
     JoinMessage, LeaveMessage, MessageType as TopicMessageType, TopicMessage,
     FileAnnouncementMessage, CanSeedMessage, SyncUpdateMessage,
-    StreamRequestMessage, StreamAcceptMessage, StreamRejectMessage,
-    StreamQueryMessage, StreamActiveMessage, StreamEndedMessage,
+    StreamRequestMessage,
 };

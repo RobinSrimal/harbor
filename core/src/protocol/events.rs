@@ -31,6 +31,18 @@ pub enum ProtocolEvent {
     StreamRejected(StreamRejectedEvent),
     /// An active stream has ended
     StreamEnded(StreamEndedEvent),
+    /// MOQ session established and ready for publishing/consuming media
+    StreamConnected(StreamConnectedEvent),
+    /// A direct message was received from a peer
+    DmReceived(DmReceivedEvent),
+    /// DM sync update received from a peer (raw CRDT bytes)
+    DmSyncUpdate(DmSyncUpdateEvent),
+    /// A peer is requesting DM sync state
+    DmSyncRequest(DmSyncRequestEvent),
+    /// Response to our DM sync request (full CRDT state)
+    DmSyncResponse(DmSyncResponseEvent),
+    /// A file was announced via DM (peer-to-peer file share)
+    DmFileAnnounced(DmFileAnnouncedEvent),
 }
 
 /// An incoming message from the event bus
@@ -170,6 +182,84 @@ pub struct StreamEndedEvent {
     pub request_id: [u8; 32],
     /// The peer whose stream ended
     pub peer_id: [u8; 32],
+}
+
+/// Event: MOQ session established and ready for media
+///
+/// Emitted on both sides after the MOQ handshake completes.
+/// The app can now call `publish_to_stream()` or `consume_stream()`.
+#[derive(Debug, Clone)]
+pub struct StreamConnectedEvent {
+    /// The stream request this session belongs to
+    pub request_id: [u8; 32],
+    /// The topic this stream is scoped to
+    pub topic_id: [u8; 32],
+    /// The remote peer
+    pub peer_id: [u8; 32],
+    /// true = we are the source (publisher), false = we are the destination (consumer)
+    pub is_source: bool,
+}
+
+/// Event: A direct message was received from a peer
+#[derive(Debug, Clone)]
+pub struct DmReceivedEvent {
+    /// The sender's EndpointID
+    pub sender_id: [u8; 32],
+    /// The decrypted message payload
+    pub payload: Vec<u8>,
+    /// Timestamp when received (Unix seconds)
+    pub timestamp: i64,
+}
+
+/// Event: DM sync update received from a peer
+///
+/// Application should apply this to their local CRDT.
+#[derive(Debug, Clone)]
+pub struct DmSyncUpdateEvent {
+    /// The sender who made the changes
+    pub sender_id: [u8; 32],
+    /// Raw CRDT bytes (Loro delta, Yjs update, etc.)
+    pub data: Vec<u8>,
+}
+
+/// Event: A peer is requesting DM sync state
+///
+/// Application should respond with their current CRDT state via
+/// `protocol.respond_sync(Target::Dm(sender_id), ...)`.
+#[derive(Debug, Clone)]
+pub struct DmSyncRequestEvent {
+    /// Who is requesting (respond to this peer)
+    pub sender_id: [u8; 32],
+}
+
+/// Event: Response to our DM sync request
+///
+/// Application should import this into their CRDT.
+#[derive(Debug, Clone)]
+pub struct DmSyncResponseEvent {
+    /// The peer who responded
+    pub sender_id: [u8; 32],
+    /// Full CRDT state bytes
+    pub data: Vec<u8>,
+}
+
+/// Event: A file was announced via DM
+#[derive(Debug, Clone)]
+pub struct DmFileAnnouncedEvent {
+    /// Who shared the file
+    pub sender_id: [u8; 32],
+    /// BLAKE3 hash of the file
+    pub hash: [u8; 32],
+    /// Human-readable filename
+    pub display_name: String,
+    /// Total file size in bytes
+    pub total_size: u64,
+    /// Total number of chunks
+    pub total_chunks: u32,
+    /// Number of sections
+    pub num_sections: u8,
+    /// Timestamp when announced
+    pub timestamp: i64,
 }
 
 #[cfg(test)]

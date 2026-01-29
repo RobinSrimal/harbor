@@ -23,7 +23,7 @@ use crate::network::send::SendService;
 
 use crate::data::{
     BlobMetadata, BlobState, BlobStore, CHUNK_SIZE, LocalIdentity, SectionTrace,
-    add_blob_recipient, get_blob, get_blobs_for_topic, get_section_peer_suggestion,
+    add_blob_recipient, get_blob, get_blobs_for_scope, get_section_peer_suggestion,
     get_section_traces, get_topic_members, init_blob_sections, insert_blob,
     mark_blob_complete, record_section_received,
 };
@@ -280,7 +280,7 @@ impl ShareService {
     pub async fn import_file(
         &self,
         source_path: impl AsRef<Path>,
-        topic_id: &[u8; 32],
+        scope_id: &[u8; 32],
     ) -> Result<([u8; 32], FileAnnouncement), ShareError> {
         let source_path = source_path.as_ref();
 
@@ -309,7 +309,7 @@ impl ShareService {
             insert_blob(
                 &db_lock,
                 &hash,
-                topic_id,
+                scope_id,
                 &self.identity.public_key,
                 &display_name,
                 total_size,
@@ -692,13 +692,13 @@ impl ShareService {
         })
     }
 
-    /// List all shared files for a topic
+    /// List all shared files for a scope (topic or endpoint)
     pub async fn list_blobs(
         &self,
-        topic_id: &[u8; 32],
+        scope_id: &[u8; 32],
     ) -> Result<Vec<BlobMetadata>, ShareError> {
         let db_lock = self.db.lock().await;
-        get_blobs_for_topic(&db_lock, topic_id)
+        get_blobs_for_scope(&db_lock, scope_id)
             .map_err(|e| ShareError::Database(e.to_string()))
     }
 
@@ -757,7 +757,7 @@ impl ShareService {
     pub async fn share_file(
         &self,
         file_path: &Path,
-        topic_id: &[u8; 32],
+        scope_id: &[u8; 32],
     ) -> Result<([u8; 32], u64, u32, u8, String), ShareError> {
         // Check file exists and is large enough
         let file_metadata = std::fs::metadata(file_path)
@@ -770,7 +770,7 @@ impl ShareService {
         info!(
             file = %file_path.display(),
             size = file_metadata.len(),
-            topic = hex::encode(&topic_id[..8]),
+            scope = hex::encode(&scope_id[..8]),
             "Starting file share"
         );
 
@@ -792,7 +792,7 @@ impl ShareService {
             insert_blob(
                 &db_lock,
                 &hash,
-                topic_id,
+                scope_id,
                 &self.identity.public_key,
                 &display_name,
                 size,
@@ -947,6 +947,56 @@ impl ShareService {
                 );
             });
         }
+
+        Ok(hash)
+    }
+
+    /// Share a file via DM (direct message to a single peer)
+    ///
+    /// Imports the file and sends a FileAnnouncement via the DM channel.
+    /// The sender is the only seeder — no CanSeed announcement needed.
+    pub async fn share_dm_file(
+        &self,
+        recipient_id: &[u8; 32],
+        file_path: &Path,
+    ) -> Result<[u8; 32], ShareError> {
+        use crate::network::send::dm_messages::DmMessage;
+        use crate::network::send::topic_messages::FileAnnouncementMessage;
+
+        // 1. Import file (use recipient_id as scope)
+        let (hash, total_size, total_chunks, num_sections, display_name) =
+            self.share_file(file_path, recipient_id).await?;
+
+        info!(
+            hash = hex::encode(&hash[..8]),
+            size = total_size,
+            recipient = hex::encode(&recipient_id[..8]),
+            "File imported, announcing via DM"
+        );
+
+        // 2. Encode DM FileAnnouncement and send
+        let dm_msg = DmMessage::FileAnnouncement(FileAnnouncementMessage::new(
+            hash,
+            self.identity.public_key,
+            total_size,
+            total_chunks,
+            num_sections,
+            display_name,
+        ));
+
+        let send_service = self.send_service.as_ref()
+            .ok_or_else(|| ShareError::Protocol("send service not available".to_string()))?;
+
+        send_service
+            .send_to_dm(recipient_id, &dm_msg.encode())
+            .await
+            .map_err(|e| ShareError::Connection(e.to_string()))?;
+
+        info!(
+            hash = hex::encode(&hash[..8]),
+            recipient = hex::encode(&recipient_id[..8]),
+            "DM file announcement sent"
+        );
 
         Ok(hash)
     }
@@ -1421,9 +1471,9 @@ impl ShareService {
             );
 
             // Announce we can seed
-            match self.get_can_seed_recipients(&metadata.topic_id).await {
+            match self.get_can_seed_recipients(&metadata.scope_id).await {
                 Ok(recipients) => {
-                    if let Err(e) = self.announce_can_seed(&metadata.topic_id, hash, &recipients).await {
+                    if let Err(e) = self.announce_can_seed(&metadata.scope_id, hash, &recipients).await {
                         warn!(error = %e, "Failed to announce can seed");
                     }
                 }
@@ -1535,70 +1585,63 @@ impl ShareService {
     }
 }
 
-/// Process an incoming share message - handles all business logic
-///
-/// This function:
-/// 1. Routes the message to the appropriate handler
-/// 2. Performs database operations
-/// 3. Reads/writes chunks as needed
-/// 4. Returns response messages to send back
-///
-/// # Arguments
-/// * `message` - The incoming ShareMessage
-/// * `sender_id` - The sender's EndpointID (from connection)
-/// * `our_id` - Our EndpointID
-/// * `db` - Database connection
-/// * `blob_store` - Blob storage
-///
-/// # Returns
-/// * Vec of response ShareMessages to send back (may be empty)
-pub async fn process_incoming_share_message(
-    message: ShareMessage,
-    sender_id: [u8; 32],
-    our_id: [u8; 32],
-    db: &Mutex<DbConnection>,
-    blob_store: &BlobStore,
-) -> Vec<ShareMessage> {
-    match message {
-        ShareMessage::ChunkMapRequest(req) => {
-            handle_chunk_map_request(db, blob_store, our_id, req)
-                .await
-                .into_iter()
-                .collect()
-        }
-        ShareMessage::ChunkRequest(req) => {
-            handle_chunk_request(db, blob_store, sender_id, req).await
-        }
-        ShareMessage::Bitfield(bitfield) => {
-            handle_bitfield(sender_id, bitfield);
-            Vec::new()
-        }
-        ShareMessage::ChunkResponse(resp) => {
-            handle_chunk_response(db, blob_store, sender_id, resp)
-                .await
-                .into_iter()
-                .collect()
-        }
-        ShareMessage::PeerSuggestion(suggestion) => {
-            debug!(
-                hash = %hex::encode(&suggestion.hash[..8]),
-                section = suggestion.section_id,
-                suggested = %hex::encode(&suggestion.suggested_peer[..8]),
-                "received peer suggestion"
-            );
-            Vec::new()
-        }
-        ShareMessage::ChunkAck(ack) => {
-            trace!(
-                hash = %hex::encode(&ack.hash[..8]),
-                chunk = ack.chunk_index,
-                "received chunk ack"
-            );
-            Vec::new()
-        }
-        ShareMessage::ChunkMapResponse(_) => {
-            // Response message, shouldn't receive this as a request
-            Vec::new()
+impl ShareService {
+    /// Process an incoming share message - routes to appropriate handler
+    ///
+    /// This function:
+    /// 1. Routes the message to the appropriate handler
+    /// 2. Performs database operations
+    /// 3. Reads/writes chunks as needed
+    /// 4. Returns response messages to send back
+    pub async fn process_incoming_message(
+        &self,
+        message: ShareMessage,
+        sender_id: [u8; 32],
+    ) -> Vec<ShareMessage> {
+        let our_id = self.endpoint_id();
+        let db = self.db();
+        let blob_store = self.blob_store();
+        match message {
+            ShareMessage::ChunkMapRequest(req) => {
+                handle_chunk_map_request(db, blob_store, our_id, req)
+                    .await
+                    .into_iter()
+                    .collect()
+            }
+            ShareMessage::ChunkRequest(req) => {
+                handle_chunk_request(db, blob_store, sender_id, req).await
+            }
+            ShareMessage::Bitfield(bitfield) => {
+                handle_bitfield(sender_id, bitfield);
+                Vec::new()
+            }
+            ShareMessage::ChunkResponse(resp) => {
+                handle_chunk_response(db, blob_store, sender_id, resp)
+                    .await
+                    .into_iter()
+                    .collect()
+            }
+            ShareMessage::PeerSuggestion(suggestion) => {
+                debug!(
+                    hash = %hex::encode(&suggestion.hash[..8]),
+                    section = suggestion.section_id,
+                    suggested = %hex::encode(&suggestion.suggested_peer[..8]),
+                    "received peer suggestion"
+                );
+                Vec::new()
+            }
+            ShareMessage::ChunkAck(ack) => {
+                trace!(
+                    hash = %hex::encode(&ack.hash[..8]),
+                    chunk = ack.chunk_index,
+                    "received chunk ack"
+                );
+                Vec::new()
+            }
+            ShareMessage::ChunkMapResponse(_) => {
+                // Response message, shouldn't receive this as a request
+                Vec::new()
+            }
         }
     }
 }

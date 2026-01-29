@@ -16,6 +16,7 @@
 
 pub mod create_key_pair;
 pub mod derive_key;
+pub mod dm_keys;
 pub mod harbor;
 pub mod send;
 pub mod topic_keys;
@@ -27,5 +28,8 @@ pub use send::{
     create_packet, verify_and_decrypt_packet, verify_and_decrypt_packet_with_mode,
     // Types
     EpochKeys, PacketError, SendPacket, VerificationMode,
+    // DM
+    create_dm_packet, verify_and_decrypt_dm_packet, FLAG_DM,
 };
 pub use topic_keys::{harbor_id_from_topic, send_target_id, TopicKeys};
+pub use dm_keys::{dm_seal, dm_open, DmCryptoError};
