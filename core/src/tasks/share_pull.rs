@@ -11,18 +11,18 @@ use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use iroh::endpoint::Connection;
-use iroh::Endpoint;
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::data::{
-    get_blob, get_blobs_for_topic, get_section_peer_suggestion,
+    get_blob, get_blobs_for_scope, get_section_peer_suggestion,
     get_all_topics, BlobState, BlobStore, CHUNK_SIZE,
 };
 use crate::network::share::protocol::{
-    ChunkRequest, ShareMessage, SHARE_ALPN,
+    ChunkRequest, ShareMessage,
 };
+use crate::network::share::ShareService;
 use crate::protocol::{ProtocolEvent, FileProgressEvent, FileCompleteEvent};
 
 /// Tracks retry state for a blob
@@ -73,7 +73,7 @@ impl BlobRetryState {
 /// Run the share pull background task
 pub async fn run_share_pull_task(
     db: Arc<Mutex<DbConnection>>,
-    endpoint: Endpoint,
+    share_service: Arc<ShareService>,
     our_id: [u8; 32],
     running: Arc<RwLock<bool>>,
     check_interval: Duration,
@@ -190,7 +190,7 @@ pub async fn run_share_pull_task(
             // Try to pull from peers (only from topic members to prevent spam)
             let success = pull_missing_chunks(
                 &db,
-                &endpoint,
+                &share_service,
                 &blob_store,
                 &hash,
                 &topic_id,
@@ -243,7 +243,7 @@ fn find_incomplete_blobs(db: &DbConnection) -> Vec<([u8; 32], [u8; 32], [u8; 32]
     // Check each topic for incomplete blobs
     for topic in topics {
         let topic_id = topic.topic_id;
-        let blobs = match get_blobs_for_topic(db, &topic_id) {
+        let blobs = match get_blobs_for_scope(db, &topic_id) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -262,7 +262,7 @@ fn find_incomplete_blobs(db: &DbConnection) -> Vec<([u8; 32], [u8; 32], [u8; 32]
 /// Only pulls from topic members to prevent spam attacks
 async fn pull_missing_chunks(
     db: &Arc<Mutex<DbConnection>>,
-    endpoint: &Endpoint,
+    share_service: &Arc<ShareService>,
     blob_store: &BlobStore,
     hash: &[u8; 32],
     topic_id: &[u8; 32],
@@ -363,7 +363,7 @@ async fn pull_missing_chunks(
     let section_futures: Vec<_> = section_targets
         .into_iter()
         .map(|(section_id, chunks, target_id)| {
-            let endpoint = endpoint.clone();
+            let share_service = share_service.clone();
             let blob_store = blob_store.clone();
             let hash = *hash;
             let source_id = *source_id;
@@ -372,7 +372,7 @@ async fn pull_missing_chunks(
 
             async move {
                 pull_section(
-                    &endpoint,
+                    &share_service,
                     &blob_store,
                     &hash,
                     section_id,
@@ -408,7 +408,7 @@ async fn pull_missing_chunks(
 /// Pull a single section from a target peer
 /// Returns the number of chunks received
 async fn pull_section(
-    endpoint: &Endpoint,
+    share_service: &ShareService,
     blob_store: &BlobStore,
     hash: &[u8; 32],
     section_id: u8,
@@ -428,7 +428,14 @@ async fn pull_section(
     );
 
     // Try to connect to target
-    match connect_for_share(endpoint, &target_id).await {
+    let target_node_id = match iroh::EndpointId::from_bytes(&target_id) {
+        Ok(id) => id,
+        Err(e) => {
+            debug!(error = %e, "Invalid target node ID");
+            return 0;
+        }
+    };
+    match share_service.connect_for_share(target_node_id).await {
         Ok(conn) => {
             // Request chunks
             let result = request_chunks_from_peer(&conn, blob_store, hash, chunks, total_size).await;
@@ -466,7 +473,11 @@ async fn pull_section(
                         "Trying suggested peer (verified topic member)"
                     );
 
-                    if let Ok(suggested_conn) = connect_for_share(endpoint, &suggested_peer).await {
+                    let suggested_node_id = match iroh::EndpointId::from_bytes(&suggested_peer) {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    };
+                    if let Ok(suggested_conn) = share_service.connect_for_share(suggested_node_id).await {
                         let suggested_result =
                             request_chunks_from_peer(&suggested_conn, blob_store, hash, chunks, total_size)
                                 .await;
@@ -496,7 +507,11 @@ async fn pull_section(
             // If this wasn't the source, try the source as fallback
             // (source was already validated as topic member in caller)
             if target_id != *source_id {
-                if let Ok(conn) = connect_for_share(endpoint, source_id).await {
+                let source_node_id = match iroh::EndpointId::from_bytes(source_id) {
+                    Ok(id) => id,
+                    Err(_) => return chunks_received,
+                };
+                if let Ok(conn) = share_service.connect_for_share(source_node_id).await {
                     let result =
                         request_chunks_from_peer(&conn, blob_store, hash, chunks, total_size).await;
                     chunks_received += result.received;
@@ -506,25 +521,6 @@ async fn pull_section(
     }
 
     chunks_received
-}
-
-/// Connect to a peer using the Share ALPN
-async fn connect_for_share(
-    endpoint: &Endpoint,
-    peer_id: &[u8; 32],
-) -> Result<Connection, String> {
-    let node_id = iroh::NodeId::from_bytes(peer_id)
-        .map_err(|e| format!("Invalid node ID: {}", e))?;
-
-    let node_addr = iroh::NodeAddr::from(node_id);
-
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        endpoint.connect(node_addr, SHARE_ALPN),
-    )
-    .await
-    .map_err(|_| "Connection timeout".to_string())?
-    .map_err(|e| format!("Connection failed: {}", e))
 }
 
 /// Result of requesting chunks from a peer
@@ -546,11 +542,11 @@ async fn request_chunks_from_peer(
     let mut received = 0;
     let mut suggested_peers = Vec::new();
 
-    // Batch request chunks (request up to 10 at a time)
-    for chunk_batch in chunks.chunks(10) {
+    // Request each chunk individually (1:1 RPC)
+    for &chunk_index in chunks {
         let request = ShareMessage::ChunkRequest(ChunkRequest {
             hash: *hash,
-            chunks: chunk_batch.to_vec(),
+            chunk_index,
         });
 
         // Open bidirectional stream
@@ -570,52 +566,41 @@ async fn request_chunks_from_peer(
         }
         let _ = send.finish();
 
-        // Read responses
-        let max_response_size = (CHUNK_SIZE as usize + 256) * chunk_batch.len();
+        // Read single response
+        let max_response_size = CHUNK_SIZE as usize + 1024;
         let response_data = match recv.read_to_end(max_response_size).await {
             Ok(data) => data,
             Err(e) => {
                 debug!(error = %e, "Failed to read chunk response");
-                break;
+                continue;
             }
         };
 
-        // Parse and store chunks
-        // The response may contain multiple ChunkResponse messages
-        let mut offset = 0;
-        while offset < response_data.len() {
-            match ShareMessage::decode_with_size(&response_data[offset..]) {
-                Ok((ShareMessage::ChunkResponse(resp), consumed)) => {
-                    if &resp.hash == hash {
-                        if let Err(e) = blob_store.write_chunk(
-                            hash,
-                            resp.chunk_index,
-                            &resp.data,
-                            total_size,
-                        ) {
-                            warn!(error = %e, chunk = resp.chunk_index, "Failed to write chunk");
-                        } else {
-                            received += 1;
-                        }
+        // Parse response
+        match ShareMessage::decode(&response_data) {
+            Ok(ShareMessage::ChunkResponse(resp)) => {
+                if &resp.hash == hash {
+                    if let Err(e) = blob_store.write_chunk(
+                        hash,
+                        resp.chunk_index,
+                        &resp.data,
+                        total_size,
+                    ) {
+                        warn!(error = %e, chunk = resp.chunk_index, "Failed to write chunk");
+                    } else {
+                        received += 1;
                     }
-                    offset += consumed;
                 }
-                Ok((ShareMessage::PeerSuggestion(suggestion), consumed)) => {
-                    // Track suggested peer for fallback
-                    info!(
-                        suggested = hex::encode(&suggestion.suggested_peer[..8]),
-                        section = suggestion.section_id,
-                        "Peer suggested alternative - will try if current attempt fails"
-                    );
-                    suggested_peers.push(suggestion.suggested_peer);
-                    offset += consumed;
-                }
-                Ok((_, consumed)) => {
-                    // Skip unknown message types
-                    offset += consumed;
-                }
-                Err(_) => break,
             }
+            Ok(ShareMessage::PeerSuggestion(suggestion)) => {
+                info!(
+                    suggested = hex::encode(&suggestion.suggested_peer[..8]),
+                    section = suggestion.section_id,
+                    "Peer suggested alternative - will try if current attempt fails"
+                );
+                suggested_peers.push(suggestion.suggested_peer);
+            }
+            _ => {}
         }
     }
 
@@ -796,7 +781,7 @@ mod tests {
         conn.execute(
             "CREATE TABLE blobs (
                 hash BLOB PRIMARY KEY,
-                topic_id BLOB NOT NULL,
+                scope_id BLOB NOT NULL,
                 source_id BLOB NOT NULL,
                 display_name TEXT NOT NULL,
                 total_size INTEGER NOT NULL,
@@ -820,7 +805,7 @@ mod tests {
         
         // Insert partial blob (state = 0 = Partial)
         conn.execute(
-            "INSERT INTO blobs (hash, topic_id, source_id, display_name, total_size, total_chunks, state)
+            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
              VALUES (?1, ?2, ?3, 'test.bin', 1048576, 2, 0)",
             rusqlite::params![hash.as_slice(), topic_id.as_slice(), source_id.as_slice()],
         ).unwrap();
@@ -851,7 +836,7 @@ mod tests {
         conn.execute(
             "CREATE TABLE blobs (
                 hash BLOB PRIMARY KEY,
-                topic_id BLOB NOT NULL,
+                scope_id BLOB NOT NULL,
                 source_id BLOB NOT NULL,
                 display_name TEXT NOT NULL,
                 total_size INTEGER NOT NULL,
@@ -875,7 +860,7 @@ mod tests {
         
         // Insert complete blob (state = 1 = Complete)
         conn.execute(
-            "INSERT INTO blobs (hash, topic_id, source_id, display_name, total_size, total_chunks, state)
+            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
              VALUES (?1, ?2, ?3, 'test.bin', 1048576, 2, 1)",
             rusqlite::params![hash.as_slice(), topic_id.as_slice(), source_id.as_slice()],
         ).unwrap();
@@ -902,7 +887,7 @@ mod tests {
         conn.execute(
             "CREATE TABLE blobs (
                 hash BLOB PRIMARY KEY,
-                topic_id BLOB NOT NULL,
+                scope_id BLOB NOT NULL,
                 source_id BLOB NOT NULL,
                 display_name TEXT NOT NULL,
                 total_size INTEGER NOT NULL,
@@ -933,17 +918,17 @@ mod tests {
         
         // Insert partial blobs in both topics
         conn.execute(
-            "INSERT INTO blobs (hash, topic_id, source_id, display_name, total_size, total_chunks, state)
+            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
              VALUES (?1, ?2, ?3, 'file1.bin', 1048576, 2, 0)",
             rusqlite::params![hash1.as_slice(), topic1.as_slice(), source.as_slice()],
         ).unwrap();
         conn.execute(
-            "INSERT INTO blobs (hash, topic_id, source_id, display_name, total_size, total_chunks, state)
+            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
              VALUES (?1, ?2, ?3, 'file2.bin', 2097152, 4, 0)",
             rusqlite::params![hash2.as_slice(), topic1.as_slice(), source.as_slice()],
         ).unwrap();
         conn.execute(
-            "INSERT INTO blobs (hash, topic_id, source_id, display_name, total_size, total_chunks, state)
+            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
              VALUES (?1, ?2, ?3, 'file3.bin', 3145728, 6, 0)",
             rusqlite::params![hash3.as_slice(), topic2.as_slice(), source.as_slice()],
         ).unwrap();

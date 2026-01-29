@@ -11,10 +11,8 @@
 //! are promoted to the routing table. This prevents Sybil attacks where
 //! malicious nodes flood the DHT with fake node IDs.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
 
-use iroh::endpoint::Connection;
 use irpc::channel::mpsc;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
@@ -22,65 +20,13 @@ use tokio::task::JoinSet;
 use tokio::time::{interval, Interval};
 use tracing::{debug, error, info, trace};
 
-use super::api::{ApiClient, ApiMessage, WeakApiClient};
-use super::distance::{Distance, Id};
-use super::pool::{DhtPool, DhtPoolError as PoolError, DialInfo};
-use super::routing::{AddNodeResult, Buckets, RoutingTable, K, ALPHA, BUCKET_COUNT};
-use super::rpc::{FindNode, FindNodeResponse, NodeInfo, RpcClient, RpcMessage};
-
-/// Default interval for verifying candidate nodes (30 seconds)
-pub const DEFAULT_CANDIDATE_VERIFY_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Maximum candidates to verify per interval
-pub const MAX_CANDIDATES_PER_VERIFY: usize = 10;
-
-/// DHT configuration
-#[derive(Debug, Clone)]
-pub struct DhtConfig {
-    /// K parameter (bucket size, default: 20)
-    pub k: usize,
-    /// Alpha parameter (concurrency, default: 3)
-    pub alpha: usize,
-    /// Whether this node is transient (won't be added to others' routing tables)
-    pub transient: bool,
-    /// Optional RNG seed for deterministic testing
-    pub rng_seed: Option<[u8; 32]>,
-    /// Interval for verifying candidate nodes
-    pub candidate_verify_interval: Duration,
-    /// Maximum candidates to verify per interval
-    pub max_candidates_per_verify: usize,
-}
-
-impl Default for DhtConfig {
-    fn default() -> Self {
-        Self {
-            k: K,
-            alpha: ALPHA,
-            transient: false,
-            rng_seed: None,
-            candidate_verify_interval: DEFAULT_CANDIDATE_VERIFY_INTERVAL,
-            max_candidates_per_verify: MAX_CANDIDATES_PER_VERIFY,
-        }
-    }
-}
-
-impl DhtConfig {
-    /// Configuration for a transient node
-    pub fn transient() -> Self {
-        Self {
-            transient: true,
-            ..Default::default()
-        }
-    }
-
-    /// Configuration for a persistent node
-    pub fn persistent() -> Self {
-        Self {
-            transient: false,
-            ..Default::default()
-        }
-    }
-}
+use super::internal::api::ApiMessage;
+use super::internal::config::DhtConfig;
+use super::internal::distance::Id;
+use super::internal::pool::{DhtPool, DhtPoolError as PoolError, DialInfo};
+use super::internal::routing::{AddNodeResult, Buckets, RoutingTable, BUCKET_COUNT};
+use super::protocol::NodeInfo;
+use super::service::{DhtService, WeakDhtService};
 
 /// DHT node state
 struct DhtNode {
@@ -114,12 +60,10 @@ pub struct DhtActor {
     pool: DhtPool,
     /// Configuration
     config: DhtConfig,
-    /// Receiver for RPC messages (from network)
-    rpc_rx: mpsc::Receiver<RpcMessage>,
     /// Receiver for API messages (local control)
     api_rx: mpsc::Receiver<ApiMessage>,
-    /// Weak reference to API for sending notifications
-    api: WeakApiClient,
+    /// Weak reference to DhtService for outgoing operations and notifications
+    service: Option<WeakDhtService>,
     /// Background tasks
     tasks: JoinSet<()>,
     /// RNG for random lookups
@@ -129,7 +73,8 @@ pub struct DhtActor {
     /// Timer for periodic candidate verification
     candidate_verify_ticker: Interval,
     /// Relay URLs for nodes we know about (used for FindNode responses)
-    node_relay_urls: HashMap<Id, String>,
+    /// Value: (relay_url, verified_at) where verified_at is Some(timestamp) if verified via outbound connection
+    node_relay_urls: HashMap<Id, (String, Option<i64>)>,
 }
 
 impl DhtActor {
@@ -139,7 +84,7 @@ impl DhtActor {
         pool: DhtPool,
         config: DhtConfig,
         bootstrap: Vec<Id>,
-    ) -> (Self, RpcClient, ApiClient) {
+    ) -> (Self, irpc::Client<super::internal::api::ApiProtocol>) {
         Self::new_with_buckets(local_id, pool, config, bootstrap, None)
     }
 
@@ -150,7 +95,7 @@ impl DhtActor {
         config: DhtConfig,
         bootstrap: Vec<Id>,
         buckets: Option<Buckets>,
-    ) -> (Self, RpcClient, ApiClient) {
+    ) -> (Self, irpc::Client<super::internal::api::ApiProtocol>) {
         // Create node
         let mut node = match buckets {
             Some(b) => DhtNode::with_buckets(local_id, b),
@@ -164,13 +109,9 @@ impl DhtActor {
             }
         }
 
-        // Create RPC channel
-        let (rpc_tx, rpc_rx) = mpsc::channel(32);
-        let rpc_client = RpcClient::new(irpc::Client::local(rpc_tx));
-
         // Create API channel
         let (api_tx, api_rx) = mpsc::channel(32);
-        let api_client = ApiClient::new(irpc::Client::local(api_tx));
+        let api_client = irpc::Client::local(api_tx);
 
         // Create RNG
         let rng = match config.rng_seed {
@@ -185,9 +126,8 @@ impl DhtActor {
             node,
             pool,
             config,
-            rpc_rx,
             api_rx,
-            api: api_client.downgrade(),
+            service: None,
             tasks: JoinSet::new(),
             rng,
             candidates: HashSet::new(),
@@ -195,7 +135,15 @@ impl DhtActor {
             node_relay_urls: HashMap::new(),
         };
 
-        (actor, rpc_client, api_client)
+        (actor, api_client)
+    }
+
+    /// Set the DhtService reference (must be called before run())
+    ///
+    /// This breaks the circular dependency: DhtService owns the irpc client,
+    /// actor holds a weak ref back to DhtService.
+    pub fn set_service(&mut self, service: WeakDhtService) {
+        self.service = Some(service);
     }
 
     /// Run the actor's main loop
@@ -204,15 +152,7 @@ impl DhtActor {
             tokio::select! {
                 biased;
 
-                // Handle RPC messages from network
-                msg = self.rpc_rx.recv() => {
-                    match msg {
-                        Ok(Some(msg)) => self.handle_rpc(msg).await,
-                        _ => break,
-                    }
-                }
-
-                // Handle API messages from local control
+                // Handle API messages (from DhtService)
                 msg = self.api_rx.recv() => {
                     match msg {
                         Ok(Some(msg)) => self.handle_api(msg).await,
@@ -295,11 +235,11 @@ impl DhtActor {
     /// Returns Ok(()) if node responds, Err if unreachable.
     async fn ping_node(&self, node: &Id) -> Result<(), PoolError> {
         let dial_info = DialInfo::from_node_id(
-            iroh::NodeId::from_bytes(node.as_bytes()).expect("valid node id")
+            iroh::EndpointId::from_bytes(node.as_bytes()).expect("valid node id")
         );
 
         // Try to get/establish connection
-        let conn = self.pool.get_connection(&dial_info).await?;
+        let (conn, _relay_confirmed) = self.pool.get_connection(&dial_info).await?;
         
         // Send a FindNode RPC to verify the node is actually responsive
         // Use a random target - we don't care about the result, just that it responds
@@ -311,8 +251,8 @@ impl DhtActor {
         };
         let relay_url = self.pool.home_relay_url();
 
-        network_find_node(conn.connection(), random_target, requester, relay_url).await?;
-        
+        DhtService::send_find_node_on_conn(conn.connection(), random_target, requester, relay_url).await?;
+
         Ok(())
     }
 
@@ -347,25 +287,34 @@ impl DhtActor {
             debug!(count = to_verify.len(), "verifying candidate nodes");
         }
 
+        // Collect known relay URLs for candidates being verified
+        let candidate_relay_urls: HashMap<Id, String> = to_verify.iter()
+            .filter_map(|id| {
+                self.node_relay_urls.get(id).map(|(url, _)| (*id, url.clone()))
+            })
+            .collect();
+
         // Verify each candidate by attempting connection and sending FindNode RPC
         let pool = self.pool.clone();
-        let api = self.api.clone();
+        let service = self.service.clone();
         let transient = self.config.transient;
         let local_id = *self.node.local_id();
         let home_relay_url = self.pool.home_relay_url();
-        
+
         // Spawn verification as background task so we don't block the actor
         self.tasks.spawn(async move {
             let mut verified = Vec::new();
             let mut failed = Vec::new();
+            // Track relay URL confirmation results: (node_id, relay_url, verified_at)
+            let mut relay_confirmations: Vec<([u8; 32], String, Option<i64>)> = Vec::new();
 
             for id in to_verify {
                 let dial_info = DialInfo::from_node_id(
-                    iroh::NodeId::from_bytes(id.as_bytes()).expect("valid node id")
+                    iroh::EndpointId::from_bytes(id.as_bytes()).expect("valid node id")
                 );
 
                 match pool.get_connection(&dial_info).await {
-                    Ok(conn) => {
+                    Ok((conn, relay_confirmed)) => {
                         // Send a FindNode RPC to verify the node is actually responsive
                         let random_target = Id::new(rand::random());
                         let requester = if transient {
@@ -374,10 +323,20 @@ impl DhtActor {
                             Some(*local_id.as_bytes())
                         };
 
-                        match network_find_node(conn.connection(), random_target, requester, home_relay_url.clone()).await {
+                        match DhtService::send_find_node_on_conn(conn.connection(), random_target, requester, home_relay_url.clone()).await {
                             Ok(_) => {
-                                trace!(node = %id, "candidate verified - FindNode RPC succeeded");
+                                trace!(node = %id, relay_confirmed = relay_confirmed, "candidate verified - FindNode RPC succeeded");
                                 verified.push(*id.as_bytes());
+
+                                // Record relay URL verification result
+                                if let Some(relay_url) = candidate_relay_urls.get(&id) {
+                                    let verified_at = if relay_confirmed {
+                                        Some(crate::data::dht::peer::current_timestamp())
+                                    } else {
+                                        None // connected via DNS, relay URL is stale
+                                    };
+                                    relay_confirmations.push((*id.as_bytes(), relay_url.clone(), verified_at));
+                                }
                             }
                             Err(e) => {
                                 trace!(node = %id, error = %e, "candidate FindNode RPC failed");
@@ -392,11 +351,22 @@ impl DhtActor {
                 }
             }
 
-            // Notify API to add verified nodes to routing table
+            // Notify service to add verified nodes to routing table
             if !verified.is_empty() {
                 info!(count = verified.len(), "verified {} candidate nodes", verified.len());
-                if let Some(api) = api.upgrade() {
-                    api.nodes_seen(&verified).await.ok();
+                if let Some(ref svc_weak) = service {
+                    if let Some(svc) = svc_weak.upgrade() {
+                        svc.nodes_seen(&verified).await.ok();
+                    }
+                }
+            }
+
+            // Send relay URL confirmation results back to actor
+            if !relay_confirmations.is_empty() {
+                if let Some(ref svc_weak) = service {
+                    if let Some(svc) = svc_weak.upgrade() {
+                        svc.confirm_relay_urls(relay_confirmations).await.ok();
+                    }
                 }
             }
 
@@ -411,99 +381,7 @@ impl DhtActor {
         });
     }
 
-    /// Handle an RPC message from the network
-    async fn handle_rpc(&mut self, msg: RpcMessage) {
-        match msg {
-            RpcMessage::FindNode(msg) => {
-                // If requester wants to be added to our routing table,
-                // add them directly since they've proven they're real by connecting to us.
-                // Also store their relay URL for sharing with other nodes.
-                if let Some(requester_id) = msg.requester {
-                    if !self.config.transient {
-                        let id = Id::new(requester_id);
-                        // Don't add ourselves
-                        if id != *self.node.local_id() {
-                            // Add directly to routing table - they connected to us, so they're verified
-                            self.add_node_with_eviction(id).await;
-                            
-                            // Store their relay URL if provided - CRITICAL for peer discovery
-                            // Only log if this is a new relay URL (avoid spam)
-                            if let Some(ref relay_url) = msg.requester_relay_url {
-                                use std::collections::hash_map::Entry;
-                                let is_new = match self.node_relay_urls.entry(id) {
-                                    Entry::Vacant(e) => {
-                                        e.insert(relay_url.clone());
-                                        true
-                                    }
-                                    Entry::Occupied(mut e) => {
-                                        if e.get() != relay_url {
-                                            e.insert(relay_url.clone());
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    }
-                                };
-                                
-                                if is_new {
-                                    // ALSO register with DhtPool so we can connect back to them
-                                    let node_id = iroh::NodeId::from_bytes(&requester_id)
-                                        .expect("valid node id");
-                                    let dial_info = DialInfo::from_node_id_with_relay(node_id, relay_url.clone());
-                                    self.pool.register_dial_info(dial_info).await;
-                                    
-                                    info!(
-                                        requester = %id,
-                                        relay = %relay_url,
-                                        "stored relay URL for requester (new)"
-                                    );
-                                }
-                            }
-                            
-                            debug!(
-                                requester = %id,
-                                relay = ?msg.requester_relay_url,
-                                "added requester directly to routing table"
-                            );
-                        }
-                    }
-                }
-                
-                let closest = self.node.routing_table.find_closest_nodes(&msg.target, self.config.k);
-                
-                // Convert to NodeInfo, including stored relay URLs for connectivity
-                let nodes: Vec<NodeInfo> = closest
-                    .iter()
-                    .map(|id| {
-                        let node_relay = self.node_relay_urls.get(id).cloned();
-                        NodeInfo::from_id_with_relay(id, node_relay)
-                    })
-                    .collect();
-                
-                // Log how many nodes have relay URLs - helpful for debugging discovery
-                let with_relay = nodes.iter().filter(|n| n.relay_url.is_some()).count();
-                if nodes.len() > 0 && with_relay < nodes.len() {
-                    debug!(
-                        total = nodes.len(),
-                        with_relay = with_relay,
-                        "FindNode response - some nodes missing relay URLs"
-                    );
-                }
-
-                debug!(
-                    target = %msg.target,
-                    returning_nodes = nodes.len(),
-                    routing_table_size = self.node.routing_table.len(),
-                    "responding to FindNode request"
-                );
-
-                let response = FindNodeResponse { nodes };
-                msg.tx.send(response).await.ok();
-            }
-        }
-    }
-
-    /// Handle an API message from local control
+    /// Handle an API message
     async fn handle_api(&mut self, msg: ApiMessage) {
         match msg {
             ApiMessage::NodesSeen(msg) => {
@@ -563,21 +441,23 @@ impl DhtActor {
 
                 let pool = self.pool.clone();
                 let config = self.config.clone();
-                let api = self.api.clone();
+                let service = self.service.clone().unwrap_or_else(|| {
+                    panic!("DhtActor::set_service must be called before run()")
+                });
                 let target = msg.target;
                 let local_id = *self.node.local_id();
                 let tx = msg.tx;
 
                 self.tasks.spawn(async move {
-                    let result = iterative_find_node(
+                    let result = DhtService::iterative_find_node(
                         target,
                         initial,
                         local_id,
                         pool,
                         config,
-                        api,
+                        service,
                     ).await;
-                    
+
                     let ids: Vec<[u8; 32]> = result.into_iter().map(|id| *id.as_bytes()).collect();
                     tx.send(ids).await.ok();
                 });
@@ -597,33 +477,54 @@ impl DhtActor {
             }
 
             ApiMessage::GetNodeRelayUrls(msg) => {
-                let relay_urls: Vec<([u8; 32], String)> = self.node_relay_urls
+                let relay_urls: Vec<([u8; 32], String, Option<i64>)> = self.node_relay_urls
                     .iter()
-                    .map(|(id, url)| (*id.as_bytes(), url.clone()))
+                    .map(|(id, (url, verified_at))| (*id.as_bytes(), url.clone(), *verified_at))
                     .collect();
                 msg.tx.send(relay_urls).await.ok();
             }
 
             ApiMessage::SetNodeRelayUrls(msg) => {
                 // Restore relay URLs from database
-                for (id_bytes, url) in &msg.relay_urls {
+                for (id_bytes, url, verified_at) in &msg.relay_urls {
                     let id = Id::new(*id_bytes);
-                    self.node_relay_urls.insert(id, url.clone());
+                    self.node_relay_urls.insert(id, (url.clone(), *verified_at));
                 }
                 debug!(count = self.node_relay_urls.len(), "restored node relay URLs from database");
+            }
+
+            ApiMessage::ConfirmRelayUrls(msg) => {
+                for (id_bytes, url, verified_at) in &msg.confirmed {
+                    let id = Id::new(*id_bytes);
+                    match self.node_relay_urls.get(&id) {
+                        Some((existing_url, _)) if existing_url == url => {
+                            // Same URL — update verified_at
+                            self.node_relay_urls.insert(id, (url.clone(), *verified_at));
+                        }
+                        _ => {
+                            // URL changed or not present — store with new status
+                            self.node_relay_urls.insert(id, (url.clone(), *verified_at));
+                        }
+                    }
+                }
+                if !msg.confirmed.is_empty() {
+                    debug!(count = msg.confirmed.len(), "updated relay URL verification status");
+                }
             }
 
             ApiMessage::SelfLookup(msg) => {
                 let local_id = *self.node.local_id();
                 let initial = self.node.routing_table.find_closest_nodes(&local_id, self.config.k);
-                
+
                 let pool = self.pool.clone();
                 let config = self.config.clone();
-                let api = self.api.clone();
+                let service = self.service.clone().unwrap_or_else(|| {
+                    panic!("DhtActor::set_service must be called before run()")
+                });
                 let tx = msg.tx;
 
                 self.tasks.spawn(async move {
-                    iterative_find_node(local_id, initial, local_id, pool, config, api).await;
+                    DhtService::iterative_find_node(local_id, initial, local_id, pool, config, service).await;
                     tx.send(()).await.ok();
                 });
             }
@@ -631,15 +532,17 @@ impl DhtActor {
             ApiMessage::RandomLookup(msg) => {
                 let random_id = Id::new(self.rng.r#gen());
                 let initial = self.node.routing_table.find_closest_nodes(&random_id, self.config.k);
-                
+
                 let pool = self.pool.clone();
                 let config = self.config.clone();
-                let api = self.api.clone();
+                let service = self.service.clone().unwrap_or_else(|| {
+                    panic!("DhtActor::set_service must be called before run()")
+                });
                 let local_id = *self.node.local_id();
                 let tx = msg.tx;
 
                 self.tasks.spawn(async move {
-                    iterative_find_node(random_id, initial, local_id, pool, config, api).await;
+                    DhtService::iterative_find_node(random_id, initial, local_id, pool, config, service).await;
                     tx.send(()).await.ok();
                 });
             }
@@ -670,22 +573,23 @@ impl DhtActor {
                                 use std::collections::hash_map::Entry;
                                 let is_new = match self.node_relay_urls.entry(id) {
                                     Entry::Vacant(e) => {
-                                        e.insert(relay_url.clone());
+                                        e.insert((relay_url.clone(), None)); // unverified
                                         true
                                     }
                                     Entry::Occupied(mut e) => {
-                                        if e.get() != relay_url {
-                                            e.insert(relay_url.clone());
+                                        let (existing_url, _) = e.get();
+                                        if existing_url != relay_url {
+                                            e.insert((relay_url.clone(), None)); // new URL, reset to unverified
                                             true
                                         } else {
-                                            false
+                                            false // same URL, keep existing verified_at
                                         }
                                     }
                                 };
                                 
                                 if is_new {
                                     // ALSO register with DhtPool so we can connect back to them
-                                    let node_id = iroh::NodeId::from_bytes(&requester_id)
+                                    let node_id = iroh::EndpointId::from_bytes(&requester_id)
                                         .expect("valid node id");
                                     let dial_info = DialInfo::from_node_id_with_relay(node_id, relay_url.clone());
                                     self.pool.register_dial_info(dial_info).await;
@@ -706,7 +610,7 @@ impl DhtActor {
                 let nodes: Vec<NodeInfo> = closest
                     .iter()
                     .map(|id| {
-                        let relay_url = self.node_relay_urls.get(id).cloned();
+                        let relay_url = self.node_relay_urls.get(id).map(|(url, _)| url.clone());
                         NodeInfo::from_id_with_relay(id, relay_url)
                     })
                     .collect();
@@ -726,277 +630,15 @@ impl DhtActor {
     }
 }
 
-/// Send FindNode RPC over a QUIC connection
-/// 
-/// Opens a bidirectional stream, sends the request, and reads the response.
-async fn network_find_node(
-    conn: &Connection,
-    target: Id,
-    requester: Option<[u8; 32]>,
-    requester_relay_url: Option<String>,
-) -> Result<FindNodeResponse, PoolError> {
-    // Open bidirectional stream
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to open stream: {}", e)))?;
-
-    // Create and serialize request
-    let request = FindNode { target, requester, requester_relay_url };
-    let request_bytes = postcard::to_allocvec(&request)
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to serialize request: {}", e)))?;
-
-    // Send length-prefixed request
-    let len = request_bytes.len() as u32;
-    send.write_all(&len.to_be_bytes())
-        .await
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to send length: {}", e)))?;
-    send.write_all(&request_bytes)
-        .await
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to send request: {}", e)))?;
-    send.finish()
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to finish send: {}", e)))?;
-
-    // Read length-prefixed response
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to read response length: {}", e)))?;
-    let response_len = u32::from_be_bytes(len_buf) as usize;
-
-    // Sanity check response size (max 64KB should be plenty for node list)
-    if response_len > 65536 {
-        return Err(PoolError::ConnectionFailed("response too large".to_string()));
-    }
-
-    let mut response_bytes = vec![0u8; response_len];
-    recv.read_exact(&mut response_bytes)
-        .await
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to read response: {}", e)))?;
-
-    // Deserialize response
-    let response: FindNodeResponse = postcard::from_bytes(&response_bytes)
-        .map_err(|e| PoolError::ConnectionFailed(format!("failed to deserialize response: {}", e)))?;
-
-    Ok(response)
-}
-
-/// Perform iterative node lookup (Kademlia algorithm)
-async fn iterative_find_node(
-    target: Id,
-    initial: Vec<Id>,
-    local_id: Id,
-    pool: DhtPool,
-    config: DhtConfig,
-    api: WeakApiClient,
-) -> Vec<Id> {
-    // Track candidates sorted by distance
-    let mut candidates: BTreeSet<(Distance, Id)> = initial
-        .into_iter()
-        .filter(|id| *id != local_id)
-        .map(|id| (target.distance(&id), id))
-        .collect();
-
-    // Track which nodes we've queried
-    let mut queried: HashSet<Id> = HashSet::new();
-    queried.insert(local_id);
-
-    // Track results
-    let mut results: BTreeSet<(Distance, Id)> = BTreeSet::new();
-    results.insert((target.distance(&local_id), local_id));
-
-    loop {
-        // Get alpha unqueried candidates to query
-        let to_query: Vec<Id> = candidates
-            .iter()
-            .filter(|(_, id)| !queried.contains(id))
-            .take(config.alpha)
-            .map(|(_, id)| *id)
-            .collect();
-
-        if to_query.is_empty() {
-            break;
-        }
-
-        // Mark as queried
-        for id in &to_query {
-            queried.insert(*id);
-        }
-
-        // Get our relay URL to include in requests
-        let home_relay_url = pool.home_relay_url();
-        
-        // Query nodes in parallel
-        let mut query_tasks = JoinSet::new();
-        for id in to_query {
-            let pool = pool.clone();
-            let target_for_rpc = target;
-            let requester_for_rpc = if config.transient {
-                None
-            } else {
-                Some(*local_id.as_bytes())
-            };
-            let relay_url_for_rpc = home_relay_url.clone();
-
-            query_tasks.spawn(async move {
-                // Create dial info - pool will merge with known relay URLs
-                let dial_info = DialInfo::from_node_id(
-                    iroh::NodeId::from_bytes(id.as_bytes()).expect("valid node id")
-                );
-                
-                match pool.get_connection(&dial_info).await {
-                    Ok(conn) => {
-                        // Send actual FindNode RPC over the connection
-                        match network_find_node(conn.connection(), target_for_rpc, requester_for_rpc, relay_url_for_rpc).await {
-                            Ok(response) => {
-                                // Return full NodeInfo so caller can extract relay URLs
-                                trace!(
-                                    peer = %id,
-                                    nodes_returned = response.nodes.len(),
-                                    "FindNode RPC succeeded"
-                                );
-                                (id, Ok(response.nodes))
-                            }
-                            Err(e) => {
-                                debug!(peer = %id, error = %e, "FindNode RPC failed");
-                                (id, Err(e))
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        debug!(peer = %id, error = %e, "Failed to connect for FindNode");
-                        (id, Err(e))
-                    }
-                }
-            });
-        }
-
-        // Collect results
-        while let Some(result) = query_tasks.join_next().await {
-            let Ok((id, query_result)) = result else {
-                continue;
-            };
-
-            match query_result {
-                Ok(node_infos) => {
-                    // Add to results
-                    let dist = target.distance(&id);
-                    results.insert((dist, id));
-
-                    // Notify API that responding node is alive (verified by successful query)
-                    if let Some(api) = api.upgrade() {
-                        api.nodes_seen(&[*id.as_bytes()]).await.ok();
-                    }
-
-                    // Add new candidates for lookup AND notify DHT about discovered nodes
-                    // Also register relay URLs for future connectivity AND store for sharing
-                    let mut discovered: Vec<[u8; 32]> = Vec::new();
-                    let mut discovered_relay_urls: Vec<([u8; 32], String)> = Vec::new();
-                    for info in node_infos {
-                        let node = Id::new(info.node_id);
-                        if node != local_id && !queried.contains(&node) {
-                            candidates.insert((target.distance(&node), node));
-                            discovered.push(info.node_id);
-                            
-                            // Register relay URL with pool for future connections
-                            // AND store in node_relay_urls so we can share with others
-                            if let Some(relay_url) = info.relay_url {
-                                let node_id = iroh::NodeId::from_bytes(&info.node_id)
-                                    .expect("valid node id");
-                                let dial_info = DialInfo::from_node_id_with_relay(node_id, relay_url.clone());
-                                pool.register_dial_info(dial_info).await;
-                                // Store for sharing with other nodes in FindNode responses
-                                discovered_relay_urls.push((info.node_id, relay_url));
-                            }
-                        }
-                    }
-                    
-                    // Store discovered relay URLs in our node_relay_urls map
-                    // This allows us to share them with other nodes in FindNode responses
-                    if !discovered_relay_urls.is_empty() {
-                        if let Some(api) = api.upgrade() {
-                            api.set_node_relay_urls(discovered_relay_urls).await.ok();
-                        }
-                    }
-
-                    // Add discovered nodes to DHT candidates for verification
-                    // This enables proper peer discovery propagation - nodes learn
-                    // about each other through query responses, not just direct contact
-                    if !discovered.is_empty() {
-                        debug!(
-                            peer = %id,
-                            discovered_count = discovered.len(),
-                            "discovered nodes from FindNode response"
-                        );
-                        if let Some(api) = api.upgrade() {
-                            api.add_candidates(&discovered).await.ok();
-                        }
-                    } else {
-                        debug!(peer = %id, "FindNode response contained no new nodes");
-                    }
-                }
-                Err(_) => {
-                    // Node is dead
-                    if let Some(api) = api.upgrade() {
-                        api.nodes_dead(&[*id.as_bytes()]).await.ok();
-                    }
-                }
-            }
-        }
-
-        // Truncate results to K
-        while results.len() > config.k {
-            results.pop_last();
-        }
-
-        // Check if we have K results and no better candidates
-        // Guard against k=0 (would cause underflow)
-        if config.k == 0 {
-            break;
-        }
-        let kth_best = results.iter().nth(config.k - 1).map(|(d, _)| *d);
-        let best_candidate = candidates.first().map(|(d, _)| *d);
-
-        match (kth_best, best_candidate) {
-            (Some(kth), Some(best)) if best >= kth => break,
-            (Some(_), None) => break,
-            _ => continue,
-        }
-    }
-
-    results.into_iter().map(|(_, id)| id).collect()
-}
-
-/// Create a DHT node and return clients for interaction
-pub fn create_dht_node(
-    local_id: Id,
-    pool: DhtPool,
-    config: DhtConfig,
-    bootstrap: Vec<Id>,
-) -> (RpcClient, ApiClient) {
-    create_dht_node_with_buckets(local_id, pool, config, bootstrap, None)
-}
-
-/// Create a DHT node with pre-existing buckets
-pub fn create_dht_node_with_buckets(
-    local_id: Id,
-    pool: DhtPool,
-    config: DhtConfig,
-    bootstrap: Vec<Id>,
-    buckets: Option<Buckets>,
-) -> (RpcClient, ApiClient) {
-    let (actor, rpc_client, api_client) = DhtActor::new_with_buckets(
-        local_id, pool, config, bootstrap, buckets
-    );
-    
-    tokio::spawn(actor.run());
-    
-    (rpc_client, api_client)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::protocol::{FindNode, FindNodeResponse};
+    use super::super::internal::config::{DEFAULT_CANDIDATE_VERIFY_INTERVAL, MAX_CANDIDATES_PER_VERIFY};
+    use super::super::internal::distance::Distance;
+    use super::super::internal::routing::{K, ALPHA};
+    use std::collections::BTreeSet;
+    use std::time::Duration;
 
     fn make_id(seed: u8) -> Id {
         Id::new([seed; 32])
@@ -1319,32 +961,6 @@ mod tests {
         let decoded: FindNodeResponse = postcard::from_bytes(&bytes).unwrap();
         
         assert_eq!(decoded.nodes.len(), K);
-    }
-
-    #[test]
-    fn test_length_prefixed_protocol() {
-        // Test the length-prefixed message format used in network_find_node
-        let request = FindNode {
-            target: make_id(42),
-            requester: Some([1u8; 32]),
-            requester_relay_url: Some("https://relay.example.com/".to_string()),
-        };
-
-        // Simulate what network_find_node does
-        let request_bytes = postcard::to_allocvec(&request).unwrap();
-        let len = request_bytes.len() as u32;
-        
-        // Build message with length prefix
-        let mut message = Vec::new();
-        message.extend_from_slice(&len.to_be_bytes());
-        message.extend_from_slice(&request_bytes);
-
-        // Parse it back
-        let parsed_len = u32::from_be_bytes([message[0], message[1], message[2], message[3]]) as usize;
-        assert_eq!(parsed_len, request_bytes.len());
-
-        let parsed_request: FindNode = postcard::from_bytes(&message[4..]).unwrap();
-        assert_eq!(parsed_request.target, request.target);
     }
 
     #[test]

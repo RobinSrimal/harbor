@@ -3,37 +3,32 @@
 //! Replicates unacknowledged packets to Harbor Nodes for offline delivery.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use iroh::Endpoint;
-use rusqlite::Connection;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace};
 
 use crate::data::send::{
     get_packets_needing_replication, delete_outgoing_packet,
 };
-use crate::network::dht::ApiClient as DhtApiClient;
+use crate::network::harbor::HarborService;
 use crate::network::harbor::protocol::HarborPacketType;
 use crate::resilience::{PoWChallenge, PoWConfig, compute_pow};
-
-use std::time::Duration;
 
 use crate::protocol::Protocol;
 
 impl Protocol {
     /// Run the replication checker
     pub(crate) async fn run_replication_checker(
-        db: Arc<Mutex<Connection>>,
-        endpoint: Endpoint,
+        harbor_service: Arc<HarborService>,
         our_id: [u8; 32],
-        dht_client: Option<DhtApiClient>,
         running: Arc<RwLock<bool>>,
         check_interval: Duration,
         replication_factor: usize,
         max_replication_attempts: usize,
-        connect_timeout: Duration,
-        response_timeout: Duration,
     ) {
+        let db = harbor_service.db().clone();
+        let dht_service = harbor_service.dht_service().clone();
         loop {
             // Check if we should stop
             if !*running.read().await {
@@ -63,7 +58,7 @@ impl Protocol {
             // For each packet, find Harbor Nodes via DHT and replicate
             for packet in &packets {
                 // Find Harbor Nodes for this topic's HarborID
-                let harbor_nodes = Self::find_harbor_nodes(&dht_client, &packet.harbor_id).await;
+                let harbor_nodes = HarborService::find_harbor_nodes(&dht_service, &packet.harbor_id).await;
 
                 if harbor_nodes.is_empty() {
                     debug!(
@@ -123,7 +118,7 @@ impl Protocol {
                         break;
                     }
 
-                    match Self::send_harbor_store(&endpoint, harbor_node, &store_req, connect_timeout, response_timeout).await {
+                    match harbor_service.send_harbor_store(harbor_node, &store_req).await {
                         Ok(true) => {
                             success_count += 1;
                             trace!(

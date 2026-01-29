@@ -183,25 +183,15 @@ pub fn get_all_topics(conn: &Connection) -> rusqlite::Result<Vec<TopicSubscripti
 
 // ============ Member Management ============
 
-/// Add a member to a topic (without relay URL)
+/// Add a member to a topic
 pub fn add_topic_member(
     conn: &Connection,
     topic_id: &[u8; 32],
     endpoint_id: &[u8; 32],
 ) -> rusqlite::Result<()> {
-    add_topic_member_with_relay(conn, topic_id, endpoint_id, None)
-}
-
-/// Add a member to a topic with optional relay URL
-pub fn add_topic_member_with_relay(
-    conn: &Connection,
-    topic_id: &[u8; 32],
-    endpoint_id: &[u8; 32],
-    relay_url: Option<&str>,
-) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO topic_members (topic_id, endpoint_id, relay_url) VALUES (?1, ?2, ?3)",
-        params![topic_id.as_slice(), endpoint_id.as_slice(), relay_url],
+        "INSERT OR REPLACE INTO topic_members (topic_id, endpoint_id) VALUES (?1, ?2)",
+        params![topic_id.as_slice(), endpoint_id.as_slice()],
     )?;
     Ok(())
 }
@@ -243,31 +233,6 @@ pub fn get_topic_members(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Re
         .query_map([topic_id.as_slice()], |row| {
             let id_vec: Vec<u8> = row.get(0)?;
             parse_id(&id_vec, "endpoint_id")
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    
-    Ok(members)
-}
-
-/// Member info with relay URL
-#[derive(Debug, Clone)]
-pub struct TopicMemberInfo {
-    pub endpoint_id: [u8; 32],
-    pub relay_url: Option<String>,
-}
-
-/// Get all members of a topic with relay info
-pub fn get_topic_members_with_info(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<Vec<TopicMemberInfo>> {
-    let mut stmt = conn.prepare(
-        "SELECT endpoint_id, relay_url FROM topic_members WHERE topic_id = ?1 ORDER BY joined_at",
-    )?;
-    
-    let members = stmt
-        .query_map([topic_id.as_slice()], |row| {
-            let id_vec: Vec<u8> = row.get(0)?;
-            let endpoint_id = parse_id(&id_vec, "endpoint_id")?;
-            let relay_url: Option<String> = row.get(1)?;
-            Ok(TopicMemberInfo { endpoint_id, relay_url })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     

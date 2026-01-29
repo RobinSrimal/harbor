@@ -87,13 +87,6 @@ scenario_dht_pool() {
     log "Phase 4: Waiting for connection pool activity (45s)..."
     sleep 45
     
-    # Force connection reuse by triggering refresh
-    log "Phase 5: Triggering member refresh to stress pool..."
-    for i in $(seq 1 $TEST_NODES); do
-        api_refresh_members $i > /dev/null
-        sleep 1
-    done
-    
     # Final wait for log messages
     sleep 15
     

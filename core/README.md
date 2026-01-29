@@ -1,12 +1,13 @@
 # harbor-core
 
-The foundation crate for Harbor Protocol - peer-to-peer topic-based messaging.
+The foundation crate for Harbor Protocol - peer-to-peer topic-based messaging and streaming.
 
 ## Features
 
 - **Topic-based messaging**: Send encrypted messages to all members of a topic
 - **CRDT sync primitives**: Three sync operations for building collaborative applications (SyncUpdate, SyncRequest, SyncResponse)
 - **File sharing**: P2P distribution for large files (≥512KB) with BLAKE3 chunking
+- **Streaming**: Real-time audio/video streaming between peers
 - **Offline delivery**: Harbor Nodes store messages for offline members
 - **DHT routing**: Kademlia-style distributed hash table for peer discovery
 - **End-to-end encryption**: All messages encrypted with topic-derived keys
@@ -65,7 +66,8 @@ harbor-core/
 │   ├── membership/ # Topic join/leave messages
 │   ├── send/       # Direct message sending (includes CRDT sync messages)
 │   ├── share/      # P2P file sharing protocol
-│   └── sync/       # CRDT sync protocol (direct peer-to-peer, no size limit)
+│   ├── stream/     # Real-time audio/video streaming
+│   └── sync/       # CRDT sync protocol (direct peer-to-peer, for initial sync)
 ├── protocol/       # Core Protocol struct 
 ├── resilience/     # Rate limiting, PoW, storage limits
 ├── security/       # Cryptographic operations

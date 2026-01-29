@@ -55,6 +55,10 @@ use crate::security::harbor::{
     sign::{sign_packet, verify_packet},
 };
 use crate::security::topic_keys::harbor_id_from_topic;
+use crate::security::dm_keys::{dm_seal, dm_open};
+
+/// Flag bit indicating a DM (direct message) packet
+pub const FLAG_DM: u8 = 0x01;
 
 /// Maximum packet payload size (512 KB)
 pub const MAX_PAYLOAD_SIZE: usize = 512 * 1024;
@@ -121,6 +125,9 @@ pub struct SendPacket {
     pub harbor_id: [u8; 32],
     /// Sender's EndpointID (public key)
     pub endpoint_id: [u8; 32],
+    /// Packet flags (bit 0 = DM)
+    #[serde(default)]
+    pub flags: u8,
     /// Epoch number for key derivation
     /// - Tier 1: Always 0 (keys from topic_id only)
     /// - Tier 2+: Increments with membership changes (forward secrecy)
@@ -138,9 +145,14 @@ pub struct SendPacket {
 }
 
 impl SendPacket {
+    /// Returns true if this is a DM packet
+    pub fn is_dm(&self) -> bool {
+        self.flags & FLAG_DM != 0
+    }
+
     /// Get the size of the packet in bytes (approximate)
     pub fn size(&self) -> usize {
-        PACKET_ID_SIZE + 32 + 32 + 8 + 12 + self.ciphertext.len() + 32 + 64
+        PACKET_ID_SIZE + 32 + 32 + 1 + 8 + 12 + self.ciphertext.len() + 32 + 64
     }
 
     /// Serialize the packet for transmission
@@ -314,6 +326,7 @@ impl PacketBuilder {
             packet_id,
             harbor_id,
             endpoint_id: self.sender_public_key,
+            flags: 0,
             epoch: epoch_keys.epoch,
             nonce,
             ciphertext,
@@ -621,6 +634,87 @@ pub fn verify_for_storage(
     }
 
     Ok(packet)
+}
+
+/// Create a DM packet encrypted for a specific recipient.
+///
+/// Uses ECDH (ed25519→x25519) to derive a shared secret, then encrypts
+/// with XChaCha20-Poly1305 via `crypto_box`. The `harbor_id` is set to the
+/// recipient's endpoint_id so harbor nodes route it correctly.
+///
+/// # Arguments
+/// * `sender_private_key` - Sender's Ed25519 private key (32 bytes)
+/// * `sender_public_key` - Sender's Ed25519 public key (EndpointID)
+/// * `recipient_public_key` - Recipient's Ed25519 public key (EndpointID)
+/// * `plaintext` - The message payload
+pub fn create_dm_packet(
+    sender_private_key: &[u8; 32],
+    sender_public_key: &[u8; 32],
+    recipient_public_key: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<SendPacket, PacketError> {
+    if plaintext.len() > MAX_PAYLOAD_SIZE {
+        return Err(PacketError::PayloadTooLarge {
+            size: plaintext.len(),
+            max: MAX_PAYLOAD_SIZE,
+        });
+    }
+
+    let packet_id = generate_packet_id();
+    let harbor_id = *recipient_public_key;
+
+    // ECDH encrypt
+    let ciphertext = dm_seal(sender_private_key, recipient_public_key, plaintext)
+        .map_err(|e| PacketError::InvalidFormat(e.to_string()))?;
+
+    // Sign the packet (nonce is embedded in ciphertext for DM, use zeroed nonce field)
+    let nonce = [0u8; 12];
+    let signature = sign_packet(
+        sender_private_key,
+        sender_public_key,
+        &nonce,
+        &ciphertext,
+    );
+
+    Ok(SendPacket {
+        packet_id,
+        harbor_id,
+        endpoint_id: *sender_public_key,
+        flags: FLAG_DM,
+        epoch: 0,
+        nonce,
+        ciphertext,
+        mac: [0u8; 32], // No MAC for DM (ECDH provides authentication)
+        signature,
+    })
+}
+
+/// Verify and decrypt a DM packet.
+///
+/// Uses the recipient's private key and sender's public key (from `endpoint_id`)
+/// to derive the shared secret and decrypt.
+///
+/// # Arguments
+/// * `packet` - The received DM packet
+/// * `recipient_private_key` - Recipient's Ed25519 private key
+pub fn verify_and_decrypt_dm_packet(
+    packet: &SendPacket,
+    recipient_private_key: &[u8; 32],
+) -> Result<Vec<u8>, PacketError> {
+    // Verify signature
+    if !verify_packet(
+        &packet.endpoint_id,
+        &packet.endpoint_id,
+        &packet.nonce,
+        &packet.ciphertext,
+        &packet.signature,
+    ) {
+        return Err(PacketError::InvalidSignature);
+    }
+
+    // ECDH decrypt
+    dm_open(recipient_private_key, &packet.endpoint_id, &packet.ciphertext)
+        .map_err(|_| PacketError::DecryptionFailed)
 }
 
 #[cfg(test)]

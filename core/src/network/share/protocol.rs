@@ -159,12 +159,12 @@ pub struct PeerChunks {
     pub chunk_end: u32,
 }
 
-/// Request specific chunks
+/// Request a single chunk
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkRequest {
     pub hash: [u8; 32],
-    /// Chunk indices to request
-    pub chunks: Vec<u32>,
+    /// Chunk index to request
+    pub chunk_index: u32,
 }
 
 /// Response with chunk data
@@ -427,7 +427,7 @@ mod tests {
     fn test_share_message_roundtrip() {
         let request = ShareMessage::ChunkRequest(ChunkRequest {
             hash: [1u8; 32],
-            chunks: vec![0, 5, 10],
+            chunk_index: 5,
         });
 
         let encoded = request.encode();
@@ -436,7 +436,7 @@ mod tests {
         match decoded {
             ShareMessage::ChunkRequest(req) => {
                 assert_eq!(req.hash, [1u8; 32]);
-                assert_eq!(req.chunks, vec![0, 5, 10]);
+                assert_eq!(req.chunk_index, 5);
             }
             _ => panic!("expected ChunkRequest"),
         }

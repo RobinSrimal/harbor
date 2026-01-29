@@ -6,7 +6,7 @@ use tokio::sync::{Mutex, mpsc};
 use serde::Serialize;
 
 use harbor_core::{
-    Protocol, ProtocolConfig, TopicInvite,
+    Protocol, ProtocolConfig, TopicInvite, Target,
     ProtocolStats, DhtBucketInfo, TopicDetails, TopicSummary,
     ProtocolEvent,
 };
@@ -334,7 +334,7 @@ async fn send_message(
     let mut topic_arr = [0u8; 32];
     topic_arr.copy_from_slice(&topic_bytes);
 
-    protocol.send(&topic_arr, message.as_bytes())
+    protocol.send(harbor_core::Target::Topic(topic_arr), message.as_bytes())
         .await
         .map_err(|e| e.to_string())
 }
@@ -459,6 +459,17 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                             data: ev.data,
                         })
                     }
+                    // Stream events — not yet surfaced to test-app frontend
+                    ProtocolEvent::StreamRequest(_)
+                    | ProtocolEvent::StreamAccepted(_)
+                    | ProtocolEvent::StreamRejected(_)
+                    | ProtocolEvent::StreamEnded(_)
+                    | ProtocolEvent::StreamConnected(_)
+                    | ProtocolEvent::DmReceived(_)
+                    | ProtocolEvent::DmSyncUpdate(_)
+                    | ProtocolEvent::DmSyncRequest(_)
+                    | ProtocolEvent::DmSyncResponse(_)
+                    | ProtocolEvent::DmFileAnnounced(_) => continue,
                 };
                 events.push(app_event);
             }
@@ -581,7 +592,7 @@ async fn share_file(
     let mut topic_arr = [0u8; 32];
     topic_arr.copy_from_slice(&topic_bytes);
 
-    let hash = protocol.share_file(&topic_arr, &file_path)
+    let hash = protocol.share_file(harbor_core::Target::Topic(topic_arr), &file_path)
         .await
         .map_err(|e| e.to_string())?;
     
@@ -658,7 +669,7 @@ async fn sync_send_update(
     topic_arr.copy_from_slice(&topic_bytes);
 
     println!("[sync_send_update] Calling protocol.send_sync_update...");
-    protocol.send_sync_update(&topic_arr, data)
+    protocol.send_sync_update(Target::Topic(topic_arr), data)
         .await
         .map_err(|e| {
             println!("[sync_send_update] ✗ Error: {}", e);
@@ -691,7 +702,7 @@ async fn sync_request(
     topic_arr.copy_from_slice(&topic_bytes);
 
     println!("[sync_request] Calling protocol.request_sync...");
-    protocol.request_sync(&topic_arr)
+    protocol.request_sync(Target::Topic(topic_arr))
         .await
         .map_err(|e| {
             println!("[sync_request] ✗ Error: {}", e);
@@ -732,7 +743,7 @@ async fn sync_respond(
     requester_arr.copy_from_slice(&requester_bytes);
 
     println!("[sync_respond] Calling protocol.respond_sync...");
-    protocol.respond_sync(&topic_arr, &requester_arr, data)
+    protocol.respond_sync(Target::Topic(topic_arr), &requester_arr, data)
         .await
         .map_err(|e| {
             println!("[sync_respond] ✗ Error: {}", e);

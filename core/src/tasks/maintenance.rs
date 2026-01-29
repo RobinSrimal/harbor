@@ -10,7 +10,7 @@ use tracing::{info, trace, warn};
 
 use crate::data::cleanup_stale_peers;
 use crate::data::harbor::{cleanup_expired, cleanup_old_pulled_packets};
-use crate::network::dht::ApiClient as DhtApiClient;
+use crate::network::dht::DhtService;
 
 use std::time::Duration;
 use crate::protocol::Protocol;
@@ -18,13 +18,12 @@ use crate::protocol::Protocol;
 impl Protocol {
     /// Run the DHT routing table save loop (periodic persistence)
     pub(crate) async fn run_dht_save_loop(
-        db: Arc<Mutex<Connection>>,
-        dht_client: Option<DhtApiClient>,
+        dht_service: Option<Arc<DhtService>>,
         running: Arc<RwLock<bool>>,
         save_interval: Duration,
     ) {
-        let Some(dht_client) = dht_client else {
-            info!("DHT save loop: no DHT client, skipping");
+        let Some(dht_service) = dht_service else {
+            info!("DHT save loop: no DHT service, skipping");
             return;
         };
 
@@ -38,7 +37,7 @@ impl Protocol {
             if !*running.read().await {
                 // Save one final time before stopping
                 info!("DHT save loop: saving before shutdown");
-                if let Err(e) = Self::save_dht_routing_table(&db, &dht_client).await {
+                if let Err(e) = dht_service.save_routing_table().await {
                     warn!(error = %e, "DHT save loop: failed to save on shutdown");
                 }
                 break;
@@ -47,7 +46,7 @@ impl Protocol {
             tokio::time::sleep(save_interval).await;
 
             // Save routing table
-            if let Err(e) = Self::save_dht_routing_table(&db, &dht_client).await {
+            if let Err(e) = dht_service.save_routing_table().await {
                 warn!(error = %e, "DHT save loop: failed to save routing table");
             }
         }

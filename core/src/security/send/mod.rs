@@ -21,5 +21,9 @@ pub use packet::{
     create_packet, verify_and_decrypt_packet, verify_and_decrypt_packet_with_mode,
     // MAC verification
     verify_mac_only, verify_mac_only_raw,
+    // DM functions
+    create_dm_packet, verify_and_decrypt_dm_packet,
+    // DM flag
+    FLAG_DM,
 };
 

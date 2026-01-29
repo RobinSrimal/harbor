@@ -8,12 +8,18 @@
 //!   harbor-cli --serve --bootstrap <id>:<relay>     # Use custom bootstrap node
 //!   harbor-cli --serve --no-default-bootstrap       # Don't use default bootstrap
 
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn, trace};
 
 use harbor_core::{Protocol, ProtocolConfig, TopicInvite};
+
+/// Shared state for active stream tracks (source side)
+/// Maps request_id → TrackProducer for reuse across publish calls
+type ActiveTracks = Arc<RwLock<HashMap<[u8; 32], moq_lite::TrackProducer>>>;
 
 /// Fixed database key for persistent identity (32 bytes)
 const DB_KEY: [u8; 32] = [
@@ -47,7 +53,7 @@ fn print_usage() {
     println!("  POST /api/topic             Create topic, returns invite");
     println!("  POST /api/join              Join topic (invite in body)");
     println!("  POST /api/send              Send message (JSON: topic, message)");
-    println!("  POST /api/refresh_members   Trigger member discovery refresh");
+    println!("  POST /api/dm                Send DM (JSON: recipient, message)");
     println!("  GET  /api/stats             Get node statistics");
     println!("  GET  /api/topics            List all topics");
     println!("  GET  /api/invite/:topic     Get fresh invite for topic (all current members)");
@@ -66,6 +72,14 @@ fn print_usage() {
     println!("  POST /api/sync/text/delete  Delete text (JSON: topic, container, index, len)");
     println!("  GET  /api/sync/text/:topic/:container  Get text value");
     println!("  GET  /api/sync/status/:topic Get sync status");
+    println!();
+    println!("DM Sync Endpoints:");
+    println!("  POST /api/dm/sync/update    Send DM sync update (JSON: recipient, data)");
+    println!("  POST /api/dm/sync/request   Request DM sync state (JSON: recipient)");
+    println!("  POST /api/dm/sync/respond   Respond to DM sync request (JSON: recipient, data)");
+    println!();
+    println!("DM Share Endpoints:");
+    println!("  POST /api/dm/share          Share a file via DM (JSON: recipient, file_path)");
     println!();
     println!("Environment:");
     println!("  RUST_LOG                    Set log level (e.g., info, debug)");
@@ -250,12 +264,16 @@ async fn main() {
     println!("Press Ctrl+C to stop...");
     println!();
 
+    // Shared state for active stream tracks
+    let active_tracks: ActiveTracks = Arc::new(RwLock::new(HashMap::new()));
+
     // Start API server if port specified
     let api_handle = if let Some(port) = api_port {
         let protocol_clone = protocol.clone();
         let bootstrap_clone = bootstrap_info.clone();
+        let tracks_clone = active_tracks.clone();
         Some(tokio::spawn(async move {
-            run_api_server(protocol_clone, bootstrap_clone, port).await;
+            run_api_server(protocol_clone, bootstrap_clone, port, tracks_clone).await;
         }))
     } else {
         None
@@ -331,6 +349,135 @@ async fn main() {
                                 "Sync response received"
                             );
                         }
+                        harbor_core::ProtocolEvent::StreamRequest(ev) => {
+                            info!(
+                                request_id = %hex::encode(&ev.request_id[..8]),
+                                name = %ev.name,
+                                "Stream request received"
+                            );
+                            // Auto-accept stream requests (for simulation testing)
+                            let p = protocol.clone();
+                            let rid = ev.request_id;
+                            tokio::spawn(async move {
+                                match p.accept_stream(&rid).await {
+                                    Ok(()) => info!(request_id = %hex::encode(&rid[..8]), "Stream auto-accepted"),
+                                    Err(e) => warn!(request_id = %hex::encode(&rid[..8]), error = %e, "Stream auto-accept failed"),
+                                }
+                            });
+                        }
+                        harbor_core::ProtocolEvent::StreamAccepted(ev) => {
+                            info!(request_id = %hex::encode(&ev.request_id[..8]), "Stream accepted");
+                        }
+                        harbor_core::ProtocolEvent::StreamRejected(ev) => {
+                            info!(request_id = %hex::encode(&ev.request_id[..8]), "Stream rejected");
+                        }
+                        harbor_core::ProtocolEvent::StreamEnded(ev) => {
+                            // Clean up stored track producer
+                            active_tracks.write().await.remove(&ev.request_id);
+                            info!(request_id = %hex::encode(&ev.request_id[..8]), "Stream ended");
+                        }
+                        harbor_core::ProtocolEvent::DmReceived(ev) => {
+                            let content = String::from_utf8_lossy(&ev.payload);
+                            info!(
+                                sender = %hex::encode(&ev.sender_id[..8]),
+                                size = ev.payload.len(),
+                                content = %content,
+                                "DM received"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::StreamConnected(ev) => {
+                            info!(
+                                request_id = %hex::encode(&ev.request_id[..8]),
+                                is_source = ev.is_source,
+                                "MOQ stream connected"
+                            );
+                            // Source side: create broadcast and wait for subscriber's track request
+                            if ev.is_source {
+                                let p = protocol.clone();
+                                let rid = ev.request_id;
+                                let tracks = active_tracks.clone();
+                                tokio::spawn(async move {
+                                    match p.publish_to_stream(&rid, "test").await {
+                                        Ok(mut broadcast) => {
+                                            // Wait for the destination to subscribe to the "data" track.
+                                            // The subscriber creates a TrackProducer via requested_track()
+                                            // which we use to write frames.
+                                            if let Some(track) = broadcast.requested_track().await {
+                                                info!(
+                                                    request_id = %hex::encode(&rid[..8]),
+                                                    track = %track.info.name,
+                                                    "Track requested by subscriber"
+                                                );
+                                                tracks.write().await.insert(rid, track);
+                                            } else {
+                                                warn!(request_id = %hex::encode(&rid[..8]), "Broadcast closed before track requested");
+                                            }
+                                            // Keep broadcast alive for the stream's lifetime
+                                            let _broadcast = broadcast;
+                                            tokio::sync::Notify::new().notified().await;
+                                        }
+                                        Err(e) => {
+                                            warn!(request_id = %hex::encode(&rid[..8]), error = %e, "Failed to create broadcast for stream");
+                                        }
+                                    }
+                                });
+                            }
+                            // Destination side: spawn consumer to read incoming data
+                            if !ev.is_source {
+                                let p = protocol.clone();
+                                let rid = ev.request_id;
+                                tokio::spawn(async move {
+                                    // Retry consume_stream — the source may not have announced
+                                    // the broadcast yet when we first connect
+                                    let broadcast = {
+                                        let mut result = None;
+                                        for attempt in 0..10 {
+                                            match p.consume_stream(&rid, "test").await {
+                                                Ok(b) => { result = Some(b); break; }
+                                                Err(_) if attempt < 9 => {
+                                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                                }
+                                                Err(e) => {
+                                                    warn!(request_id = %hex::encode(&rid[..8]), error = %e, "Stream consume failed after retries");
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        result.unwrap()
+                                    };
+                                    info!(request_id = %hex::encode(&rid[..8]), "Stream consumer started");
+                                    let mut track = broadcast.subscribe_track(&moq_lite::Track { name: "data".to_string(), priority: 0 });
+                                    while let Ok(Some(mut group)) = track.next_group().await {
+                                        while let Ok(Some(frame)) = group.read_frame().await {
+                                            info!(
+                                                request_id = %hex::encode(&rid[..8]),
+                                                size = frame.len(),
+                                                data = %hex::encode(&frame),
+                                                "Stream data received"
+                                            );
+                                        }
+                                    }
+                                    info!(request_id = %hex::encode(&rid[..8]), "Stream consumer ended");
+                                });
+                            }
+                        }
+                        harbor_core::ProtocolEvent::DmSyncUpdate(ev) => {
+                            info!(sender = %hex::encode(&ev.sender_id[..8]), "DM sync update received");
+                        }
+                        harbor_core::ProtocolEvent::DmSyncRequest(ev) => {
+                            info!(sender = %hex::encode(&ev.sender_id[..8]), "DM sync request received");
+                        }
+                        harbor_core::ProtocolEvent::DmSyncResponse(ev) => {
+                            info!(sender = %hex::encode(&ev.sender_id[..8]), "DM sync response received");
+                        }
+                        harbor_core::ProtocolEvent::DmFileAnnounced(ev) => {
+                            info!(
+                                sender = %hex::encode(&ev.sender_id[..8]),
+                                hash = %hex::encode(&ev.hash[..8]),
+                                name = %ev.display_name,
+                                "DM file announced"
+                            );
+                        }
                     }
                 }
             } else {
@@ -379,7 +526,7 @@ fn parse_bootstrap_arg(arg: &str) -> Option<(String, Option<String>)> {
 // Simple HTTP API Server
 // ============================================================================
 
-async fn run_api_server(protocol: Arc<Protocol>, bootstrap_info: Arc<BootstrapInfo>, port: u16) {
+async fn run_api_server(protocol: Arc<Protocol>, bootstrap_info: Arc<BootstrapInfo>, port: u16, active_tracks: ActiveTracks) {
     use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -401,7 +548,8 @@ async fn run_api_server(protocol: Arc<Protocol>, bootstrap_info: Arc<BootstrapIn
 
         let protocol = protocol.clone();
         let bootstrap = bootstrap_info.clone();
-        
+        let tracks = active_tracks.clone();
+
         tokio::spawn(async move {
             // Buffer large enough for max message (512KB) + HTTP headers
             let mut buf = vec![0u8; 600 * 1024];
@@ -452,7 +600,7 @@ async fn run_api_server(protocol: Arc<Protocol>, bootstrap_info: Arc<BootstrapIn
             }
 
             let request = String::from_utf8_lossy(&buf[..total_read]);
-            let response = handle_request(&protocol, &bootstrap, &request).await;
+            let response = handle_request(&protocol, &bootstrap, &tracks, &request).await;
             
             if let Err(e) = socket.write_all(response.as_bytes()).await {
                 warn!("API: failed to send response: {}", e);
@@ -499,7 +647,7 @@ fn parse_content_length(headers: &str) -> usize {
     0 // No Content-Length header means no body
 }
 
-async fn handle_request(protocol: &Protocol, bootstrap: &BootstrapInfo, request: &str) -> String {
+async fn handle_request(protocol: &Protocol, bootstrap: &BootstrapInfo, active_tracks: &ActiveTracks, request: &str) -> String {
     let lines: Vec<&str> = request.lines().collect();
     if lines.is_empty() {
         return http_response(400, "Bad Request");
@@ -544,7 +692,7 @@ async fn handle_request(protocol: &Protocol, bootstrap: &BootstrapInfo, request:
         ("POST", "/api/topic") => handle_create_topic(protocol).await,
         ("POST", "/api/join") => handle_join_topic(protocol, body).await,
         ("POST", "/api/send") => handle_send(protocol, body).await,
-        ("POST", "/api/refresh_members") => handle_refresh_members(protocol).await,
+        ("POST", "/api/dm") => handle_send_dm(protocol, body).await,
         ("POST", "/api/share") => handle_share_file(protocol, body).await,
         ("POST", "/api/share/pull") => handle_share_pull(protocol, body).await,
         ("POST", "/api/share/export") => handle_share_export(protocol, body).await,
@@ -552,6 +700,20 @@ async fn handle_request(protocol: &Protocol, bootstrap: &BootstrapInfo, request:
         ("POST", "/api/sync/update") => handle_sync_update(protocol, body).await,
         ("POST", "/api/sync/request") => handle_sync_request(protocol, body).await,
         ("POST", "/api/sync/respond") => handle_sync_respond(protocol, body).await,
+        // DM sync endpoints
+        ("POST", "/api/dm/sync/update") => handle_dm_sync_update(protocol, body).await,
+        ("POST", "/api/dm/sync/request") => handle_dm_sync_request(protocol, body).await,
+        ("POST", "/api/dm/sync/respond") => handle_dm_sync_respond(protocol, body).await,
+        // DM share endpoints
+        ("POST", "/api/dm/share") => handle_dm_share(protocol, body).await,
+        // DM stream endpoints
+        ("POST", "/api/dm/stream/request") => handle_dm_stream_request(protocol, body).await,
+        // Stream endpoints
+        ("POST", "/api/stream/request") => handle_stream_request(protocol, body).await,
+        ("POST", "/api/stream/accept") => handle_stream_accept(protocol, body).await,
+        ("POST", "/api/stream/reject") => handle_stream_reject(protocol, body).await,
+        ("POST", "/api/stream/publish") => handle_stream_publish(active_tracks, body).await,
+        ("POST", "/api/stream/end") => handle_stream_end(protocol, body).await,
         ("GET", "/api/stats") => handle_stats(protocol).await,
         ("GET", "/api/topics") => handle_list_topics(protocol).await,
         ("GET", "/api/bootstrap") => handle_bootstrap(bootstrap),
@@ -644,7 +806,7 @@ async fn handle_send(protocol: &Protocol, body: &str) -> String {
     };
 
     info!("API: calling protocol.send()");
-    let result = match protocol.send(&topic_bytes, message.as_bytes()).await {
+    let result = match protocol.send(harbor_core::Target::Topic(topic_bytes), message.as_bytes()).await {
         Ok(()) => {
             info!("API: protocol.send() completed successfully");
             http_response(200, "Message sent")
@@ -658,17 +820,36 @@ async fn handle_send(protocol: &Protocol, body: &str) -> String {
     result
 }
 
-async fn handle_refresh_members(protocol: &Protocol) -> String {
-    info!("API: handle_refresh_members started");
-    
-    match protocol.refresh_members().await {
-        Ok(count) => {
-            info!("API: refresh_members completed, {} topics refreshed", count);
-            http_response(200, &format!("Refreshed {} topics", count))
+/// POST /api/dm - Send a direct message
+/// Body: {"recipient":"hex64","message":"text"}
+async fn handle_send_dm(protocol: &Protocol, body: &str) -> String {
+    let recipient_hex = extract_json_string(body, "recipient");
+    let message = extract_json_string(body, "message");
+
+    if recipient_hex.is_none() || message.is_none() {
+        return http_response(400, "Expected JSON with 'recipient' and 'message' fields");
+    }
+
+    let recipient_hex = recipient_hex.unwrap();
+    let message = message.unwrap();
+
+    let recipient_bytes = match hex::decode(&recipient_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid recipient ID (must be 64 hex chars)"),
+    };
+
+    match protocol.send(harbor_core::Target::Dm(recipient_bytes), message.as_bytes()).await {
+        Ok(()) => {
+            info!("API: DM sent to {}", &recipient_hex[..16]);
+            http_response(200, "DM sent")
         }
         Err(e) => {
-            warn!("API: refresh_members failed: {}", e);
-            http_response(500, &format!("Failed to refresh: {}", e))
+            info!("API: DM send failed: {}", e);
+            http_response(500, &format!("Failed to send DM: {}", e))
         }
     }
 }
@@ -744,7 +925,7 @@ async fn handle_share_file(protocol: &Protocol, body: &str) -> String {
         _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
     };
 
-    match protocol.share_file(&topic_bytes, &file_path).await {
+    match protocol.share_file(harbor_core::Target::Topic(topic_bytes), &file_path).await {
         Ok(hash) => {
             let json = format!(r#"{{"hash":"{}","status":"announced"}}"#, hex::encode(hash));
             http_json_response(200, &json)
@@ -907,7 +1088,7 @@ async fn handle_sync_update(protocol: &Protocol, body: &str) -> String {
         Err(_) => return http_response(400, "Invalid hex data"),
     };
 
-    match protocol.send_sync_update(&topic_bytes, data).await {
+    match protocol.send_sync_update(harbor_core::Target::Topic(topic_bytes), data).await {
         Ok(()) => http_response(200, "Sync update sent"),
         Err(e) => http_response(500, &format!("Failed to send sync update: {}", e)),
     }
@@ -931,7 +1112,7 @@ async fn handle_sync_request(protocol: &Protocol, body: &str) -> String {
         _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
     };
 
-    match protocol.request_sync(&topic_bytes).await {
+    match protocol.request_sync(harbor_core::Target::Topic(topic_bytes)).await {
         Ok(()) => http_response(200, "Sync request sent"),
         Err(e) => http_response(500, &format!("Failed to request sync: {}", e)),
     }
@@ -979,9 +1160,322 @@ async fn handle_sync_respond(protocol: &Protocol, body: &str) -> String {
         Err(_) => return http_response(400, "Invalid hex data"),
     };
 
-    match protocol.respond_sync(&topic_bytes, &requester_bytes, data).await {
+    match protocol.respond_sync(harbor_core::Target::Topic(topic_bytes), &requester_bytes, data).await {
         Ok(()) => http_response(200, "Sync response sent"),
         Err(e) => http_response(500, &format!("Failed to respond to sync: {}", e)),
+    }
+}
+
+// ============================================================================
+// DM Sync API Handlers
+// ============================================================================
+
+/// POST /api/dm/sync/update
+/// Body: {"recipient": "hex64", "data": "hex-encoded-crdt-update"}
+async fn handle_dm_sync_update(protocol: &Protocol, body: &str) -> String {
+    let recipient_hex = match extract_json_string(body, "recipient") {
+        Some(r) => r,
+        None => return http_response(400, "Missing 'recipient' field"),
+    };
+
+    let data_hex = match extract_json_string(body, "data") {
+        Some(d) => d,
+        None => return http_response(400, "Missing 'data' field"),
+    };
+
+    let recipient_bytes = match hex::decode(&recipient_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid recipient ID (must be 64 hex chars)"),
+    };
+
+    let data = match hex::decode(&data_hex) {
+        Ok(d) => d,
+        Err(_) => return http_response(400, "Invalid hex data"),
+    };
+
+    match protocol.send_sync_update(harbor_core::Target::Dm(recipient_bytes), data).await {
+        Ok(()) => http_response(200, "DM sync update sent"),
+        Err(e) => http_response(500, &format!("Failed to send DM sync update: {}", e)),
+    }
+}
+
+/// POST /api/dm/sync/request
+/// Body: {"recipient": "hex64"}
+async fn handle_dm_sync_request(protocol: &Protocol, body: &str) -> String {
+    let recipient_hex = match extract_json_string(body, "recipient") {
+        Some(r) => r,
+        None => return http_response(400, "Missing 'recipient' field"),
+    };
+
+    let recipient_bytes = match hex::decode(&recipient_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid recipient ID (must be 64 hex chars)"),
+    };
+
+    match protocol.request_sync(harbor_core::Target::Dm(recipient_bytes)).await {
+        Ok(()) => http_response(200, "DM sync request sent"),
+        Err(e) => http_response(500, &format!("Failed to send DM sync request: {}", e)),
+    }
+}
+
+/// POST /api/dm/sync/respond
+/// Body: {"recipient": "hex64", "data": "hex-encoded-crdt-snapshot"}
+async fn handle_dm_sync_respond(protocol: &Protocol, body: &str) -> String {
+    let recipient_hex = match extract_json_string(body, "recipient") {
+        Some(r) => r,
+        None => return http_response(400, "Missing 'recipient' field"),
+    };
+
+    let data_hex = match extract_json_string(body, "data") {
+        Some(d) => d,
+        None => return http_response(400, "Missing 'data' field"),
+    };
+
+    let recipient_bytes = match hex::decode(&recipient_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid recipient ID (must be 64 hex chars)"),
+    };
+
+    let data = match hex::decode(&data_hex) {
+        Ok(d) => d,
+        Err(_) => return http_response(400, "Invalid hex data"),
+    };
+
+    // requester_id is unused for DM target, pass recipient as placeholder
+    match protocol.respond_sync(harbor_core::Target::Dm(recipient_bytes), &recipient_bytes, data).await {
+        Ok(()) => http_response(200, "DM sync response sent"),
+        Err(e) => http_response(500, &format!("Failed to send DM sync response: {}", e)),
+    }
+}
+
+// ============================================================================
+// DM Share API Handlers
+// ============================================================================
+
+/// POST /api/dm/share
+/// Body: {"recipient": "hex64", "file_path": "/path/to/file"}
+async fn handle_dm_share(protocol: &Protocol, body: &str) -> String {
+    let recipient_hex = match extract_json_string(body, "recipient") {
+        Some(r) => r,
+        None => return http_response(400, "Missing 'recipient' field"),
+    };
+
+    let file_path = match extract_json_string(body, "file_path") {
+        Some(p) => p,
+        None => return http_response(400, "Missing 'file_path' field"),
+    };
+
+    let recipient_bytes = match hex::decode(&recipient_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid recipient ID (must be 64 hex chars)"),
+    };
+
+    match protocol.share_file(harbor_core::Target::Dm(recipient_bytes), &file_path).await {
+        Ok(hash) => {
+            let json = format!(r#"{{"hash":"{}","status":"announced"}}"#, hex::encode(hash));
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(500, &format!("Failed to share DM file: {}", e)),
+    }
+}
+
+// ============================================================================
+// Stream API Handlers
+// ============================================================================
+
+/// Request a DM stream to a peer (peer-to-peer, no topic)
+/// POST /api/dm/stream/request
+/// Body: {"peer": "hex...", "name": "stream-name"}
+async fn handle_dm_stream_request(protocol: &Protocol, body: &str) -> String {
+    let peer_hex = match extract_json_string(body, "peer") {
+        Some(p) => p,
+        None => return http_response(400, "Missing 'peer' field"),
+    };
+    let name = extract_json_string(body, "name").unwrap_or_else(|| "test".to_string());
+
+    let peer_bytes = match hex::decode(&peer_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid peer ID"),
+    };
+
+    match protocol.dm_stream_request(&peer_bytes, &name).await {
+        Ok(request_id) => {
+            let json = format!(r#"{{"request_id":"{}"}}"#, hex::encode(request_id));
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(500, &format!("Failed to request DM stream: {}", e)),
+    }
+}
+
+/// Request a stream to a peer
+/// POST /api/stream/request
+/// Body: {"topic": "hex...", "peer": "hex...", "name": "stream-name"}
+async fn handle_stream_request(protocol: &Protocol, body: &str) -> String {
+    let topic_hex = match extract_json_string(body, "topic") {
+        Some(t) => t,
+        None => return http_response(400, "Missing 'topic' field"),
+    };
+    let peer_hex = match extract_json_string(body, "peer") {
+        Some(p) => p,
+        None => return http_response(400, "Missing 'peer' field"),
+    };
+    let name = extract_json_string(body, "name").unwrap_or_else(|| "test".to_string());
+
+    let topic_bytes = match hex::decode(&topic_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID"),
+    };
+    let peer_bytes = match hex::decode(&peer_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid peer ID"),
+    };
+
+    match protocol.request_stream(&topic_bytes, &peer_bytes, &name, vec![]).await {
+        Ok(request_id) => {
+            let json = format!(r#"{{"request_id":"{}"}}"#, hex::encode(request_id));
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(500, &format!("Failed to request stream: {}", e)),
+    }
+}
+
+/// Accept a stream request
+/// POST /api/stream/accept
+/// Body: {"request_id": "hex..."}
+async fn handle_stream_accept(protocol: &Protocol, body: &str) -> String {
+    let id_hex = match extract_json_string(body, "request_id") {
+        Some(h) => h,
+        None => return http_response(400, "Missing 'request_id' field"),
+    };
+    let id_bytes = match hex::decode(&id_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid request_id"),
+    };
+
+    match protocol.accept_stream(&id_bytes).await {
+        Ok(()) => http_response(200, "Stream accepted"),
+        Err(e) => http_response(500, &format!("Failed to accept stream: {}", e)),
+    }
+}
+
+/// Reject a stream request
+/// POST /api/stream/reject
+/// Body: {"request_id": "hex...", "reason": "optional reason"}
+async fn handle_stream_reject(protocol: &Protocol, body: &str) -> String {
+    let id_hex = match extract_json_string(body, "request_id") {
+        Some(h) => h,
+        None => return http_response(400, "Missing 'request_id' field"),
+    };
+    let reason = extract_json_string(body, "reason");
+
+    let id_bytes = match hex::decode(&id_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid request_id"),
+    };
+
+    match protocol.reject_stream(&id_bytes, reason).await {
+        Ok(()) => http_response(200, "Stream rejected"),
+        Err(e) => http_response(500, &format!("Failed to reject stream: {}", e)),
+    }
+}
+
+/// Publish data to an active stream
+/// POST /api/stream/publish
+/// Body: {"request_id": "hex...", "data": "hex-encoded-payload"}
+async fn handle_stream_publish(active_tracks: &ActiveTracks, body: &str) -> String {
+    let id_hex = match extract_json_string(body, "request_id") {
+        Some(h) => h,
+        None => return http_response(400, "Missing 'request_id' field"),
+    };
+    let data_hex = match extract_json_string(body, "data") {
+        Some(d) => d,
+        None => return http_response(400, "Missing 'data' field"),
+    };
+
+    let id_bytes = match hex::decode(&id_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid request_id"),
+    };
+    let data = match hex::decode(&data_hex) {
+        Ok(d) => d,
+        Err(_) => return http_response(400, "Invalid hex data"),
+    };
+
+    // Write frame to the existing track (created on StreamConnected)
+    let mut tracks = active_tracks.write().await;
+    match tracks.get_mut(&id_bytes) {
+        Some(track) => {
+            track.write_frame(bytes::Bytes::from(data));
+            info!(
+                request_id = %hex::encode(&id_bytes[..8]),
+                "Stream data published"
+            );
+            http_response(200, "Published")
+        }
+        None => http_response(404, "No active track for this stream — not connected yet?"),
+    }
+}
+
+/// End an active stream
+/// POST /api/stream/end
+/// Body: {"request_id": "hex..."}
+async fn handle_stream_end(protocol: &Protocol, body: &str) -> String {
+    let id_hex = match extract_json_string(body, "request_id") {
+        Some(h) => h,
+        None => return http_response(400, "Missing 'request_id' field"),
+    };
+    let id_bytes = match hex::decode(&id_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid request_id"),
+    };
+
+    match protocol.end_stream(&id_bytes).await {
+        Ok(()) => http_response(200, "Stream ended"),
+        Err(e) => http_response(500, &format!("Failed to end stream: {}", e)),
     }
 }
 

@@ -29,7 +29,10 @@ pub mod share;
 pub mod start;
 
 // Re-export commonly used items from dht/
-pub use dht::{cleanup_stale_peers, current_timestamp, PeerInfo, PEER_RETENTION_SECS};
+pub use dht::{
+    cleanup_stale_peers, current_timestamp, get_peer_relay_info, update_peer_relay_url, PeerInfo,
+    PEER_RETENTION_SECS,
+};
 
 // Re-export commonly used items from harbor/
 pub use harbor::{
@@ -52,9 +55,9 @@ pub use send::{
 
 // Re-export commonly used items from membership/
 pub use membership::{
-    add_topic_member, add_topic_member_with_relay, get_all_topics, get_joined_at, get_topic,
-    get_topic_members, get_topic_members_with_info, get_topics_for_member, remove_topic_member,
-    subscribe_topic, unsubscribe_topic, TopicMember, TopicMemberInfo, TopicSubscription,
+    add_topic_member, get_all_topics, get_joined_at, get_topic,
+    get_topic_members, get_topics_for_member, remove_topic_member,
+    subscribe_topic, unsubscribe_topic, TopicMember, TopicSubscription,
 };
 
 // Re-export commonly used items from schema
@@ -65,7 +68,7 @@ pub use start::{start_db, start_memory_db, StartError};
 
 // Re-export commonly used items from share/
 pub use share::{
-    add_blob_recipient, delete_blob, get_blob, get_blobs_for_topic, get_section_peer_suggestion,
+    add_blob_recipient, delete_blob, get_blob, get_blobs_for_scope, get_section_peer_suggestion,
     get_section_traces, init_blob_sections, insert_blob, is_distribution_complete,
     mark_blob_complete, mark_recipient_complete, record_peer_can_seed, record_section_received,
     BlobMetadata, BlobState, SectionTrace, CHUNK_SIZE,

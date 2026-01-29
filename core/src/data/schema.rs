@@ -23,20 +23,19 @@ pub fn create_all_tables(conn: &Connection) -> rusqlite::Result<()> {
 /// Each migration checks if it's already been applied before making changes.
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // Migration 1: Add packet_type column to outgoing_packets (v0.2)
-    // Check if column exists by querying table info
     let has_packet_type: bool = conn.query_row(
         "SELECT COUNT(*) > 0 FROM pragma_table_info('outgoing_packets') WHERE name = 'packet_type'",
         [],
         |row| row.get(0),
     )?;
-    
+
     if !has_packet_type {
         conn.execute(
             "ALTER TABLE outgoing_packets ADD COLUMN packet_type INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
-    
+
     Ok(())
 }
 
@@ -72,6 +71,8 @@ pub fn create_peer_table(conn: &Connection) -> rusqlite::Result<()> {
             last_latency_ms INTEGER,
             latency_timestamp INTEGER,
             last_seen INTEGER NOT NULL,
+            relay_url TEXT,
+            relay_url_last_success INTEGER,
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
         )",
         [],
@@ -97,7 +98,6 @@ pub fn create_dht_table(conn: &Connection) -> rusqlite::Result<()> {
             endpoint_id BLOB PRIMARY KEY NOT NULL CHECK (length(endpoint_id) = 32),
             bucket_index INTEGER NOT NULL,
             added_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            relay_url TEXT,
             FOREIGN KEY (endpoint_id) REFERENCES peers(endpoint_id) ON DELETE CASCADE
         )",
         [],
@@ -130,7 +130,6 @@ pub fn create_topic_table(conn: &Connection) -> rusqlite::Result<()> {
         "CREATE TABLE IF NOT EXISTS topic_members (
             topic_id BLOB NOT NULL CHECK (length(topic_id) = 32),
             endpoint_id BLOB NOT NULL CHECK (length(endpoint_id) = 32),
-            relay_url TEXT,
             joined_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             PRIMARY KEY (topic_id, endpoint_id),
             FOREIGN KEY (topic_id) REFERENCES topics(topic_id) ON DELETE CASCADE
@@ -296,15 +295,14 @@ pub fn create_share_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS blobs (
             hash BLOB PRIMARY KEY NOT NULL CHECK (length(hash) = 32),
-            topic_id BLOB NOT NULL CHECK (length(topic_id) = 32),
+            scope_id BLOB NOT NULL CHECK (length(scope_id) = 32),
             source_id BLOB NOT NULL CHECK (length(source_id) = 32),
             display_name TEXT NOT NULL,
             total_size INTEGER NOT NULL,
             total_chunks INTEGER NOT NULL,
             num_sections INTEGER NOT NULL,
             state INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            FOREIGN KEY (topic_id) REFERENCES topics(topic_id)
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
         )",
         [],
     )?;
@@ -340,7 +338,7 @@ pub fn create_share_tables(conn: &Connection) -> rusqlite::Result<()> {
 
     // Indexes for efficient queries
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_blobs_topic ON blobs(topic_id)",
+        "CREATE INDEX IF NOT EXISTS idx_blobs_scope ON blobs(scope_id)",
         [],
     )?;
     conn.execute(

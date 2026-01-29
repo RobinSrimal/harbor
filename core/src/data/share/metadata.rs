@@ -33,7 +33,7 @@ impl From<u8> for BlobState {
 #[derive(Debug, Clone)]
 pub struct BlobMetadata {
     pub hash: [u8; 32],
-    pub topic_id: [u8; 32],
+    pub scope_id: [u8; 32],
     pub source_id: [u8; 32],
     pub display_name: String,
     pub total_size: u64,
@@ -57,21 +57,21 @@ pub struct SectionTrace {
 pub fn insert_blob(
     conn: &Connection,
     hash: &[u8; 32],
-    topic_id: &[u8; 32],
+    scope_id: &[u8; 32],
     source_id: &[u8; 32],
     display_name: &str,
     total_size: u64,
     num_sections: u8,
 ) -> rusqlite::Result<()> {
     let total_chunks = ((total_size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
-    
+
     conn.execute(
-        "INSERT OR REPLACE INTO blobs 
-         (hash, topic_id, source_id, display_name, total_size, total_chunks, num_sections, state)
+        "INSERT OR REPLACE INTO blobs
+         (hash, scope_id, source_id, display_name, total_size, total_chunks, num_sections, state)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
         params![
             hash.as_slice(),
-            topic_id.as_slice(),
+            scope_id.as_slice(),
             source_id.as_slice(),
             display_name,
             total_size as i64,
@@ -85,26 +85,26 @@ pub fn insert_blob(
 /// Get blob metadata by hash
 pub fn get_blob(conn: &Connection, hash: &[u8; 32]) -> rusqlite::Result<Option<BlobMetadata>> {
     let mut stmt = conn.prepare(
-        "SELECT hash, topic_id, source_id, display_name, total_size, total_chunks, 
+        "SELECT hash, scope_id, source_id, display_name, total_size, total_chunks,
                 num_sections, state, created_at
          FROM blobs WHERE hash = ?1"
     )?;
-    
+
     let result = stmt.query_row([hash.as_slice()], |row| {
         let hash_vec: Vec<u8> = row.get(0)?;
-        let topic_vec: Vec<u8> = row.get(1)?;
+        let scope_vec: Vec<u8> = row.get(1)?;
         let source_vec: Vec<u8> = row.get(2)?;
-        
+
         let mut hash = [0u8; 32];
-        let mut topic_id = [0u8; 32];
+        let mut scope_id = [0u8; 32];
         let mut source_id = [0u8; 32];
         hash.copy_from_slice(&hash_vec);
-        topic_id.copy_from_slice(&topic_vec);
+        scope_id.copy_from_slice(&scope_vec);
         source_id.copy_from_slice(&source_vec);
-        
+
         Ok(BlobMetadata {
             hash,
-            topic_id,
+            scope_id,
             source_id,
             display_name: row.get(3)?,
             total_size: row.get::<_, i64>(4)? as u64,
@@ -318,29 +318,29 @@ pub fn record_peer_can_seed(
     Ok(())
 }
 
-/// Get blobs for a topic
-pub fn get_blobs_for_topic(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<Vec<BlobMetadata>> {
+/// Get blobs for a scope (topic_id or endpoint_id)
+pub fn get_blobs_for_scope(conn: &Connection, scope_id: &[u8; 32]) -> rusqlite::Result<Vec<BlobMetadata>> {
     let mut stmt = conn.prepare(
-        "SELECT hash, topic_id, source_id, display_name, total_size, total_chunks, 
+        "SELECT hash, scope_id, source_id, display_name, total_size, total_chunks,
                 num_sections, state, created_at
-         FROM blobs WHERE topic_id = ?1"
+         FROM blobs WHERE scope_id = ?1"
     )?;
-    
-    let rows = stmt.query_map([topic_id.as_slice()], |row| {
+
+    let rows = stmt.query_map([scope_id.as_slice()], |row| {
         let hash_vec: Vec<u8> = row.get(0)?;
-        let topic_vec: Vec<u8> = row.get(1)?;
+        let scope_vec: Vec<u8> = row.get(1)?;
         let source_vec: Vec<u8> = row.get(2)?;
-        
+
         let mut hash = [0u8; 32];
-        let mut topic_id = [0u8; 32];
+        let mut scope_id = [0u8; 32];
         let mut source_id = [0u8; 32];
         hash.copy_from_slice(&hash_vec);
-        topic_id.copy_from_slice(&topic_vec);
+        scope_id.copy_from_slice(&scope_vec);
         source_id.copy_from_slice(&source_vec);
-        
+
         Ok(BlobMetadata {
             hash,
-            topic_id,
+            scope_id,
             source_id,
             display_name: row.get(3)?,
             total_size: row.get::<_, i64>(4)? as u64,
@@ -370,15 +370,6 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
         create_all_tables(&conn).unwrap();
-        
-        // Insert a topic for foreign key
-        let topic_id = [1u8; 32];
-        let harbor_id = [2u8; 32];
-        conn.execute(
-            "INSERT INTO topics (topic_id, harbor_id) VALUES (?1, ?2)",
-            params![topic_id.as_slice(), harbor_id.as_slice()],
-        ).unwrap();
-        
         conn
     }
 
@@ -386,10 +377,10 @@ mod tests {
     fn test_insert_and_get_blob() {
         let conn = setup_db();
         let hash = [3u8; 32];
-        let topic_id = [1u8; 32];
+        let scope_id = [1u8; 32];
         let source_id = [4u8; 32];
         
-        insert_blob(&conn, &hash, &topic_id, &source_id, "test.bin", 1024 * 1024, 3).unwrap();
+        insert_blob(&conn, &hash, &scope_id, &source_id, "test.bin", 1024 * 1024, 3).unwrap();
         
         let blob = get_blob(&conn, &hash).unwrap().unwrap();
         assert_eq!(blob.hash, hash);
@@ -404,11 +395,11 @@ mod tests {
     fn test_section_traces() {
         let conn = setup_db();
         let hash = [3u8; 32];
-        let topic_id = [1u8; 32];
+        let scope_id = [1u8; 32];
         let source_id = [4u8; 32];
         let peer_id = [5u8; 32];
         
-        insert_blob(&conn, &hash, &topic_id, &source_id, "test.bin", 5 * 1024 * 1024, 3).unwrap();
+        insert_blob(&conn, &hash, &scope_id, &source_id, "test.bin", 5 * 1024 * 1024, 3).unwrap();
         init_blob_sections(&conn, &hash, 3, 10).unwrap();
         
         // Record receiving section 1 from peer
@@ -427,12 +418,12 @@ mod tests {
     fn test_recipient_tracking() {
         let conn = setup_db();
         let hash = [3u8; 32];
-        let topic_id = [1u8; 32];
+        let scope_id = [1u8; 32];
         let source_id = [4u8; 32];
         let peer1 = [5u8; 32];
         let peer2 = [6u8; 32];
         
-        insert_blob(&conn, &hash, &topic_id, &source_id, "test.bin", 1024 * 1024, 3).unwrap();
+        insert_blob(&conn, &hash, &scope_id, &source_id, "test.bin", 1024 * 1024, 3).unwrap();
         
         add_blob_recipient(&conn, &hash, &peer1).unwrap();
         add_blob_recipient(&conn, &hash, &peer2).unwrap();
@@ -453,10 +444,10 @@ mod tests {
     fn test_mark_blob_complete() {
         let conn = setup_db();
         let hash = [3u8; 32];
-        let topic_id = [1u8; 32];
+        let scope_id = [1u8; 32];
         let source_id = [4u8; 32];
         
-        insert_blob(&conn, &hash, &topic_id, &source_id, "test.bin", 1024 * 1024, 3).unwrap();
+        insert_blob(&conn, &hash, &scope_id, &source_id, "test.bin", 1024 * 1024, 3).unwrap();
         
         // Initially partial
         let blob = get_blob(&conn, &hash).unwrap().unwrap();
@@ -470,21 +461,21 @@ mod tests {
     }
 
     #[test]
-    fn test_get_blobs_for_topic() {
+    fn test_get_blobs_for_scope() {
         let conn = setup_db();
-        let topic_id = [1u8; 32];
+        let scope_id = [1u8; 32];
         let source_id = [4u8; 32];
-        
+
         // Insert multiple blobs
         let hash1 = [10u8; 32];
         let hash2 = [11u8; 32];
         let hash3 = [12u8; 32];
-        
-        insert_blob(&conn, &hash1, &topic_id, &source_id, "file1.bin", 1024 * 1024, 3).unwrap();
-        insert_blob(&conn, &hash2, &topic_id, &source_id, "file2.bin", 2 * 1024 * 1024, 3).unwrap();
-        insert_blob(&conn, &hash3, &topic_id, &source_id, "file3.bin", 3 * 1024 * 1024, 3).unwrap();
-        
-        let blobs = get_blobs_for_topic(&conn, &topic_id).unwrap();
+
+        insert_blob(&conn, &hash1, &scope_id, &source_id, "file1.bin", 1024 * 1024, 3).unwrap();
+        insert_blob(&conn, &hash2, &scope_id, &source_id, "file2.bin", 2 * 1024 * 1024, 3).unwrap();
+        insert_blob(&conn, &hash3, &scope_id, &source_id, "file3.bin", 3 * 1024 * 1024, 3).unwrap();
+
+        let blobs = get_blobs_for_scope(&conn, &scope_id).unwrap();
         assert_eq!(blobs.len(), 3);
         
         let names: Vec<_> = blobs.iter().map(|b| b.display_name.as_str()).collect();
@@ -497,11 +488,11 @@ mod tests {
     fn test_delete_blob_cascades() {
         let conn = setup_db();
         let hash = [3u8; 32];
-        let topic_id = [1u8; 32];
+        let scope_id = [1u8; 32];
         let source_id = [4u8; 32];
         let peer1 = [5u8; 32];
         
-        insert_blob(&conn, &hash, &topic_id, &source_id, "test.bin", 5 * 1024 * 1024, 3).unwrap();
+        insert_blob(&conn, &hash, &scope_id, &source_id, "test.bin", 5 * 1024 * 1024, 3).unwrap();
         init_blob_sections(&conn, &hash, 3, 10).unwrap();
         add_blob_recipient(&conn, &hash, &peer1).unwrap();
         record_section_received(&conn, &hash, 0, &peer1).unwrap();
@@ -521,12 +512,12 @@ mod tests {
     fn test_get_section_traces() {
         let conn = setup_db();
         let hash = [3u8; 32];
-        let topic_id = [1u8; 32];
+        let scope_id = [1u8; 32];
         let source_id = [4u8; 32];
         let peer1 = [5u8; 32];
         let peer2 = [6u8; 32];
         
-        insert_blob(&conn, &hash, &topic_id, &source_id, "test.bin", 5 * 1024 * 1024, 3).unwrap();
+        insert_blob(&conn, &hash, &scope_id, &source_id, "test.bin", 5 * 1024 * 1024, 3).unwrap();
         init_blob_sections(&conn, &hash, 3, 10).unwrap();
         
         // Record different peers for different sections
@@ -562,13 +553,13 @@ mod tests {
     fn test_multiple_sections_different_peers() {
         let conn = setup_db();
         let hash = [3u8; 32];
-        let topic_id = [1u8; 32];
+        let scope_id = [1u8; 32];
         let source_id = [4u8; 32];
         let peer1 = [5u8; 32];
         let peer2 = [6u8; 32];
         let peer3 = [7u8; 32];
         
-        insert_blob(&conn, &hash, &topic_id, &source_id, "test.bin", 10 * 1024 * 1024, 5).unwrap();
+        insert_blob(&conn, &hash, &scope_id, &source_id, "test.bin", 10 * 1024 * 1024, 5).unwrap();
         init_blob_sections(&conn, &hash, 5, 20).unwrap();
         
         // Each peer gets different sections
@@ -590,11 +581,11 @@ mod tests {
     fn test_duplicate_recipient_ignored() {
         let conn = setup_db();
         let hash = [3u8; 32];
-        let topic_id = [1u8; 32];
+        let scope_id = [1u8; 32];
         let source_id = [4u8; 32];
         let peer1 = [5u8; 32];
         
-        insert_blob(&conn, &hash, &topic_id, &source_id, "test.bin", 1024 * 1024, 3).unwrap();
+        insert_blob(&conn, &hash, &scope_id, &source_id, "test.bin", 1024 * 1024, 3).unwrap();
         
         // Add same recipient twice - should not error (INSERT OR IGNORE)
         add_blob_recipient(&conn, &hash, &peer1).unwrap();

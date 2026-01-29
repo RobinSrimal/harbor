@@ -95,6 +95,20 @@ api_send() {
     echo "$result"
 }
 
+api_send_dm() {
+    local n=$1
+    local recipient=$2
+    local message=$3
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/dm" \
+        -H "Content-Type: application/json" \
+        -d "{\"recipient\":\"$recipient\",\"message\":\"$message\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/dm"
+    echo "$result"
+}
+
 api_stats() {
     local n=$1
     local port=$(api_port $n)
@@ -123,16 +137,6 @@ api_get_invite() {
     result=$(curl -s --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/api/invite/$topic")
     local exit_code=$?
     log_api_error $exit_code $n "GET /api/invite"
-    echo "$result"
-}
-
-api_refresh_members() {
-    local n=$1
-    local port=$(api_port $n)
-    local result
-    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/refresh_members")
-    local exit_code=$?
-    log_api_error $exit_code $n "POST /api/refresh_members"
     echo "$result"
 }
 
@@ -362,6 +366,74 @@ extract_sync_text() {
     echo "$json" | grep -o '"text":"[^"]*"' | cut -d'"' -f4
 }
 
+# ============================================================================
+# DM SYNC API HELPERS
+# ============================================================================
+
+# Send a DM sync update (CRDT delta) to a single peer
+# Usage: api_dm_sync_update <node> <recipient_hex> <data_hex>
+api_dm_sync_update() {
+    local n=$1
+    local recipient=$2
+    local data_hex=$3
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/dm/sync/update" \
+        -H "Content-Type: application/json" \
+        -d "{\"recipient\":\"$recipient\",\"data\":\"$data_hex\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/dm/sync/update"
+    echo "$result"
+}
+
+# Request DM sync state from a peer
+# Usage: api_dm_sync_request <node> <recipient_hex>
+api_dm_sync_request() {
+    local n=$1
+    local recipient=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/dm/sync/request" \
+        -H "Content-Type: application/json" \
+        -d "{\"recipient\":\"$recipient\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/dm/sync/request"
+    echo "$result"
+}
+
+# Respond to a DM sync request with full state (direct SYNC_ALPN)
+# Usage: api_dm_sync_respond <node> <recipient_hex> <data_hex>
+api_dm_sync_respond() {
+    local n=$1
+    local recipient=$2
+    local data_hex=$3
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/dm/sync/respond" \
+        -H "Content-Type: application/json" \
+        -d "{\"recipient\":\"$recipient\",\"data\":\"$data_hex\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/dm/sync/respond"
+    echo "$result"
+}
+
+# Share a file via DM (peer-to-peer)
+# Usage: api_dm_share <node> <recipient_hex> <file_path>
+# Returns: JSON with hash
+api_dm_share() {
+    local n=$1
+    local recipient=$2
+    local file_path=$3
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/dm/share" \
+        -H "Content-Type: application/json" \
+        -d "{\"recipient\":\"$recipient\",\"file_path\":\"$file_path\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/dm/share"
+    echo "$result"
+}
+
 # Get a node's endpoint ID
 # Usage: api_get_endpoint_id <node>
 # Returns: 64-char hex endpoint ID
@@ -369,5 +441,118 @@ api_get_endpoint_id() {
     local n=$1
     local stats=$(api_stats $n)
     echo "$stats" | grep -o '"endpoint_id":"[^"]*"' | cut -d'"' -f4
+}
+
+# ============================================================================
+# STREAM API HELPERS
+# ============================================================================
+
+# Request a stream to a peer
+# Usage: api_stream_request <node> <topic_hex> <peer_hex> [name]
+# Returns: JSON with request_id
+api_stream_request() {
+    local n=$1
+    local topic=$2
+    local peer=$3
+    local name=${4:-"test"}
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/stream/request" \
+        -H "Content-Type: application/json" \
+        -d "{\"topic\":\"$topic\",\"peer\":\"$peer\",\"name\":\"$name\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/stream/request"
+    echo "$result"
+}
+
+# Request a DM stream to a peer (peer-to-peer, no topic)
+# Usage: api_dm_stream_request <node> <peer_hex> [name]
+# Returns: JSON with request_id
+api_dm_stream_request() {
+    local n=$1
+    local peer=$2
+    local name=${3:-"test"}
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/dm/stream/request" \
+        -H "Content-Type: application/json" \
+        -d "{\"peer\":\"$peer\",\"name\":\"$name\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/dm/stream/request"
+    echo "$result"
+}
+
+# Accept a stream request
+# Usage: api_stream_accept <node> <request_id_hex>
+api_stream_accept() {
+    local n=$1
+    local request_id=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/stream/accept" \
+        -H "Content-Type: application/json" \
+        -d "{\"request_id\":\"$request_id\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/stream/accept"
+    echo "$result"
+}
+
+# Reject a stream request
+# Usage: api_stream_reject <node> <request_id_hex> [reason]
+api_stream_reject() {
+    local n=$1
+    local request_id=$2
+    local reason=${3:-""}
+    local port=$(api_port $n)
+    local body="{\"request_id\":\"$request_id\""
+    if [ -n "$reason" ]; then
+        body="$body,\"reason\":\"$reason\""
+    fi
+    body="$body}"
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/stream/reject" \
+        -H "Content-Type: application/json" \
+        -d "$body")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/stream/reject"
+    echo "$result"
+}
+
+# Publish data to an active stream
+# Usage: api_stream_publish <node> <request_id_hex> <data_hex>
+api_stream_publish() {
+    local n=$1
+    local request_id=$2
+    local data_hex=$3
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/stream/publish" \
+        -H "Content-Type: application/json" \
+        -d "{\"request_id\":\"$request_id\",\"data\":\"$data_hex\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/stream/publish"
+    echo "$result"
+}
+
+# End an active stream
+# Usage: api_stream_end <node> <request_id_hex>
+api_stream_end() {
+    local n=$1
+    local request_id=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/stream/end" \
+        -H "Content-Type: application/json" \
+        -d "{\"request_id\":\"$request_id\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/stream/end"
+    echo "$result"
+}
+
+# Extract request_id from stream request response JSON
+# Usage: extract_request_id <json>
+extract_request_id() {
+    local json=$1
+    echo "$json" | grep -o '"request_id":"[^"]*"' | cut -d'"' -f4
 }
 

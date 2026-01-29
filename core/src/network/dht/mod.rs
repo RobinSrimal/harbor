@@ -5,12 +5,18 @@
 //!
 //! # Architecture
 //!
-//! - `distance`: XOR distance metric implementation  
-//! - `routing`: In-memory routing table with K-buckets
-//! - `pool`: Connection pool with direct-dial fallback for DHT ALPN
-//! - `rpc`: irpc-based RPC protocol for node communication
-//! - `api`: High-level API for DHT operations
+//! Top-level modules:
+//! - `protocol`: Wire format for DHT messages (FindNode, FindNodeResponse)
 //! - `actor`: Actor that manages DHT state and handles messages
+//!
+//! Internal modules (in `internal/`):
+//! - `api`: High-level API for DHT operations
+//! - `bootstrap`: Bootstrap node configuration
+//! - `config`: DHT configuration and factory functions
+//! - `distance`: XOR distance metric implementation
+//! - `lookup`: Kademlia iterative lookup algorithm
+//! - `pool`: Connection pool with direct-dial fallback
+//! - `routing`: In-memory routing table with K-buckets
 //!
 //! # Example
 //!
@@ -27,33 +33,26 @@
 //! ```
 
 pub mod actor;
-pub mod api;
-pub mod bootstrap;
-pub mod distance;
-pub mod pool;
-pub mod routing;
-pub mod rpc;
+pub mod internal;
+pub mod protocol;
+pub mod service;
 
-// Re-export commonly used items
-pub use actor::{create_dht_node, create_dht_node_with_buckets, DhtConfig};
-pub use api::ApiClient;
-pub use bootstrap::{BootstrapConfig, BootstrapNode, default_bootstrap_nodes, bootstrap_node_ids, bootstrap_dial_info};
-pub use distance::{Distance, Id};
-pub use pool::{DhtPool, DhtPoolConfig, DhtPoolError, DialInfo, DHT_ALPN};
-pub use routing::{Buckets, RoutingTable, K, ALPHA, BUCKET_COUNT};
-pub use rpc::RpcClient;
-
-// Sample file dht_sample.rs is kept for reference but not compiled
+// Re-export commonly used items from internal modules
+pub use internal::bootstrap::{BootstrapConfig, BootstrapNode, default_bootstrap_nodes, bootstrap_node_ids, bootstrap_dial_info};
+pub use internal::config::{DhtConfig, create_dht_actor, create_dht_actor_with_buckets};
+pub use internal::distance::{Distance, Id};
+pub use internal::pool::{DhtPool, DhtPoolConfig, DhtPoolError, DialInfo, DHT_ALPN};
+pub use internal::routing::{Buckets, RoutingTable, K, ALPHA, BUCKET_COUNT};
+pub use service::{DhtService, WeakDhtService};
 
 #[cfg(test)]
 mod tests {
     //! Offline DHT tests
     //!
-    //! These tests use in-memory clients without actual network connections,
-    //! similar to the tests in dht_sample.rs
+    //! These tests use in-memory clients without actual network connections.
 
     use super::*;
-    use super::routing::KBucket;
+    use super::internal::routing::KBucket;
 
     fn make_id(seed: u8) -> Id {
         Id::new([seed; 32])
@@ -83,7 +82,7 @@ mod tests {
         let d_ab = a.distance(&b);
         let d_bc = b.distance(&c);
         let d_ac = a.distance(&c);
-        
+
         // In XOR metric, d(a,c) <= d(a,b) XOR d(b,c) isn't always true
         // but the metric still works for Kademlia routing
         assert!(d_ac <= Distance::MAX);
@@ -171,7 +170,7 @@ mod tests {
 
         // Find 3 closest to local (0x00)
         let closest = table.find_closest_nodes(&local, 3);
-        
+
         assert_eq!(closest.len(), 3);
         // Should be sorted by distance (closest first)
         assert_eq!(closest[0], nodes[4]); // 0x01
@@ -237,7 +236,7 @@ mod tests {
     fn test_routing_table_persistence_simulation() {
         // Simulate saving and restoring routing table
         let local = make_id(0);
-        
+
         // Create and populate a routing table
         let mut table1 = RoutingTable::new(local);
         for i in 1..=10u8 {
@@ -286,7 +285,7 @@ mod tests {
         let b = make_id(123);
 
         let dist = a.distance(&b);
-        
+
         // d.inverse(b) should give us a
         let recovered_a = Id::new(dist.inverse(b.as_bytes()));
         assert_eq!(recovered_a, a);
@@ -300,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_node_info_roundtrip() {
-        use super::rpc::NodeInfo;
+        use super::protocol::NodeInfo;
 
         let original = NodeInfo {
             node_id: [42u8; 32],
@@ -318,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_find_node_request_roundtrip() {
-        use super::rpc::FindNode;
+        use super::protocol::FindNode;
 
         let request = FindNode {
             target: make_id(100),
@@ -336,8 +335,8 @@ mod tests {
 
     #[test]
     fn test_find_node_response_roundtrip() {
-        use super::rpc::FindNodeResponse;
-        use super::rpc::NodeInfo;
+        use super::protocol::FindNodeResponse;
+        use super::protocol::NodeInfo;
 
         let response = FindNodeResponse {
             nodes: (0..5).map(|i| NodeInfo {
@@ -380,11 +379,11 @@ mod tests {
 
     #[test]
     fn test_dht_config_candidate_defaults() {
-        use super::actor::{DEFAULT_CANDIDATE_VERIFY_INTERVAL, MAX_CANDIDATES_PER_VERIFY};
+        use super::internal::config::{DEFAULT_CANDIDATE_VERIFY_INTERVAL, MAX_CANDIDATES_PER_VERIFY};
         use std::time::Duration;
-        
+
         let config = DhtConfig::default();
-        
+
         assert_eq!(config.candidate_verify_interval, DEFAULT_CANDIDATE_VERIFY_INTERVAL);
         assert_eq!(config.max_candidates_per_verify, MAX_CANDIDATES_PER_VERIFY);
         assert_eq!(DEFAULT_CANDIDATE_VERIFY_INTERVAL, Duration::from_secs(30));
@@ -394,13 +393,13 @@ mod tests {
     #[test]
     fn test_dht_config_custom_candidate_interval() {
         use std::time::Duration;
-        
+
         let config = DhtConfig {
             candidate_verify_interval: Duration::from_secs(10),
             max_candidates_per_verify: 5,
             ..Default::default()
         };
-        
+
         assert_eq!(config.candidate_verify_interval, Duration::from_secs(10));
         assert_eq!(config.max_candidates_per_verify, 5);
     }
@@ -408,42 +407,42 @@ mod tests {
     #[test]
     fn test_candidate_set_uniqueness() {
         use std::collections::HashSet;
-        
+
         let mut candidates: HashSet<Id> = HashSet::new();
         let node1 = make_id(1);
         let node2 = make_id(1); // Same as node1
         let node3 = make_id(2); // Different
-        
+
         // First insert succeeds
         assert!(candidates.insert(node1));
         // Duplicate insert fails (returns false)
         assert!(!candidates.insert(node2));
         // Different node succeeds
         assert!(candidates.insert(node3));
-        
+
         assert_eq!(candidates.len(), 2);
     }
 
     #[test]
     fn test_candidate_batch_limits() {
         use std::collections::HashSet;
-        use super::actor::MAX_CANDIDATES_PER_VERIFY;
-        
+        use super::internal::config::MAX_CANDIDATES_PER_VERIFY;
+
         let mut candidates: HashSet<Id> = HashSet::new();
-        
+
         // Add 25 candidates
         for i in 0..25 {
             candidates.insert(make_id(i as u8));
         }
         assert_eq!(candidates.len(), 25);
-        
+
         // Batch should be limited to MAX_CANDIDATES_PER_VERIFY
         let batch: Vec<Id> = candidates
             .iter()
             .take(MAX_CANDIDATES_PER_VERIFY)
             .copied()
             .collect();
-        
+
         assert_eq!(batch.len(), MAX_CANDIDATES_PER_VERIFY);
         assert_eq!(batch.len(), 10); // Verify the constant
     }
@@ -451,23 +450,23 @@ mod tests {
     #[test]
     fn test_candidate_batch_removes_from_set() {
         use std::collections::HashSet;
-        
+
         let mut candidates: HashSet<Id> = HashSet::new();
-        
+
         // Add 5 candidates
         for i in 0..5 {
             candidates.insert(make_id(i));
         }
         assert_eq!(candidates.len(), 5);
-        
+
         // Take all as batch
         let batch: Vec<Id> = candidates.iter().copied().collect();
-        
+
         // Remove from candidates (simulating verification process)
         for id in &batch {
             candidates.remove(id);
         }
-        
+
         assert_eq!(candidates.len(), 0);
     }
 
@@ -476,7 +475,7 @@ mod tests {
         // Transient nodes don't accept candidates from requesters
         let config = DhtConfig::transient();
         assert!(config.transient);
-        
+
         // In handle_rpc, the check is: if !self.config.transient
         // So for transient nodes, the requester is NOT added to candidates
     }
@@ -484,20 +483,20 @@ mod tests {
     #[test]
     fn test_local_id_excluded_from_candidates() {
         use std::collections::HashSet;
-        
+
         let local_id = make_id(42);
         let mut candidates: HashSet<Id> = HashSet::new();
-        
+
         // Simulate the check in handle_rpc: if id != *self.node.local_id()
         let requester = local_id;
         if requester != local_id {
             candidates.insert(requester);
         }
-        
+
         // Local ID should NOT be in candidates
         assert!(!candidates.contains(&local_id));
         assert_eq!(candidates.len(), 0);
-        
+
         // Different ID should be added
         let remote = make_id(100);
         if remote != local_id {
@@ -510,45 +509,45 @@ mod tests {
     #[test]
     fn test_candidate_flow_simulation() {
         use std::collections::HashSet;
-        
+
         // Simulate the full candidate flow:
         // 1. Requester sends FindNode -> added to candidates
         // 2. Verification runs -> connection attempted
         // 3. If successful -> promoted to routing table via nodes_seen
         // 4. If failed -> removed from candidates, not added to routing table
-        
+
         let local = make_id(0);
         let mut routing_table = RoutingTable::new(local);
         let mut candidates: HashSet<Id> = HashSet::new();
-        
+
         // Step 1: Simulate receiving FindNode requests
         let requester1 = make_id(1);
         let requester2 = make_id(2);
         let requester3 = make_id(3);
-        
+
         candidates.insert(requester1);
         candidates.insert(requester2);
         candidates.insert(requester3);
-        
+
         // Routing table should NOT have these yet
         assert!(!routing_table.contains(&requester1));
         assert!(!routing_table.contains(&requester2));
         assert!(!routing_table.contains(&requester3));
-        
+
         // Step 2 & 3: Simulate verification - only requester1 and requester3 are reachable
         let verified = vec![requester1, requester3];
         let _failed = vec![requester2];
-        
+
         // Remove all from candidates
         for _id in candidates.drain() {
             // In real code, this happens as part of verification
         }
-        
+
         // Step 4: Add verified to routing table
         for id in verified {
             routing_table.add_node(id);
         }
-        
+
         // Verify final state
         assert!(routing_table.contains(&requester1));
         assert!(!routing_table.contains(&requester2)); // Failed verification
@@ -556,4 +555,3 @@ mod tests {
         assert!(candidates.is_empty());
     }
 }
-

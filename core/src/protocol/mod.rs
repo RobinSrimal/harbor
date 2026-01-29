@@ -37,11 +37,8 @@ pub(crate) mod core;
 mod config;
 mod error;
 mod events;
-mod types;
-mod topics;
-mod send;
+mod api;
 mod stats;
-mod share;
 
 // Core protocol
 pub use core::Protocol;
@@ -54,10 +51,14 @@ pub use error::ProtocolError;
 pub use events::{
     FileAnnouncedEvent, FileCompleteEvent, FileProgressEvent, IncomingMessage, ProtocolEvent,
     SyncUpdateEvent, SyncRequestEvent, SyncResponseEvent,
+    StreamRequestEvent, StreamAcceptedEvent, StreamRejectedEvent, StreamEndedEvent,
+    StreamConnectedEvent,
+    DmReceivedEvent, DmSyncUpdateEvent, DmSyncRequestEvent, DmSyncResponseEvent,
+    DmFileAnnouncedEvent,
 };
 
-// Domain types
-pub use types::{MemberInfo, TopicInvite};
+// Domain types (from TopicService)
+pub use crate::network::topic::{MemberInfo, TopicInvite};
 
 // Stats types
 pub use stats::{
@@ -66,4 +67,9 @@ pub use stats::{
 };
 
 // Share types
-pub use share::ShareStatus;
+pub use api::ShareStatus;
+
+// Target types (Topic vs DM)
+mod target;
+pub use target::Target;
+

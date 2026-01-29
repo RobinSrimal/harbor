@@ -5,6 +5,10 @@
 //! - Section-level replication traces
 //! - Adaptive splitting based on available peers
 //!
+//! Architecture:
+//! - `protocol.rs` - Wire format and message types
+//! - `service.rs` - Business logic (ShareService)
+//!
 //! Messages:
 //! - FileAnnouncement: Broadcast via Send when sharing starts
 //! - CanSeed: Broadcast via Send when peer reaches 100%
@@ -19,5 +23,5 @@ pub use protocol::{
     ChunkResponse, DecodeError, FileAnnouncement, InitialRecipient, PeerChunks, PeerSuggestion,
     ShareMessage, ShareMessageType, SHARE_ALPN,
 };
-pub use service::{ShareConfig, ShareError, ShareService};
+pub use service::{ProcessShareError, ShareConfig, ShareError, ShareService, ShareStatus};
 

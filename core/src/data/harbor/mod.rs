@@ -9,7 +9,7 @@ pub mod dedup;
 
 // Re-export commonly used items
 pub use cache::{
-    all_recipients_delivered, cache_packet, cleanup_expired, delete_packet,
+    all_recipients_delivered, cache_packet, cache_packet_with_ttl, cleanup_expired, delete_packet,
     get_active_harbor_ids, get_cached_packet, get_delivered_recipients,
     get_harbor_cache_stats, get_packets_for_recipient, get_packets_for_sync,
     get_undelivered_recipients, mark_delivered, mark_pulled, was_pulled,

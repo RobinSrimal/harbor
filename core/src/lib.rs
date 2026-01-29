@@ -71,6 +71,10 @@ pub use protocol::{
     SyncUpdateEvent,
     SyncRequestEvent,
     SyncResponseEvent,
+    // Target
+    Target,
+    // DM events
+    DmReceivedEvent,
     // Stats types
     ProtocolStats,
     IdentityStats,

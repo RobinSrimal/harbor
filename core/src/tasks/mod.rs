@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::network::dht::ApiClient as DhtApiClient;
+use crate::network::dht::DhtService;
 
 use crate::protocol::Protocol;
 
@@ -32,98 +32,58 @@ impl Protocol {
     pub(crate) async fn start_background_tasks(&self, _shutdown_rx: mpsc::Receiver<()>) {
         let mut tasks = self.tasks.write().await;
 
-        // 1. Incoming message handler (handles Send, DHT, Harbor, Share, Sync protocols)
-        let endpoint = self.endpoint.clone();
-        let db = self.db.clone();
-        let event_tx = self.event_tx.clone();
-        let our_id = self.identity.public_key;
-        let running = self.running.clone();
-        let dht_client = self.dht_client.clone();
-        
-        // Initialize blob store for Share protocol
-        let blob_path = self.blob_path();
-        let blob_store = match crate::data::BlobStore::new(&blob_path) {
-            Ok(store) => Some(std::sync::Arc::new(store)),
-            Err(e) => {
-                warn!(error = %e, path = %blob_path.display(), "failed to initialize blob store");
-                None
-            }
-        };
-
-        let incoming_task = tokio::spawn(async move {
-            Self::run_incoming_handler(
-                endpoint, db, event_tx, our_id, running, dht_client, blob_store,
-            ).await;
-        });
-        tasks.push(incoming_task);
-
-        // 2. Replication checker (checks for unacked packets and replicates to Harbor)
-        let db = self.db.clone();
-        let endpoint = self.endpoint.clone();
+        // 1. Replication checker (checks for unacked packets and replicates to Harbor)
+        let harbor_service = self.harbor_service.clone();
         let running = self.running.clone();
         let our_id = self.identity.public_key;
-        let dht_client = self.dht_client.clone();
         let replication_interval = Duration::from_secs(self.config.replication_check_interval_secs);
         let replication_factor = self.config.replication_factor;
         let max_replication_attempts = self.config.max_replication_attempts;
-        let harbor_connect_timeout = Duration::from_secs(self.config.harbor_connect_timeout_secs);
-        let harbor_response_timeout = Duration::from_secs(self.config.harbor_response_timeout_secs);
 
         let replication_task = tokio::spawn(async move {
             Self::run_replication_checker(
-                db, endpoint, our_id, dht_client, running, replication_interval,
+                harbor_service, our_id, running, replication_interval,
                 replication_factor, max_replication_attempts,
-                harbor_connect_timeout, harbor_response_timeout,
             ).await;
         });
         tasks.push(replication_task);
 
         // 3. Harbor pull loop (periodically pull missed packets from Harbor Nodes)
-        let db = self.db.clone();
-        let endpoint = self.endpoint.clone();
+        let harbor_service = self.harbor_service.clone();
         let running = self.running.clone();
         let event_tx = self.event_tx.clone();
         let our_id = self.identity.public_key;
-        let dht_client = self.dht_client.clone();
         let pull_interval = Duration::from_secs(self.config.harbor_pull_interval_secs);
         let pull_max_nodes = self.config.harbor_pull_max_nodes;
         let pull_early_stop = self.config.harbor_pull_early_stop;
-        let harbor_connect_timeout = Duration::from_secs(self.config.harbor_connect_timeout_secs);
-        let harbor_response_timeout = Duration::from_secs(self.config.harbor_response_timeout_secs);
 
+        let stream_service = self.stream_service.clone();
         let pull_task = tokio::spawn(async move {
             Self::run_harbor_pull_loop(
-                db,
-                endpoint,
+                harbor_service,
                 event_tx,
                 our_id,
-                dht_client,
                 running,
                 pull_interval,
                 pull_max_nodes,
                 pull_early_stop,
-                harbor_connect_timeout,
-                harbor_response_timeout,
+                stream_service,
             )
             .await;
         });
         tasks.push(pull_task);
 
         // 4. Harbor sync loop (Harbor Node to Harbor Node sync for redundancy)
-        let db = self.db.clone();
-        let endpoint = self.endpoint.clone();
+        let harbor_service = self.harbor_service.clone();
         let running = self.running.clone();
         let our_id = self.identity.public_key;
-        let dht_client = self.dht_client.clone();
         let sync_interval = Duration::from_secs(self.config.harbor_sync_interval_secs);
         let sync_candidates = self.config.harbor_sync_candidates;
 
         let sync_task = tokio::spawn(async move {
             Self::run_harbor_sync_loop(
-                db,
-                endpoint,
+                harbor_service,
                 our_id,
-                dht_client,
                 running,
                 sync_interval,
                 sync_candidates,
@@ -133,26 +93,25 @@ impl Protocol {
         tasks.push(sync_task);
 
         // 5. DHT routing table persistence (saves periodically)
-        let db = self.db.clone();
         let running = self.running.clone();
-        let dht_client = self.dht_client.clone();
+        let dht_service = self.dht_service.clone();
         let dht_save_interval = Duration::from_secs(self.config.dht_save_interval_secs);
 
         let dht_save_task = tokio::spawn(async move {
-            Self::run_dht_save_loop(db, dht_client, running, dht_save_interval).await;
+            Self::run_dht_save_loop(dht_service, running, dht_save_interval).await;
         });
         tasks.push(dht_save_task);
 
         // 6. DHT bootstrap and refresh loop (maintains routing table health)
         let running = self.running.clone();
-        let dht_client = self.dht_client.clone();
+        let dht_service = self.dht_service.clone();
         let dht_bootstrap_delay = Duration::from_secs(self.config.dht_bootstrap_delay_secs);
         let dht_initial_refresh = Duration::from_secs(self.config.dht_initial_refresh_interval_secs);
         let dht_stable_refresh = Duration::from_secs(self.config.dht_stable_refresh_interval_secs);
 
         let dht_refresh_task = tokio::spawn(async move {
             Self::run_dht_refresh_loop(
-                dht_client, running,
+                dht_service, running,
                 dht_bootstrap_delay, dht_initial_refresh, dht_stable_refresh,
             ).await;
         });
@@ -170,7 +129,7 @@ impl Protocol {
 
         // 8. Share pull task (retries incomplete blob downloads)
         let db = self.db.clone();
-        let endpoint = self.endpoint.clone();
+        let share_service = self.share_service.clone();
         let running = self.running.clone();
         let our_id = self.identity.public_key;
         let share_pull_interval = Duration::from_secs(self.config.share_pull_interval_secs);
@@ -180,7 +139,7 @@ impl Protocol {
         let share_pull_task = tokio::spawn(async move {
             share_pull::run_share_pull_task(
                 db,
-                endpoint,
+                share_service,
                 our_id,
                 running,
                 share_pull_interval,
@@ -198,13 +157,13 @@ impl Protocol {
     /// On startup: waits for relay connection, then does rapid lookups to bootstrap
     /// After initial phase: does periodic random lookups to maintain routing table
     async fn run_dht_refresh_loop(
-        dht_client: Option<DhtApiClient>,
+        dht_service: Option<Arc<DhtService>>,
         running: Arc<RwLock<bool>>,
         bootstrap_delay: Duration,
         initial_refresh_interval: Duration,
         stable_refresh_interval: Duration,
     ) {
-        let Some(dht) = dht_client else {
+        let Some(dht) = dht_service else {
             debug!("DHT client not available, skipping refresh loop");
             return;
         };

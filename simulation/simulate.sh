@@ -105,6 +105,17 @@ source "$SCRIPT_DIR/scenarios/sync_basic.sh"
 source "$SCRIPT_DIR/scenarios/sync_concurrent.sh"
 source "$SCRIPT_DIR/scenarios/sync_offline.sh"
 source "$SCRIPT_DIR/scenarios/sync_initial.sh"
+source "$SCRIPT_DIR/scenarios/stream_basic.sh"
+source "$SCRIPT_DIR/scenarios/stream_reject.sh"
+source "$SCRIPT_DIR/scenarios/stream_end.sh"
+source "$SCRIPT_DIR/scenarios/dm_basic.sh"
+source "$SCRIPT_DIR/scenarios/dm_offline.sh"
+source "$SCRIPT_DIR/scenarios/dm_sync_basic.sh"
+source "$SCRIPT_DIR/scenarios/dm_sync_offline.sh"
+source "$SCRIPT_DIR/scenarios/dm_share_basic.sh"
+source "$SCRIPT_DIR/scenarios/dm_share_offline.sh"
+source "$SCRIPT_DIR/scenarios/dm_stream_basic.sh"
+source "$SCRIPT_DIR/scenarios/dm_stream_offline.sh"
 source "$SCRIPT_DIR/scenarios/suites.sh"
 
 # ============================================================================
@@ -245,6 +256,39 @@ case $SCENARIO in
     sync)
         run_sync_suite
         ;;
+    stream-basic)
+        scenario_stream_basic
+        ;;
+    stream-reject)
+        scenario_stream_reject
+        ;;
+    stream-end)
+        scenario_stream_end
+        ;;
+    dm-basic)
+        scenario_dm_basic
+        ;;
+    dm-offline)
+        scenario_dm_offline
+        ;;
+    dm-sync-basic)
+        scenario_dm_sync_basic
+        ;;
+    dm-sync-offline)
+        scenario_dm_sync_offline
+        ;;
+    dm-share-basic)
+        scenario_dm_share_basic
+        ;;
+    dm-share-offline)
+        scenario_dm_share_offline
+        ;;
+    dm-stream-basic)
+        scenario_dm_stream_basic
+        ;;
+    dm-stream-offline)
+        scenario_dm_stream_offline
+        ;;
     advanced)
         run_advanced_suite
         ;;
@@ -263,6 +307,9 @@ case $SCENARIO in
         echo "  Share:      share-basic, share-peer-offline, share-few-peers, share-large-file,"
         echo "              share-retry-source, share-retry-recipient"
         echo "  Sync:       sync-basic, sync-concurrent, sync-offline, sync-initial"
+        echo "  Stream:     stream-basic, stream-reject, stream-end"
+        echo "  DM:         dm-basic, dm-offline"
+        echo "  DM Stream:  dm-stream-basic, dm-stream-offline"
         echo "  Suites:     membership, advanced, share, sync, full"
         echo ""
         exit 1

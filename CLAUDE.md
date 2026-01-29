@@ -2,132 +2,166 @@
 
 This file provides important context about Harbor's architecture for AI assistants working on this codebase.
 
-## Overview
+## Codebase Architecture
 
-Harbor is a **CRDT-agnostic transport protocol** for distributed, offline-first collaboration. The protocol doesn't implement CRDT logic internally - that's the application layer's responsibility. Harbor provides three transport primitives:
-
-1. **Sync Updates (deltas)** → `send_sync_update(topic, data: Vec<u8>)`
-   - Broadcasts CRDT delta bytes to all topic members
-   - Uses Send protocol (max 512KB)
-   - Goes through Harbor nodes for offline delivery
-
-2. **Sync Requests** → `request_sync(topic)`
-   - Broadcasts request for full state to all topic members
-   - Uses Send protocol
-   - Triggers `SyncRequest` events on all members
-
-3. **Sync Responses (full state)** → `respond_sync(topic, requester_id, data: Vec<u8>)`
-   - Direct point-to-point connection via **SYNC_ALPN**
-   - NO size limit (can be hundreds of MB)
-   - Uses dedicated QUIC stream for large snapshots
-
-**Key Design Decision**: Sync responses use a separate ALPN (`SYNC_ALPN`) to make it very clear they flow directly peer-to-peer, not through the broadcast/harbor system.
-
-## Protocol Flow
+### Layer Overview
 
 ```
-Node A: Has CRDT state, makes edit
-  ↓
-Node A: Serializes CRDT delta → bytes
-  ↓
-Node A: send_sync_update(topic, delta_bytes)
-  ↓ (broadcast via Send protocol)
-All members: Receive SyncUpdate event with delta_bytes
-  ↓
-Each node: Deserializes and applies delta to their CRDT
-
----
-
-Node B: Joins topic, needs full state
-  ↓
-Node B: request_sync(topic)
-  ↓ (broadcast via Send protocol)
-All members: Receive SyncRequest event
-  ↓
-Node A: Serializes full CRDT state → bytes
-  ↓
-Node A: respond_sync(topic, node_b_id, snapshot_bytes)
-  ↓ (direct SYNC_ALPN connection)
-Node B: Receives SyncResponse event with snapshot_bytes
-  ↓
-Node B: Deserializes and initializes CRDT state
+┌─────────────────────────────────────────────────────────────┐
+│                    Protocol (protocol/)                      │
+│         Thin API layer + startup/shutdown only               │
+│      Delegates to services, exposes public methods           │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Services (network/)                       │
+│     Self-contained units that own connections & handlers     │
+│                                                              │
+│  ┌───────────┐ ┌─────────────┐ ┌───────────┐ ┌───────────┐  │
+│  │SendService│ │HarborService│ │ShareService│ │ DhtService│  │
+│  └───────────┘ └─────────────┘ └───────────┘ └───────────┘  │
+│        │              │              │              │        │
+│        └──────────────┼──────────────┼──────────────┘        │
+│                       ▼              ▼                       │
+│              Services call each other directly               │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   Connection (transport)                     │
+│        Per-peer, per-ALPN transport primitive                │
+│     Wraps QUIC, handles relay URLs, connection pooling       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Data (data/)                            │
+│              Persistence layer (SQLite + blobs)              │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## Protocol Architecture
+### Protocol (`core/src/protocol/`)
 
-### Three Main Protocol Layers
+**Role**: Thin API shell + startup/shutdown orchestration.
 
-1. **DHT Layer** (`network/dht/`)
-   - Kademlia-based distributed hash table
-   - Peer discovery and routing
-   - Bootstrap nodes for joining network
+- `core.rs` - Protocol struct, `start()`, `stop()`, service initialization
+- `send.rs`, `topics.rs`, `share.rs` - Public API methods that delegate to services
+- `events.rs` - Event types emitted to application
+- `config.rs`, `error.rs`, `types.rs` - Configuration and types
 
-2. **Harbor Layer** (`network/harbor/`)
-   - Store-and-forward for offline delivery
-   - Nodes store packets for offline peers
-   - Pull mechanism to retrieve missed messages
-   - Sync functionality (batched packet sync between harbor nodes)
+**Important**: Protocol does NOT coordinate between services. Services call each other directly when needed. Protocol just:
+1. Creates and wires up services on startup
+2. Exposes public API (delegates to services)
+3. Handles shutdown
 
-3. **Membership Layer** (`network/membership/`)
-   - Topic-based pub/sub
-   - Join/Leave announcements
-   - Member verification and encryption
-   - Message types: Content, Join, Leave, FileAnnouncement, CanSeed, SyncUpdate, SyncRequest
+### Services (`core/src/network/`)
+
+**Role**: Self-contained units that own their connections, context, and business logic.
+
+Each service:
+- Owns a connection pool for its ALPN
+- Has access to shared context (db, event_tx, identity)
+- Handles both incoming and outgoing operations
+- Calls other services directly when needed
+
+| Service | ALPN | Responsibility |
+|---------|------|----------------|
+| `SendService` | `harbor/send/0` | Message delivery, receipts |
+| `HarborService` | `harbor/harbor/0` | Store-and-forward for offline peers |
+| `ShareService` | `harbor/share/0` | File chunk distribution |
+| `DhtService` | `harbor/dht/0` | Peer discovery, routing table |
+| `SyncService` | `harbor/sync/0` | Large sync responses (point-to-point) |
+
+**Service interaction example** (send message):
+1. User calls `protocol.send(topic, data)`
+2. Protocol delegates to `send_service.send(topic, data)`
+3. SendService tries direct delivery via its connections
+4. If peer offline, SendService calls `harbor_service.store(packet)`
+5. No Protocol involvement after initial delegation
+
+### Handlers (`core/src/handlers/`)
+
+**Role**: Process incoming connections/messages for each protocol.
+
+- `incoming/` - Handle incoming QUIC connections by ALPN
+- `outgoing/` - Outgoing operations (currently on Protocol, moving to Services)
+
+**Current state**: Handlers are `impl Protocol` methods.
+**Target state**: Handlers belong to their respective Services.
+
+### Tasks (`core/src/tasks/`)
+
+**Role**: Background automation that runs periodically.
+
+| Task | Purpose |
+|------|---------|
+| `harbor_pull.rs` | Pull missed packets from Harbor nodes |
+| `harbor_replication.rs` | Replicate packets to Harbor nodes |
+| `dht_persist.rs` | Periodically save DHT routing table |
+
+Tasks are spawned by Protocol on startup and run independently. They use Services to perform their work.
+
+### Data (`core/src/data/`)
+
+**Role**: Persistence layer - SQLite database + blob storage.
+
+- `schema.rs` - Database schema (tables for identity, topics, members, packets, etc.)
+- `identity.rs` - Local identity (keypair) management
+- `topics.rs` - Topic and membership persistence
+- `send.rs` - Outgoing packet tracking
+- `harbor.rs` - Harbor packet storage
+- `dht.rs` - DHT routing table persistence
+- `blobs.rs` - File chunk storage (filesystem)
+
+**Key principle**: Data layer is accessed by Services, not directly by Protocol or handlers.
+
+### Connection (transport primitive)
+
+**Role**: Per-peer, per-ALPN transport abstraction over QUIC.
+
+```rust
+struct Connection {
+    peer_id: NodeId,
+    alpn: Alpn,
+    relay_url: Option<RelayUrl>,
+    // connection state, streams, etc.
+}
+```
+
+- Wraps iroh/QUIC connection details
+- Handles relay URLs for NAT traversal
+- Managed by Services in connection pools
+- Encryption is at QUIC level (transport) - packet encryption is only for Harbor storage
+
+## Protocol Layers (Conceptual)
 
 ### ALPN Protocols
 
 Harbor uses multiple ALPN identifiers for different protocols:
 
-- `harbor/dht/0` - DHT operations (peer discovery, routing)
-- `harbor/harbor/0` - Harbor protocol (store packets, pull packets, harbor sync)
-- `harbor/send/0` - Direct send (receipts, direct messages)
-- `harbor/share/0` - File sharing (chunk requests, bitfields)
-- `harbor/sync/0` - **Sync responses ONLY** (direct large snapshots)
+| ALPN | Service | Purpose |
+|------|---------|---------|
+| `harbor/send/0` | SendService | Message delivery, receipts |
+| `harbor/harbor/0` | HarborService | Store/pull packets, harbor-to-harbor sync |
+| `harbor/dht/0` | DhtService | Peer discovery, routing |
+| `harbor/share/0` | ShareService | File chunk requests, bitfields |
+| `harbor/sync/0` | SyncService | **Sync responses ONLY** (large snapshots) |
 
-**Important**: `SYNC_ALPN` is only used for sync responses (full state snapshots). Sync updates and requests go through Send protocol.
+## Key Files
 
-### Message Flow
-
-#### Regular Messages
-1. Node creates topic, gets invite
-2. Members join via invite (includes topic ID + encryption keys)
-3. Node calls `send(topic, bytes)` → creates signed packet
-4. Packet sent to online members directly via Send protocol
-5. Packet replicated to Harbor nodes for offline members
-6. Offline members pull packets when they come online
-
-#### Sync Messages
-1. **Updates (deltas)**: `send_sync_update()` → Broadcast via Send → Harbor replication
-2. **Requests**: `request_sync()` → Broadcast via Send → Harbor replication
-3. **Responses**: `respond_sync()` → Direct SYNC_ALPN connection (no Harbor)
-
-### Key Files
-
-- `core/src/protocol/core.rs` - Main Protocol struct, public API methods
-- `core/src/handlers/incoming/` - Protocol handlers for different ALPNs
-  - `send.rs` - Handles Send protocol (messages, sync updates/requests)
-  - `sync.rs` - Handles SYNC_ALPN (sync responses only)
-  - `harbor.rs` - Handles Harbor protocol (store/pull/sync)
-- `core/src/network/membership/messages.rs` - TopicMessage enum (sent over Send protocol)
-- `core/src/tasks/harbor_pull.rs` - Background task to pull packets from Harbor nodes
-
-### TopicMessage Types
-
-The `TopicMessage` enum defines message types sent via Send protocol:
-
-```rust
-pub enum TopicMessage {
-    Content(Vec<u8>),              // Regular messages
-    Join(JoinMessage),             // Join announcements
-    Leave(LeaveMessage),           // Leave announcements
-    FileAnnouncement(...),         // File sharing
-    CanSeed(...),                  // File sharing
-    SyncUpdate(SyncUpdateMessage), // CRDT delta bytes
-    SyncRequest,                   // Request for full state
-}
-```
-
-**Note**: There is NO `SyncResponse` in this enum! Sync responses are sent via direct SYNC_ALPN connection, not through TopicMessage/Send protocol.
+| Path | Purpose |
+|------|---------|
+| `core/src/protocol/core.rs` | Protocol struct, startup, public API |
+| `core/src/network/send/` | SendService, Send protocol messages |
+| `core/src/network/harbor/` | HarborService, store-and-forward |
+| `core/src/network/dht/` | DhtService, Kademlia DHT |
+| `core/src/network/share/` | ShareService, file distribution |
+| `core/src/network/sync/` | SyncService, large sync responses |
+| `core/src/handlers/incoming/` | Incoming connection handlers (per ALPN) |
+| `core/src/handlers/outgoing/` | Outgoing operations |
+| `core/src/tasks/` | Background tasks (pull, replication, persist) |
+| `core/src/data/` | Persistence (SQLite schema, queries) |
 
 ## Testing & Simulations
 
@@ -140,6 +174,9 @@ See [SIMULATIONS.md](SIMULATIONS.md) for details on running simulations and test
 3. **Harbor sync vs CRDT sync**: "Harbor sync" = syncing packets between harbor nodes; "CRDT sync" = application-level state synchronization
 4. **Size limits**: Send protocol has 512KB limit; SYNC_ALPN has no limit (designed for large snapshots)
 5. **The protocol is CRDT-agnostic**: Applications choose their own CRDT library (Loro, Yjs, Automerge, etc.)
+6. **Protocol is just API**: Don't add business logic to Protocol - it delegates to Services
+7. **Services call services**: Services communicate directly, not through Protocol
+8. **Encryption layers**: QUIC provides transport encryption; packet encryption is only needed for Harbor storage
 
 ## Development Notes
 
@@ -156,3 +193,6 @@ See [SIMULATIONS.md](SIMULATIONS.md) for details on running simulations and test
 3. **Offline-first** - Harbor layer stores packets for offline peers
 4. **Topic-based** - All communication scoped to topics with invite-based membership
 5. **End-to-end encrypted** - Topics use shared keys, packets are signed
+6. **Services are self-contained** - Each service owns its connections, handlers, and business logic
+7. **Protocol is a thin shell** - API + startup only, no coordination logic
+8. **Connection as transport primitive** - Per-peer, per-ALPN abstraction over QUIC

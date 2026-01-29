@@ -11,25 +11,14 @@ A topic-based message protocol for consumer apps built on [Iroh](https://iroh.co
 > - **Try it out:** Run the [simulations](simulation/) or use the invite feature in the [test app](test-app/) to create group chats.
 > - **Bootstrap Nodes:** If you'd like to volunteer to run a bootstrap node, please open an issue or reach out!
 
-## Crates
-
-| Crate | Description | Status |
-|-------|-------------|--------|
-| [`harbor-core`](core/) | Core protocol with messaging, DHT, Harbor Nodes, and CRDT sync primitives | ✅ Implemented |
-| [`harbor-stream`](stream/) | Real-time audio/video streaming | 🚧 Planned |
-
 ```
                        ┌──────────────────────────┐
                        │      harbor-core         │
                        │  • Messaging & Topics    │
                        │  • DHT & Harbor Nodes    │
                        │  • Sync Primitives       │
+                       │  • Streaming             │
                        └──────────────────────────┘
-                                    ↑
-                                    │
-                          ┌─────────────────┐
-                          │  harbor-stream  │
-                          └─────────────────┘
 ```
 
 ## Quick Start
@@ -89,16 +78,15 @@ npm run tauri dev
 
 ```
 harbor/
-├── core/               # harbor-core: Core protocol with sync primitives
+├── core/               # harbor-core: Protocol, messaging, streaming
 │   └── src/
 │       ├── data/       # SQLCipher-encrypted storage + file storage for Share
 │       ├── handlers/   # Incoming/outgoing message handlers
-│       ├── network/    # Network protocols (DHT, Send, Harbor, Share, Sync)
+│       ├── network/    # Network protocols (DHT, Send, Harbor, Share, Sync, Stream)
 │       ├── protocol/   # Core Protocol struct and sync API
 │       ├── security/   # Cryptographic operations
 │       ├── tasks/      # Background tasks (harbor pull, share pull, maintenance)
 │       └── resilience/ # Rate limiting, PoW, storage limits
-├── stream/             # harbor-stream: Audio/video streaming (planned)
 └── test-app/           # Tauri desktop app with Loro CRDT collaboration
     ├── src/            # React frontend with Loro integration
     └── src-tauri/      # Tauri/Rust backend
