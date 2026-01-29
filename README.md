@@ -1,6 +1,6 @@
 # Harbor
 
-A topic-based message protocol for consumer apps built on [Iroh](https://iroh.computer/).
+A peer-to-peer messaging protocol with offline delivery, built on [Iroh](https://iroh.computer/).
 
 > **Early Stage Software**
 >
@@ -13,14 +13,13 @@ A topic-based message protocol for consumer apps built on [Iroh](https://iroh.co
 
 ## Features
 
-- **Topic-based messaging** - Send encrypted messages to all members of a topic
-- **CRDT sync primitives** - SyncUpdate, SyncRequest, SyncResponse for collaborative apps
+- **Messaging** - Topic-based group messaging and direct peer-to-peer messages
+- **CRDT sync primitives** - Built-in support for collaborative applications
 - **File sharing** - P2P distribution for large files with BLAKE3 chunking
-- **Streaming** - Real-time audio/video streaming between peers
+- **Streaming** - Real-time streaming transport layer between peers
 - **Offline delivery** - Harbor Nodes store messages for offline members
 - **DHT routing** - Kademlia-style distributed hash table for peer discovery
-- **End-to-end encryption** - All messages encrypted with topic-derived keys
-- **Direct messages** - Peer-to-peer messaging, sync, sharing, and streaming without topics
+- **End-to-end encryption** - All messages signed and encrypted
 
 ## Quick Start
 

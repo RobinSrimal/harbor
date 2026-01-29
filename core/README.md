@@ -1,47 +1,35 @@
 # harbor-core
 
-The foundation crate for Harbor Protocol - peer-to-peer topic-based messaging and streaming.
-
-## Features
-
-- **Topic-based messaging**: Send encrypted messages to all members of a topic
-- **CRDT sync primitives**: Three sync operations for building collaborative applications (SyncUpdate, SyncRequest, SyncResponse)
-- **File sharing**: P2P distribution for large files (≥512KB) with BLAKE3 chunking
-- **Streaming**: Real-time audio/video streaming between peers
-- **Offline delivery**: Harbor Nodes store messages for offline members
-- **DHT routing**: Kademlia-style distributed hash table for peer discovery
-- **End-to-end encryption**: All messages encrypted with topic-derived keys
-- **Persistent identity**: Ed25519 keypair stored in encrypted database
+The core crate for Harbor — peer-to-peer messaging with offline delivery.
 
 ## Usage
 
-```toml
-[dependencies]
-harbor-core = "0.1"
-```
-
 ```rust
-use harbor_core::{Protocol, ProtocolConfig, ProtocolEvent, TopicInvite};
+use harbor_core::{Protocol, ProtocolConfig, ProtocolEvent, Target, TopicInvite};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Start the protocol
     let config = ProtocolConfig::default();
     let protocol = Protocol::start(config).await?;
 
-    // Create a new topic
+    // Create a topic
     let invite = protocol.create_topic().await?;
-    println!("Topic created: {}", hex::encode(invite.topic_id));
 
-    // Send a message
-    protocol.send(&invite.topic_id, b"Hello, Harbor!").await?;
+    // Send a message to all topic members
+    protocol.send(Target::Topic(invite.topic_id), b"Hello, Harbor!").await?;
 
-    // Listen for events (messages, file announcements, etc.)
+    // Send a direct message
+    protocol.send(Target::Dm(peer_id), b"Hello directly!").await?;
+
+    // Listen for events
     let mut events = protocol.events().await.unwrap();
     while let Some(event) = events.recv().await {
         match event {
             ProtocolEvent::Message(msg) => {
                 println!("Message: {:?}", String::from_utf8_lossy(&msg.payload));
+            }
+            ProtocolEvent::DmReceived(msg) => {
+                println!("DM: {:?}", String::from_utf8_lossy(&msg.payload));
             }
             ProtocolEvent::FileAnnounced(file) => {
                 println!("File shared: {} ({} bytes)", file.display_name, file.total_size);
@@ -58,27 +46,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```
 harbor-core/
-├── data/           # SQLCipher-encrypted storage + file storage for Share
+├── data/           # SQLCipher-encrypted storage + blob storage
 ├── handlers/       # Incoming/outgoing message handlers
 ├── network/
 │   ├── dht/        # Kademlia DHT implementation
 │   ├── harbor/     # Harbor Node protocol (store, pull, harbor sync)
 │   ├── membership/ # Topic join/leave messages
-│   ├── send/       # Direct message sending (includes CRDT sync messages)
+│   ├── send/       # Message sending (includes CRDT sync messages)
 │   ├── share/      # P2P file sharing protocol
-│   ├── stream/     # Real-time audio/video streaming
+│   ├── stream/     # Real-time streaming transport
 │   └── sync/       # CRDT sync protocol (direct peer-to-peer, for initial sync)
-├── protocol/       # Core Protocol struct 
+├── protocol/       # Protocol struct and public API
 ├── resilience/     # Rate limiting, PoW, storage limits
 ├── security/       # Cryptographic operations
-└── tasks/          # Background tasks (harbor pull, share pull, maintenance)
+└── tasks/          # Background tasks (harbor pull, maintenance)
 ```
 
 ## Core Concepts
 
 ### Topics
 
-All communication is organized around **topics**. A topic:
+Group communication is organized around **topics**. A topic:
 - Has a 32-byte TopicID
 - Maintains a list of member EndpointIDs
 - Derives encryption keys from the TopicID
@@ -88,69 +76,84 @@ All communication is organized around **topics**. A topic:
 let invite = protocol.create_topic().await?;
 
 // Share the invite with others
-let invite_string = invite.to_base64();
+let invite_string = invite.to_hex()?;
 
 // Join using an invite
-let invite = TopicInvite::from_base64(&invite_string)?;
+let invite = TopicInvite::from_hex(&invite_string)?;
 protocol.join_topic(invite).await?;
 ```
 
-### Send Mode
+### Direct Messages
+
+Peer-to-peer communication without topics. DMs support messaging, sync, file sharing, and streaming — the same capabilities as topics but between two peers directly.
+
+```rust
+protocol.send(Target::Dm(peer_id), b"Hello!").await?;
+```
+
+### Send Protocol
 
 Messages are delivered with best-effort semantics:
 
 1. Encrypt and sign the packet
-2. Send directly to all online members
+2. Send directly to all online recipients
 3. Collect read receipts
 4. Replicate to Harbor Nodes if any receipts are missing
 
 ```rust
 // Send to all topic members (max 512 KB)
-protocol.send(&topic_id, payload).await?;
+protocol.send(Target::Topic(topic_id), payload).await?;
 ```
 
-### Share Mode (File Sharing)
+### Share Protocol (File Sharing)
 
 For files ≥512KB, use the Share protocol for efficient P2P distribution:
 
 ```rust
-// Share a large file with topic members
-let hash = protocol.share_file(&topic_id, "/path/to/video.mp4").await?;
-println!("Shared with hash: {}", hex::encode(hash));
+// Share a file with topic members
+let hash = protocol.share_file(Target::Topic(topic_id), "/path/to/video.mp4").await?;
+
+// Share a file via DM
+let hash = protocol.share_file(Target::Dm(peer_id), "/path/to/file.pdf").await?;
 
 // Check share status
-let status = protocol.share_status(&hash).await?;
+let status = protocol.get_share_status(&hash).await?;
 println!("Progress: {}/{} chunks", status.chunks_complete, status.total_chunks);
 
 // Export a completed file
-protocol.export_file(&hash, "/path/to/output.mp4").await?;
+protocol.export_blob(&hash, "/path/to/output.mp4").await?;
 ```
 
 **How it works:**
 1. File is split into 512KB chunks, hashed with BLAKE3
-2. `FileAnnouncement` is broadcast to topic via Send protocol
+2. `FileAnnouncement` is broadcast to recipients via Send protocol
 3. Recipients pull chunks directly from source and other seeders
 4. When a peer completes download, it broadcasts `CanSeed`
 5. Chunks spread across the swarm (BitTorrent-like distribution)
 
 **Events emitted:**
-- `FileAnnounced` - A file was shared to the topic
+- `FileAnnounced` - A file was shared
 - `FileProgress` - Download progress update
 - `FileComplete` - All chunks received
 
 ### Sync Primitives (CRDT Support)
 
-Harbor provides three primitives for building collaborative applications with CRDTs:
+Three primitives for building collaborative applications with CRDTs. All methods accept `Target::Topic(id)` or `Target::Dm(id)`:
 
 ```rust
 // Send a CRDT update (delta) to all topic members
-protocol.sync_send_update(&topic_id, update_bytes).await?;
+protocol.send_sync_update(Target::Topic(topic_id), update_bytes).await?;
 
 // Request full state from all topic members
-protocol.sync_request(&topic_id).await?;
+protocol.request_sync(Target::Topic(topic_id)).await?;
 
 // Respond with full state to a specific peer (direct connection, no size limit)
-protocol.sync_respond(&topic_id, &requester_id, snapshot_bytes).await?;
+protocol.respond_sync(Target::Topic(topic_id), &requester_id, snapshot_bytes).await?;
+
+// DM equivalents
+protocol.send_sync_update(Target::Dm(peer_id), update_bytes).await?;
+protocol.request_sync(Target::Dm(peer_id)).await?;
+protocol.respond_sync(Target::Dm(peer_id), &peer_id, snapshot_bytes).await?;
 ```
 
 **How it works:**
@@ -159,19 +162,49 @@ protocol.sync_respond(&topic_id, &requester_id, snapshot_bytes).await?;
 3. **SyncResponse**: Direct peer-to-peer transfer via dedicated SYNC_ALPN protocol (no size limit)
 
 **Events emitted:**
-- `SyncUpdate` - A CRDT update was received
-- `SyncRequest` - A peer is requesting full state
-- `SyncResponse` - Full state snapshot received
+- `SyncUpdate` / `DmSyncUpdate` - A CRDT update was received
+- `SyncRequest` / `DmSyncRequest` - A peer is requesting full state
+- `SyncResponse` / `DmSyncResponse` - Full state snapshot received
 
 **Example use case:** The test app uses these primitives with [Loro CRDT](https://loro.dev) for real-time collaborative text editing.
 
+### Stream Protocol
+
+Transport layer for real-time streaming between peers. Applications handle the media encoding/decoding — Harbor provides the signaling and QUIC transport.
+
+```rust
+// Request a stream within a topic
+let request_id = protocol.request_stream(&topic_id, &peer_id, "audio", catalog).await?;
+
+// DM stream (no topic)
+let request_id = protocol.dm_stream_request(&peer_id, "audio").await?;
+
+// Accept/reject incoming requests
+protocol.accept_stream(&request_id).await?;
+protocol.reject_stream(&request_id, Some("busy".into())).await?;
+
+// After StreamConnected event, publish or consume media
+let producer = protocol.publish_to_stream(&request_id, "audio").await?;
+let consumer = protocol.consume_stream(&request_id, "audio").await?;
+
+// End a stream
+protocol.end_stream(&request_id).await?;
+```
+
+**Events emitted:**
+- `StreamRequest` - A peer wants to start a stream
+- `StreamAccepted` - Stream request was accepted
+- `StreamRejected` - Stream request was rejected
+- `StreamConnected` - QUIC session established, ready for media
+- `StreamEnded` - Stream was terminated
+
 ### Harbor Nodes
 
-When members are offline, packets are stored on Harbor Nodes:
+When recipients are offline, packets are stored on Harbor Nodes:
 
 - Any node can be a Harbor Node
 - Nodes responsible for a HarborID (hash of TopicID) store packets
-- Offline members pull missed packets when they reconnect
+- Offline peers pull missed packets when they reconnect
 - Packets expire after 3 months (configurable)
 
 ### DHT
@@ -187,21 +220,21 @@ Kademlia-style distributed hash table for:
 let config = ProtocolConfig {
     // Database path (encrypted with SQLCipher)
     db_path: Some(PathBuf::from("harbor.db")),
-    
+
     // Database encryption key (generated if not provided)
     db_key: None,
-    
+
     // Blob storage path for shared files (defaults to .harbor_blobs/)
     blob_path: Some(PathBuf::from(".harbor_blobs")),
-    
+
     // Bootstrap nodes for DHT
     bootstrap_nodes: vec![],
-    
-    // Testing mode (shorter intervals)
-    testing: false,
-    
+
     ..Default::default()
 };
+
+// Or for testing (shorter intervals, no PoW)
+let config = ProtocolConfig::for_testing();
 ```
 
 ## Database Schema
@@ -228,7 +261,7 @@ The protocol uses **SQLCipher** (encrypted SQLite) for persistence.
 
 All packets provide three guarantees:
 
-1. **Confidentiality**: AEAD encryption with topic-derived key
+1. **Confidentiality**: AEAD encryption
 2. **Integrity**: AEAD tag + HMAC
 3. **Authenticity**: Ed25519 signature
 
@@ -297,6 +330,9 @@ RUST_LOG=harbor_core::network::dht=debug cargo run -p harbor-core
 
 # Debug file sharing
 RUST_LOG=harbor_core::network::share=debug cargo run -p harbor-core
+
+# Debug streaming
+RUST_LOG=harbor_core::network::stream=debug cargo run -p harbor-core
 
 # Multiple modules
 RUST_LOG=info,harbor_core::network=debug cargo run -p harbor-core
