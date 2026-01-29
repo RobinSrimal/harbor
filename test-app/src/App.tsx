@@ -31,7 +31,12 @@ type AppEvent =
   | { type: "Message"; topic_id: string; sender_id: string; payload: string; timestamp: number }
   | { type: "FileAnnounced"; topic_id: string; source_id: string; hash: string; display_name: string; total_size: number; total_chunks: number; timestamp: number }
   | { type: "FileProgress"; hash: string; chunks_complete: number; total_chunks: number }
-  | { type: "FileComplete"; hash: string; display_name: string; total_size: number };
+  | { type: "FileComplete"; hash: string; display_name: string; total_size: number }
+  | { type: "StreamRequest"; topic_id: string | null; peer_id: string; request_id: string; name: string }
+  | { type: "StreamAccepted"; request_id: string }
+  | { type: "StreamRejected"; request_id: string; reason: string | null }
+  | { type: "StreamEnded"; request_id: string; peer_id: string }
+  | { type: "StreamConnected"; request_id: string; topic_id: string | null; peer_id: string; is_source: boolean };
 
 // Track file transfer state
 interface FileTransfer {
@@ -51,7 +56,7 @@ type ChatItem =
   | { type: "message"; data: Message }
   | { type: "file"; data: FileTransfer };
 
-type Tab = "chat" | "document" | "dashboard";
+type Tab = "chat" | "document" | "dashboard" | "video";
 
 function App() {
   const [isRunning, setIsRunning] = useState(false);
@@ -62,10 +67,40 @@ function App() {
   const [chatItems, setChatItems] = useState<ChatItem[]>([]);
   const [messageInput, setMessageInput] = useState("");
   const [joinInput, setJoinInput] = useState("");
+  // Stream state (lifted from VideoPanel so main poll can feed it)
+  const [streamStatus, setStreamStatus] = useState<string>("idle");
+  const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
+  const [incomingRequests, setIncomingRequests] = useState<
+    { request_id: string; peer_id: string; name: string }[]
+  >([]);
+  const [receiving, setReceiving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState("Stopped");
   const [activeTab, setActiveTab] = useState<Tab>("chat");
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Periodically refresh topic members
+  useEffect(() => {
+    if (!isRunning || !currentTopic) return;
+    const topicId = currentTopic.topic_id;
+    const interval = setInterval(async () => {
+      try {
+        const details = await invoke<{ members: { endpoint_id: string }[] }>(
+          "get_topic_details",
+          { topicId }
+        );
+        const memberIds = details.members.map((m) => m.endpoint_id);
+        setCurrentTopic((prev) =>
+          prev && prev.topic_id === topicId
+            ? { ...prev, members: memberIds }
+            : prev
+        );
+      } catch {
+        // ignore refresh errors
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [isRunning, currentTopic?.topic_id]);
 
   // Poll for events (messages + files)
   useEffect(() => {
@@ -137,6 +172,63 @@ function App() {
                 }
                 return prev;
               });
+              break;
+
+            // Stream events
+            case "StreamRequest":
+              setIncomingRequests((prev) => [
+                ...prev,
+                {
+                  request_id: event.request_id,
+                  peer_id: event.peer_id,
+                  name: event.name,
+                },
+              ]);
+              break;
+            case "StreamAccepted":
+              setStreamStatus("accepted - connecting...");
+              break;
+            case "StreamRejected":
+              setStreamStatus(`rejected: ${event.reason || "no reason"}`);
+              setActiveRequestId(null);
+              break;
+            case "StreamConnected": {
+              setStreamStatus("connected - starting video...");
+              const rid = event.request_id;
+              setActiveRequestId(rid);
+              if (event.is_source) {
+                // Source sends video
+                try {
+                  await invoke("start_video_stream", { requestId: rid });
+                } catch (e) {
+                  console.error("Failed to start video send:", e);
+                }
+                setStreamStatus("in call (sending)");
+              } else {
+                // Destination receives video
+                console.log("Starting video receive for", rid);
+                try {
+                  await invoke("start_video_receive", { requestId: rid });
+                  console.log("Video receive started successfully");
+                  setReceiving(true);
+                } catch (e) {
+                  console.error("Failed to start video receive:", e);
+                }
+                setStreamStatus("in call (receiving)");
+              }
+              setActiveTab("video");
+              break;
+            }
+            case "StreamEnded":
+              setStreamStatus("ended");
+              setActiveRequestId((prev) => {
+                if (prev) {
+                  invoke("stop_video_stream", { requestId: prev }).catch(() => {});
+                  invoke("stop_video_receive", { requestId: prev }).catch(() => {});
+                }
+                return null;
+              });
+              setReceiving(false);
               break;
           }
         }
@@ -356,6 +448,12 @@ function App() {
               📝 Document
             </button>
             <button
+              className={`tab ${activeTab === "video" ? "active" : ""}`}
+              onClick={() => setActiveTab("video")}
+            >
+              📹 Video
+            </button>
+            <button
               className={`tab ${activeTab === "dashboard" ? "active" : ""}`}
               onClick={() => setActiveTab("dashboard")}
             >
@@ -378,6 +476,20 @@ function App() {
             Start Protocol
           </button>
         </div>
+      ) : activeTab === "video" ? (
+        <VideoPanel
+          isRunning={isRunning}
+          endpointId={endpointId}
+          currentTopic={currentTopic}
+          streamStatus={streamStatus}
+          setStreamStatus={setStreamStatus}
+          activeRequestId={activeRequestId}
+          setActiveRequestId={setActiveRequestId}
+          incomingRequests={incomingRequests}
+          setIncomingRequests={setIncomingRequests}
+          receiving={receiving}
+          setReceiving={setReceiving}
+        />
       ) : activeTab === "dashboard" ? (
         <Dashboard isRunning={isRunning} />
       ) : activeTab === "document" ? (
@@ -546,6 +658,223 @@ function App() {
             )}
           </main>
         </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// Video Panel Component
+// ============================================================================
+
+function VideoPanel({
+  isRunning,
+  endpointId,
+  currentTopic,
+  streamStatus,
+  setStreamStatus,
+  activeRequestId,
+  setActiveRequestId,
+  incomingRequests,
+  setIncomingRequests,
+  receiving,
+  setReceiving,
+}: {
+  isRunning: boolean;
+  endpointId: string | null;
+  currentTopic: TopicInfo | null;
+  streamStatus: string;
+  setStreamStatus: (s: string) => void;
+  activeRequestId: string | null;
+  setActiveRequestId: (s: string | null) => void;
+  incomingRequests: { request_id: string; peer_id: string; name: string }[];
+  setIncomingRequests: React.Dispatch<React.SetStateAction<{ request_id: string; peer_id: string; name: string }[]>>;
+  receiving: boolean;
+  setReceiving: (b: boolean) => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const framePollerRef = useRef<number | null>(null);
+
+  // Poll for decoded video frames when receiving
+  useEffect(() => {
+    if (!receiving || !activeRequestId) {
+      if (framePollerRef.current) {
+        clearInterval(framePollerRef.current);
+        framePollerRef.current = null;
+      }
+      return;
+    }
+
+    const reqId = activeRequestId;
+    framePollerRef.current = window.setInterval(async () => {
+      try {
+        const frame = await invoke<string | null>("get_video_frame", {
+          requestId: reqId,
+        });
+        if (frame && canvasRef.current) {
+          const img = new Image();
+          img.onload = () => {
+            const ctx = canvasRef.current?.getContext("2d");
+            if (ctx && canvasRef.current) {
+              canvasRef.current.width = img.width;
+              canvasRef.current.height = img.height;
+              ctx.drawImage(img, 0, 0);
+            }
+          };
+          img.src = "data:image/jpeg;base64," + frame;
+        }
+      } catch {
+        // ignore frame poll errors
+      }
+    }, 33); // ~30fps
+
+    return () => {
+      if (framePollerRef.current) {
+        clearInterval(framePollerRef.current);
+        framePollerRef.current = null;
+      }
+    };
+  }, [receiving, activeRequestId]);
+
+  const callPeer = async (peerId: string) => {
+    if (!currentTopic) return;
+    try {
+      const requestId = await invoke<string>("request_stream", {
+        topicId: currentTopic.topic_id,
+        peerId,
+        name: "video-call",
+      });
+      setActiveRequestId(requestId);
+      setStreamStatus("calling...");
+    } catch (e) {
+      setStreamStatus(`call failed: ${e}`);
+    }
+  };
+
+  const acceptRequest = async (requestId: string) => {
+    try {
+      await invoke("accept_stream", { requestId });
+      setActiveRequestId(requestId);
+      setIncomingRequests((prev) =>
+        prev.filter((r) => r.request_id !== requestId)
+      );
+      setStreamStatus("accepted - waiting for connection...");
+    } catch (e) {
+      setStreamStatus(`accept failed: ${e}`);
+    }
+  };
+
+  const rejectRequest = async (requestId: string) => {
+    try {
+      await invoke("reject_stream", { requestId });
+      setIncomingRequests((prev) =>
+        prev.filter((r) => r.request_id !== requestId)
+      );
+    } catch (e) {
+      console.error("Reject failed:", e);
+    }
+  };
+
+  const hangUp = async () => {
+    if (!activeRequestId) return;
+    try {
+      await invoke("stop_video_stream", { requestId: activeRequestId });
+    } catch {}
+    try {
+      await invoke("stop_video_receive", { requestId: activeRequestId });
+    } catch {}
+    setStreamStatus("stopped");
+    setActiveRequestId(null);
+    setReceiving(false);
+  };
+
+  const shortId = (id: string) => id.substring(0, 8) + "...";
+
+  const otherMembers = currentTopic
+    ? currentTopic.members.filter((m) => m !== endpointId)
+    : [];
+
+  return (
+    <div style={{ padding: "20px", maxWidth: "700px" }}>
+      <h2>Video Call</h2>
+
+      {/* Remote Video Display */}
+      {receiving && (
+        <div style={{ marginBottom: "16px", textAlign: "center" }}>
+          <canvas
+            ref={canvasRef}
+            style={{
+              width: "100%",
+              maxWidth: "640px",
+              backgroundColor: "#000",
+              borderRadius: "8px",
+            }}
+          />
+        </div>
+      )}
+
+      {/* Status + Hang Up */}
+      {streamStatus !== "idle" && (
+        <div style={{ marginBottom: "16px" }}>
+          <p><strong>{streamStatus}</strong></p>
+          {activeRequestId && (streamStatus === "in call" || streamStatus === "streaming") && (
+            <button className="btn" style={{ backgroundColor: "#e74c3c", color: "#fff" }} onClick={hangUp}>
+              Hang Up
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Incoming Calls */}
+      {incomingRequests.map((req) => (
+        <div
+          key={req.request_id}
+          style={{
+            border: "2px solid #4a9eff",
+            borderRadius: "8px",
+            padding: "12px",
+            marginBottom: "12px",
+            backgroundColor: "rgba(74, 158, 255, 0.1)",
+          }}
+        >
+          <p>Incoming call from <code>{shortId(req.peer_id)}</code></p>
+          <div style={{ display: "flex", gap: "8px" }}>
+            <button className="btn primary" onClick={() => acceptRequest(req.request_id)}>
+              Accept
+            </button>
+            <button className="btn" onClick={() => rejectRequest(req.request_id)}>
+              Reject
+            </button>
+          </div>
+        </div>
+      ))}
+
+      {/* Call Members */}
+      {!activeRequestId && currentTopic && (
+        <div>
+          {otherMembers.length > 0 ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+              {otherMembers.map((m) => (
+                <button
+                  key={m}
+                  className="btn primary"
+                  style={{ textAlign: "left" }}
+                  onClick={() => callPeer(m)}
+                >
+                  Call {shortId(m)}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p style={{ color: "#888" }}>No other members in this topic yet.</p>
+          )}
+        </div>
+      )}
+
+      {!currentTopic && (
+        <p style={{ color: "#888" }}>
+          Join a topic first to start a video call.
+        </p>
       )}
     </div>
   );

@@ -1,6 +1,7 @@
 //! Tauri app integration with Harbor Protocol
 
 use std::sync::Arc;
+use std::collections::HashMap;
 use tauri::State;
 use tokio::sync::{Mutex, mpsc};
 use serde::Serialize;
@@ -11,11 +12,15 @@ use harbor_core::{
     ProtocolEvent,
 };
 
+mod video;
+
 /// Shared protocol state
 pub struct AppState {
     protocol: Arc<Mutex<Option<Protocol>>>,
     event_rx: Arc<Mutex<Option<mpsc::Receiver<ProtocolEvent>>>>,
     frontend_log_path: Arc<Mutex<Option<std::path::PathBuf>>>,
+    video_pipelines: Arc<Mutex<HashMap<String, video::pipeline::VideoPipeline>>>,
+    video_consumers: Arc<Mutex<HashMap<String, video::consumer::VideoConsumer>>>,
 }
 
 impl Default for AppState {
@@ -24,6 +29,8 @@ impl Default for AppState {
             protocol: Arc::new(Mutex::new(None)),
             event_rx: Arc::new(Mutex::new(None)),
             frontend_log_path: Arc::new(Mutex::new(None)),
+            video_pipelines: Arc::new(Mutex::new(HashMap::new())),
+            video_consumers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -113,6 +120,44 @@ mod serde_bytes_as_array {
     }
 }
 
+/// Stream request event for frontend
+#[derive(Serialize, Clone)]
+pub struct StreamRequestEventFE {
+    topic_id: Option<String>,
+    peer_id: String,
+    request_id: String,
+    name: String,
+}
+
+/// Stream accepted event for frontend
+#[derive(Serialize, Clone)]
+pub struct StreamAcceptedEventFE {
+    request_id: String,
+}
+
+/// Stream rejected event for frontend
+#[derive(Serialize, Clone)]
+pub struct StreamRejectedEventFE {
+    request_id: String,
+    reason: Option<String>,
+}
+
+/// Stream ended event for frontend
+#[derive(Serialize, Clone)]
+pub struct StreamEndedEventFE {
+    request_id: String,
+    peer_id: String,
+}
+
+/// Stream connected event for frontend
+#[derive(Serialize, Clone)]
+pub struct StreamConnectedEventFE {
+    request_id: String,
+    topic_id: Option<String>,
+    peer_id: String,
+    is_source: bool,
+}
+
 /// Combined event type for frontend
 #[derive(Serialize, Clone)]
 #[serde(tag = "type")]
@@ -124,6 +169,11 @@ pub enum AppEvent {
     SyncUpdate(SyncUpdateEventFE),
     SyncRequest(SyncRequestEventFE),
     SyncResponse(SyncResponseEventFE),
+    StreamRequest(StreamRequestEventFE),
+    StreamAccepted(StreamAcceptedEventFE),
+    StreamRejected(StreamRejectedEventFE),
+    StreamEnded(StreamEndedEventFE),
+    StreamConnected(StreamConnectedEventFE),
 }
 
 /// Fixed database key for persistent identity (32 bytes)
@@ -459,13 +509,46 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                             data: ev.data,
                         })
                     }
-                    // Stream events — not yet surfaced to test-app frontend
-                    ProtocolEvent::StreamRequest(_)
-                    | ProtocolEvent::StreamAccepted(_)
-                    | ProtocolEvent::StreamRejected(_)
-                    | ProtocolEvent::StreamEnded(_)
-                    | ProtocolEvent::StreamConnected(_)
-                    | ProtocolEvent::DmReceived(_)
+                    ProtocolEvent::StreamRequest(ev) => {
+                        println!("[poll_events] StreamRequest from {}", hex::encode(&ev.peer_id[..4]));
+                        AppEvent::StreamRequest(StreamRequestEventFE {
+                            topic_id: ev.topic_id.map(hex::encode),
+                            peer_id: hex::encode(ev.peer_id),
+                            request_id: hex::encode(ev.request_id),
+                            name: ev.name,
+                        })
+                    }
+                    ProtocolEvent::StreamAccepted(ev) => {
+                        println!("[poll_events] StreamAccepted {}", hex::encode(&ev.request_id[..4]));
+                        AppEvent::StreamAccepted(StreamAcceptedEventFE {
+                            request_id: hex::encode(ev.request_id),
+                        })
+                    }
+                    ProtocolEvent::StreamRejected(ev) => {
+                        println!("[poll_events] StreamRejected {}", hex::encode(&ev.request_id[..4]));
+                        AppEvent::StreamRejected(StreamRejectedEventFE {
+                            request_id: hex::encode(ev.request_id),
+                            reason: ev.reason,
+                        })
+                    }
+                    ProtocolEvent::StreamEnded(ev) => {
+                        println!("[poll_events] StreamEnded {}", hex::encode(&ev.request_id[..4]));
+                        AppEvent::StreamEnded(StreamEndedEventFE {
+                            request_id: hex::encode(ev.request_id),
+                            peer_id: hex::encode(ev.peer_id),
+                        })
+                    }
+                    ProtocolEvent::StreamConnected(ev) => {
+                        println!("[poll_events] StreamConnected {} is_source={}", hex::encode(&ev.request_id[..4]), ev.is_source);
+                        AppEvent::StreamConnected(StreamConnectedEventFE {
+                            request_id: hex::encode(ev.request_id),
+                            topic_id: ev.topic_id.map(hex::encode),
+                            peer_id: hex::encode(ev.peer_id),
+                            is_source: ev.is_source,
+                        })
+                    }
+                    // DM events — not yet surfaced
+                    ProtocolEvent::DmReceived(_)
                     | ProtocolEvent::DmSyncUpdate(_)
                     | ProtocolEvent::DmSyncRequest(_)
                     | ProtocolEvent::DmSyncResponse(_)
@@ -777,6 +860,177 @@ async fn write_frontend_log(state: State<'_, AppState>, message: String) -> Resu
     Ok(())
 }
 
+// ============================================================================
+// Video Streaming Commands
+// ============================================================================
+
+/// List available cameras
+#[tauri::command]
+async fn list_cameras() -> Result<Vec<serde_json::Value>, String> {
+    let cameras = video::capture::list_cameras()?;
+    Ok(cameras
+        .into_iter()
+        .map(|c| serde_json::json!({ "index": c.index, "name": c.name }))
+        .collect())
+}
+
+/// Helper to parse hex string to [u8; 32]
+fn parse_id(hex_str: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
+    if bytes.len() != 32 {
+        return Err("Invalid ID length".to_string());
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
+}
+
+/// Request a video stream to a peer in a topic
+#[tauri::command]
+async fn request_stream(
+    state: State<'_, AppState>,
+    topic_id: String,
+    peer_id: String,
+    name: String,
+) -> Result<String, String> {
+    let topic_arr = parse_id(&topic_id)?;
+    let peer_arr = parse_id(&peer_id)?;
+
+    let protocol_guard = state.protocol.lock().await;
+    let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
+
+    let request_id = protocol
+        .request_stream(&topic_arr, &peer_arr, &name, Vec::new())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(hex::encode(request_id))
+}
+
+/// Accept an incoming stream request
+#[tauri::command]
+async fn accept_stream(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), String> {
+    let id = parse_id(&request_id)?;
+
+    let protocol_guard = state.protocol.lock().await;
+    let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
+
+    protocol.accept_stream(&id).await.map_err(|e| e.to_string())
+}
+
+/// Reject an incoming stream request
+#[tauri::command]
+async fn reject_stream(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), String> {
+    let id = parse_id(&request_id)?;
+
+    let protocol_guard = state.protocol.lock().await;
+    let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
+
+    protocol
+        .reject_stream(&id, Some("User rejected".to_string()))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Start video capture + encode + publish on an accepted stream
+#[tauri::command]
+async fn start_video_stream(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), String> {
+    let id = parse_id(&request_id)?;
+
+    let pipeline = video::pipeline::VideoPipeline::start(
+        state.protocol.clone(),
+        id,
+        640, // width
+        480, // height
+        30,  // fps
+    )
+    .await?;
+
+    let mut pipelines = state.video_pipelines.lock().await;
+    pipelines.insert(request_id, pipeline);
+
+    Ok(())
+}
+
+/// Stop a running video stream
+#[tauri::command]
+async fn stop_video_stream(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), String> {
+    let mut pipelines = state.video_pipelines.lock().await;
+    if let Some(mut pipeline) = pipelines.remove(&request_id) {
+        pipeline.stop();
+    }
+
+    // Also end the stream at protocol level
+    let id = parse_id(&request_id)?;
+    let protocol_guard = state.protocol.lock().await;
+    if let Some(protocol) = protocol_guard.as_ref() {
+        let _ = protocol.end_stream(&id).await;
+    }
+
+    Ok(())
+}
+
+/// Start receiving + decoding video from an active stream
+#[tauri::command]
+async fn start_video_receive(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), String> {
+    let id = parse_id(&request_id)?;
+
+    let consumer = video::consumer::VideoConsumer::start(
+        state.protocol.clone(),
+        id,
+        640,
+        480,
+    )
+    .await?;
+
+    let mut consumers = state.video_consumers.lock().await;
+    consumers.insert(request_id, consumer);
+
+    Ok(())
+}
+
+/// Stop receiving video
+#[tauri::command]
+async fn stop_video_receive(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), String> {
+    let mut consumers = state.video_consumers.lock().await;
+    if let Some(mut consumer) = consumers.remove(&request_id) {
+        consumer.stop();
+    }
+    Ok(())
+}
+
+/// Get the latest decoded video frame as a base64-encoded JPEG
+#[tauri::command]
+async fn get_video_frame(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<Option<String>, String> {
+    let consumers = state.video_consumers.lock().await;
+    if let Some(consumer) = consumers.get(&request_id) {
+        Ok(consumer.get_frame())
+    } else {
+        Ok(None)
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize tracing - write to file if HARBOR_DB_PATH is set
@@ -849,6 +1103,16 @@ pub fn run() {
             sync_respond,
             // Logging
             write_frontend_log,
+            // Video Streaming
+            list_cameras,
+            request_stream,
+            accept_stream,
+            reject_stream,
+            start_video_stream,
+            stop_video_stream,
+            start_video_receive,
+            stop_video_receive,
+            get_video_frame,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

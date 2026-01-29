@@ -33,4 +33,12 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 hex = "0.4"
 chrono = "0.4"
+bytes = "1"
+
+# Video capture & encoding
+nokhwa = { version = "0.10", features = ["input-native"] }
+hang = "0.11.0"
+tokio-util = "0.7"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+base64 = "0.22"
 
