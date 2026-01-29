@@ -31,8 +31,9 @@ target
 *.db-wal
 harbor_protocol.db
 
-# Simulation output logs
+# Simulation output logs and node data
 output.log
+simulation/nodes/
 
 # Iroh blob storage
 **/iroh-blobs/
