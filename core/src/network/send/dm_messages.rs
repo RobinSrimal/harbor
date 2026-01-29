@@ -30,6 +30,8 @@ pub enum DmMessageType {
     StreamActive = 0x8A,
     /// Stream ended (response to query) — 0x80 + 0x0C
     StreamEnded = 0x8B,
+    /// Stream request (source → destination, DM-scoped) — 0x80 + 0x0D
+    StreamRequest = 0x8C,
 }
 
 impl TryFrom<u8> for DmMessageType {
@@ -46,6 +48,7 @@ impl TryFrom<u8> for DmMessageType {
             0x89 => Ok(DmMessageType::StreamQuery),
             0x8A => Ok(DmMessageType::StreamActive),
             0x8B => Ok(DmMessageType::StreamEnded),
+            0x8C => Ok(DmMessageType::StreamRequest),
             _ => Err(()),
         }
     }
@@ -72,6 +75,8 @@ pub enum DmMessage {
     StreamActive(DmStreamActiveMessage),
     /// Stream ended response (source → destination)
     StreamEnded(DmStreamEndedMessage),
+    /// Stream request (source → destination, DM-scoped peer-to-peer)
+    StreamRequest(DmStreamRequestMessage),
 }
 
 impl DmMessage {
@@ -135,6 +140,13 @@ impl DmMessage {
                 bytes.extend_from_slice(&payload);
                 bytes
             }
+            DmMessage::StreamRequest(msg) => {
+                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
+                let mut bytes = Vec::with_capacity(1 + payload.len());
+                bytes.push(DmMessageType::StreamRequest as u8);
+                bytes.extend_from_slice(&payload);
+                bytes
+            }
         }
     }
 
@@ -181,6 +193,11 @@ impl DmMessage {
                     .map_err(|e| DmDecodeError::InvalidPayload(e.to_string()))?;
                 Ok(DmMessage::StreamEnded(msg))
             }
+            DmMessageType::StreamRequest => {
+                let msg: DmStreamRequestMessage = postcard::from_bytes(&bytes[1..])
+                    .map_err(|e| DmDecodeError::InvalidPayload(e.to_string()))?;
+                Ok(DmMessage::StreamRequest(msg))
+            }
         }
     }
 
@@ -196,6 +213,7 @@ impl DmMessage {
             DmMessage::StreamQuery(_) => DmMessageType::StreamQuery,
             DmMessage::StreamActive(_) => DmMessageType::StreamActive,
             DmMessage::StreamEnded(_) => DmMessageType::StreamEnded,
+            DmMessage::StreamRequest(_) => DmMessageType::StreamRequest,
         }
     }
 }
@@ -239,6 +257,13 @@ pub struct DmStreamActiveMessage {
 pub struct DmStreamEndedMessage {
     pub topic_id: [u8; 32],
     pub request_id: [u8; 32],
+}
+
+/// DM stream request message (peer-to-peer, no topic)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmStreamRequestMessage {
+    pub request_id: [u8; 32],
+    pub stream_name: String,
 }
 
 /// Error decoding a DM message

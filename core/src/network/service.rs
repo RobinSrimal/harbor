@@ -61,8 +61,6 @@ impl ServiceDeps {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_service_deps_endpoint_id() {
         // ServiceDeps derives endpoint_id from identity.public_key

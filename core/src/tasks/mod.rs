@@ -57,7 +57,7 @@ impl Protocol {
         let pull_max_nodes = self.config.harbor_pull_max_nodes;
         let pull_early_stop = self.config.harbor_pull_early_stop;
 
-        let live_service = self.live_service.clone();
+        let stream_service = self.stream_service.clone();
         let pull_task = tokio::spawn(async move {
             Self::run_harbor_pull_loop(
                 harbor_service,
@@ -67,7 +67,7 @@ impl Protocol {
                 pull_interval,
                 pull_max_nodes,
                 pull_early_stop,
-                live_service,
+                stream_service,
             )
             .await;
         });

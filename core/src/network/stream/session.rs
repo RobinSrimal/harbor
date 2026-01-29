@@ -1,14 +1,14 @@
-//! Live Session - Per-peer MOQ session wrapper
+//! Stream Session - Per-peer MOQ session wrapper
 //!
 //! Wraps a moq-lite session with topic scoping and harbor identity.
 
 use moq_lite::{BroadcastConsumer, BroadcastProducer, Origin, Session};
 
-/// A live streaming session with a specific peer
+/// A streaming session with a specific peer
 ///
 /// Wraps the moq-lite Session and Origin for a single peer connection,
 /// scoped to a specific topic and stream request.
-pub struct LiveSession {
+pub struct StreamSession {
     /// The underlying MOQ session
     session: Session,
     /// Origin for this session (publish/subscribe coordination)
@@ -20,8 +20,8 @@ pub struct LiveSession {
     request_id: [u8; 32],
 }
 
-impl LiveSession {
-    /// Create a new LiveSession wrapping a MOQ session (creates its own Origin)
+impl StreamSession {
+    /// Create a new StreamSession wrapping a MOQ session (creates its own Origin)
     pub fn new(
         session: Session,
         topic_id: [u8; 32],
@@ -37,7 +37,7 @@ impl LiveSession {
         }
     }
 
-    /// Create a LiveSession from pre-existing parts (used by the handler
+    /// Create a StreamSession from pre-existing parts (used by the handler
     /// when the Origin was already created for the MOQ Server handshake)
     pub fn from_parts(
         session: Session,

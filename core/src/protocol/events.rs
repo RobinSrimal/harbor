@@ -147,8 +147,8 @@ pub struct SyncResponseEvent {
 /// Application should accept or reject via `protocol.accept_stream()` / `reject_stream()`.
 #[derive(Debug, Clone)]
 pub struct StreamRequestEvent {
-    /// The topic this stream is scoped to
-    pub topic_id: [u8; 32],
+    /// The topic this stream is scoped to (None for DM streams)
+    pub topic_id: Option<[u8; 32]>,
     /// The peer requesting to stream
     pub peer_id: [u8; 32],
     /// Unique identifier for this stream request
@@ -192,8 +192,8 @@ pub struct StreamEndedEvent {
 pub struct StreamConnectedEvent {
     /// The stream request this session belongs to
     pub request_id: [u8; 32],
-    /// The topic this stream is scoped to
-    pub topic_id: [u8; 32],
+    /// The topic this stream is scoped to (None for DM streams)
+    pub topic_id: Option<[u8; 32]>,
     /// The remote peer
     pub peer_id: [u8; 32],
     /// true = we are the source (publisher), false = we are the destination (consumer)

@@ -1,4 +1,4 @@
-//! Live Service - Real-time streaming over MOQ
+//! Stream Service - Real-time streaming over MOQ
 //!
 //! Manages stream signaling (via SendService) and media transport (via moq-lite).
 //! Streams are topic-scoped and require explicit acceptance before media flows.
@@ -20,10 +20,12 @@ use crate::network::send::topic_messages::StreamRequestMessage;
 use crate::network::send::dm_messages::{
     DmMessage, DmStreamAcceptMessage, DmStreamRejectMessage,
     DmStreamQueryMessage, DmStreamActiveMessage, DmStreamEndedMessage,
+    DmStreamRequestMessage,
 };
+use super::{ZERO_TOPIC_ID, optional_topic_id};
 use crate::protocol::{MemberInfo, ProtocolEvent, StreamConnectedEvent};
-use super::protocol::{LIVE_ALPN, STREAM_SIGNAL_TTL, LiveError};
-use super::session::LiveSession;
+use super::protocol::{STREAM_ALPN, STREAM_SIGNAL_TTL, StreamError};
+use super::session::StreamSession;
 
 /// A pending stream request awaiting accept/reject
 #[derive(Debug, Clone)]
@@ -53,8 +55,8 @@ pub struct ActiveStream {
     pub name: String,
 }
 
-/// Messages sent to the LiveService actor
-enum LiveActorMessage {
+/// Messages sent to the StreamService actor
+enum StreamActorMessage {
     /// A stream request was accepted by the destination
     StreamAccepted {
         request_id: [u8; 32],
@@ -82,7 +84,7 @@ enum LiveActorMessage {
 /// 1. Source requests a stream via signaling (SendService)
 /// 2. Destination accepts/rejects
 /// 3. On accept, MOQ connection is established for media transport
-pub struct LiveService {
+pub struct StreamService {
     /// Iroh endpoint for QUIC connections (used for MOQ transport)
     #[allow(dead_code)]
     endpoint: Endpoint,
@@ -95,7 +97,7 @@ pub struct LiveService {
     /// Send service for signaling messages
     send_service: Arc<SendService>,
     /// Actor message channel
-    actor_tx: mpsc::Sender<LiveActorMessage>,
+    actor_tx: mpsc::Sender<StreamActorMessage>,
     /// Pending outgoing requests (source side, awaiting accept/reject)
     pending_outgoing: Arc<RwLock<HashMap<[u8; 32], PendingStream>>>,
     /// Pending incoming requests (destination side, awaiting app decision)
@@ -105,17 +107,17 @@ pub struct LiveService {
     /// Currently active outgoing streams (source side, for liveness queries)
     active_streams: Arc<RwLock<HashMap<[u8; 32], ActiveStream>>>,
     /// Active MOQ sessions keyed by request_id
-    sessions: Arc<RwLock<HashMap<[u8; 32], Arc<LiveSession>>>>,
+    sessions: Arc<RwLock<HashMap<[u8; 32], Arc<StreamSession>>>>,
 }
 
-impl std::fmt::Debug for LiveService {
+impl std::fmt::Debug for StreamService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LiveService").finish_non_exhaustive()
+        f.debug_struct("StreamService").finish_non_exhaustive()
     }
 }
 
-impl LiveService {
-    /// Create a new LiveService
+impl StreamService {
+    /// Create a new StreamService
     pub fn new(
         endpoint: Endpoint,
         identity: Arc<LocalIdentity>,
@@ -154,11 +156,11 @@ impl LiveService {
     }
 
     /// Get topic members for signaling, excluding ourselves
-    async fn get_recipients(&self, topic_id: &[u8; 32]) -> Result<Vec<MemberInfo>, LiveError> {
+    async fn get_recipients(&self, topic_id: &[u8; 32]) -> Result<Vec<MemberInfo>, StreamError> {
         let our_id = self.identity.public_key;
         let db = self.db.lock().await;
         let members = get_topic_members(&db, topic_id)
-            .map_err(|e| LiveError::Database(e.to_string()))?;
+            .map_err(|e| StreamError::Database(e.to_string()))?;
         Ok(members
             .into_iter()
             .filter(|m| *m != our_id)
@@ -172,7 +174,7 @@ impl LiveService {
         topic_id: &[u8; 32],
         msg: &TopicMessage,
         options: SendOptions,
-    ) -> Result<(), LiveError> {
+    ) -> Result<(), StreamError> {
         let recipients = self.get_recipients(topic_id).await?;
         if recipients.is_empty() {
             return Ok(());
@@ -181,7 +183,7 @@ impl LiveService {
         self.send_service
             .send_to_topic(topic_id, &payload, &recipients, options)
             .await
-            .map_err(|e| LiveError::Signaling(e.to_string()))?;
+            .map_err(|e| StreamError::Signaling(e.to_string()))?;
         Ok(())
     }
 
@@ -190,12 +192,12 @@ impl LiveService {
         &self,
         target_peer: &[u8; 32],
         dm_msg: DmMessage,
-    ) -> Result<(), LiveError> {
+    ) -> Result<(), StreamError> {
         let encoded = dm_msg.encode();
         self.send_service
             .send_to_dm(target_peer, &encoded)
             .await
-            .map_err(|e| LiveError::Signaling(e.to_string()))?;
+            .map_err(|e| StreamError::Signaling(e.to_string()))?;
         Ok(())
     }
 
@@ -209,7 +211,7 @@ impl LiveService {
         peer_id: &[u8; 32],
         name: &str,
         catalog: Vec<u8>,
-    ) -> Result<[u8; 32], LiveError> {
+    ) -> Result<[u8; 32], StreamError> {
         let request_id = generate_request_id();
 
         let pending = PendingStream {
@@ -240,13 +242,48 @@ impl LiveService {
         Ok(request_id)
     }
 
+    /// Request a DM stream to a peer (source side, peer-to-peer, no topic)
+    ///
+    /// Sends a DmMessage::StreamRequest directly to the peer.
+    pub async fn dm_request_stream(
+        &self,
+        peer_id: &[u8; 32],
+        name: &str,
+    ) -> Result<[u8; 32], StreamError> {
+        let request_id = generate_request_id();
+
+        let pending = PendingStream {
+            request_id,
+            topic_id: ZERO_TOPIC_ID,
+            peer_id: *peer_id,
+            name: name.to_string(),
+            catalog: vec![],
+        };
+        self.pending_outgoing.write().await.insert(request_id, pending);
+
+        let dm_msg = DmMessage::StreamRequest(DmStreamRequestMessage {
+            request_id,
+            stream_name: name.to_string(),
+        });
+        self.send_dm_signaling(peer_id, dm_msg).await?;
+
+        debug!(
+            request_id = %hex::encode(&request_id[..8]),
+            peer = %hex::encode(&peer_id[..8]),
+            name = %name,
+            "DM stream request sent"
+        );
+
+        Ok(request_id)
+    }
+
     /// Accept an incoming stream request (destination side)
     pub async fn accept_stream(
         self: &Arc<Self>,
         request_id: &[u8; 32],
-    ) -> Result<(), LiveError> {
+    ) -> Result<(), StreamError> {
         let pending = self.pending_incoming.write().await.remove(request_id)
-            .ok_or(LiveError::RequestNotFound)?;
+            .ok_or(StreamError::RequestNotFound)?;
 
         // Move to accepted_incoming so the MOQ handler can find it
         self.accepted_incoming.write().await.insert(*request_id, pending.clone());
@@ -276,9 +313,9 @@ impl LiveService {
         &self,
         request_id: &[u8; 32],
         reason: Option<String>,
-    ) -> Result<(), LiveError> {
+    ) -> Result<(), StreamError> {
         let pending = self.pending_incoming.write().await.remove(request_id)
-            .ok_or(LiveError::RequestNotFound)?;
+            .ok_or(StreamError::RequestNotFound)?;
 
         let dm_msg = DmMessage::StreamReject(DmStreamRejectMessage {
             topic_id: pending.topic_id,
@@ -295,9 +332,9 @@ impl LiveService {
     pub async fn end_stream(
         &self,
         request_id: &[u8; 32],
-    ) -> Result<(), LiveError> {
+    ) -> Result<(), StreamError> {
         let active = self.active_streams.write().await.remove(request_id)
-            .ok_or(LiveError::RequestNotFound)?;
+            .ok_or(StreamError::RequestNotFound)?;
 
         let dm_msg = DmMessage::StreamEnded(DmStreamEndedMessage {
             topic_id: active.topic_id,
@@ -328,12 +365,12 @@ impl LiveService {
     }
 
     /// Store an active MOQ session
-    pub(crate) async fn store_session(&self, request_id: [u8; 32], session: LiveSession) {
+    pub(crate) async fn store_session(&self, request_id: [u8; 32], session: StreamSession) {
         self.sessions.write().await.insert(request_id, Arc::new(session));
     }
 
     /// Get an active MOQ session by request_id
-    pub(crate) async fn get_session(&self, request_id: &[u8; 32]) -> Option<Arc<LiveSession>> {
+    pub(crate) async fn get_session(&self, request_id: &[u8; 32]) -> Option<Arc<StreamSession>> {
         self.sessions.read().await.get(request_id).cloned()
     }
 
@@ -350,37 +387,37 @@ impl LiveService {
     /// Establish an outgoing MOQ connection to the destination peer (source side).
     ///
     /// Called after the destination accepts our stream request. Dials the peer
-    /// with LIVE_ALPN, performs the MOQ Client handshake, and stores the session.
-    pub(crate) async fn connect_moq(&self, request_id: &[u8; 32]) -> Result<(), LiveError> {
+    /// with STREAM_ALPN, performs the MOQ Client handshake, and stores the session.
+    pub(crate) async fn connect_moq(&self, request_id: &[u8; 32]) -> Result<(), StreamError> {
         // 1. Look up the active stream to get peer_id and topic_id
         let active = self.active_streams.read().await.get(request_id).map(|a| (a.peer_id, a.topic_id));
-        let (peer_id, topic_id) = active.ok_or(LiveError::RequestNotFound)?;
+        let (peer_id, topic_id) = active.ok_or(StreamError::RequestNotFound)?;
 
         // 2. Get relay URL from DB for smart connect
         let relay_info = {
             let db = self.db.lock().await;
             get_peer_relay_info(&db, &peer_id)
-                .map_err(|e| LiveError::Database(e.to_string()))?
+                .map_err(|e| StreamError::Database(e.to_string()))?
         };
         let (parsed_relay, relay_last_success) = match relay_info {
             Some((url, last_success)) => (url.parse::<iroh::RelayUrl>().ok(), last_success),
             None => (None, None),
         };
 
-        // 3. Dial the peer with LIVE_ALPN
+        // 3. Dial the peer with STREAM_ALPN
         let node_id = EndpointId::from_bytes(&peer_id)
-            .map_err(|e| LiveError::Connection(e.to_string()))?;
+            .map_err(|e| StreamError::Connection(e.to_string()))?;
 
         let connect_result = connect::connect(
             &self.endpoint,
             node_id,
             parsed_relay.as_ref(),
             relay_last_success,
-            LIVE_ALPN,
+            STREAM_ALPN,
             Duration::from_secs(10),
         )
         .await
-        .map_err(|e| LiveError::Connection(e.to_string()))?;
+        .map_err(|e| StreamError::Connection(e.to_string()))?;
 
         info!(
             peer = %hex::encode(&peer_id[..8]),
@@ -399,7 +436,7 @@ impl LiveService {
             .with_publish(origin.consumer.clone());
 
         let moq_session = moq_client.connect(wt_session).await
-            .map_err(|e| LiveError::Moq(e.to_string()))?;
+            .map_err(|e| StreamError::Moq(e.to_string()))?;
 
         info!(
             peer = %hex::encode(&peer_id[..8]),
@@ -407,8 +444,8 @@ impl LiveService {
             "MOQ session established (source side)"
         );
 
-        // 6. Create and store LiveSession
-        let live_session = LiveSession::from_parts(
+        // 6. Create and store StreamSession
+        let live_session = StreamSession::from_parts(
             moq_session,
             origin.producer,
             origin.consumer,
@@ -420,7 +457,7 @@ impl LiveService {
         // 7. Emit StreamConnected event
         let event = ProtocolEvent::StreamConnected(StreamConnectedEvent {
             request_id: *request_id,
-            topic_id,
+            topic_id: optional_topic_id(&topic_id),
             peer_id,
             is_source: true,
         });
@@ -458,18 +495,18 @@ impl LiveService {
     ) {
         match dm_msg {
             DmMessage::StreamAccept(accept) => {
-                let _ = self.actor_tx.send(LiveActorMessage::StreamAccepted {
+                let _ = self.actor_tx.send(StreamActorMessage::StreamAccepted {
                     request_id: accept.request_id,
                 }).await;
             }
             DmMessage::StreamReject(reject) => {
-                let _ = self.actor_tx.send(LiveActorMessage::StreamRejected {
+                let _ = self.actor_tx.send(StreamActorMessage::StreamRejected {
                     request_id: reject.request_id,
                     reason: reject.reason.clone(),
                 }).await;
             }
             DmMessage::StreamQuery(query) => {
-                let _ = self.actor_tx.send(LiveActorMessage::StreamQuery {
+                let _ = self.actor_tx.send(StreamActorMessage::StreamQuery {
                     request_id: query.request_id,
                     topic_id: query.topic_id,
                     querier_id: sender_id,
@@ -479,9 +516,19 @@ impl LiveService {
                 self.emit_deferred_stream_request(&active.request_id).await;
             }
             DmMessage::StreamEnded(ended) => {
-                let _ = self.actor_tx.send(LiveActorMessage::StreamEnded {
+                let _ = self.actor_tx.send(StreamActorMessage::StreamEnded {
                     request_id: ended.request_id,
                 }).await;
+            }
+            DmMessage::StreamRequest(req) => {
+                self.handle_incoming_stream_request(
+                    &req.request_id,
+                    &ZERO_TOPIC_ID,
+                    sender_id,
+                    &req.stream_name,
+                    &[],
+                    crate::network::send::PacketSource::Direct,
+                ).await;
             }
             _ => {}
         }
@@ -531,7 +578,7 @@ impl LiveService {
 
     async fn emit_stream_request_event(&self, pending: &PendingStream) {
         let event = ProtocolEvent::StreamRequest(crate::protocol::StreamRequestEvent {
-            topic_id: pending.topic_id,
+            topic_id: optional_topic_id(&pending.topic_id),
             peer_id: pending.peer_id,
             request_id: pending.request_id,
             name: pending.name.clone(),
@@ -547,10 +594,10 @@ impl LiveService {
         }
     }
 
-    async fn run_actor(self: Arc<Self>, mut rx: mpsc::Receiver<LiveActorMessage>) {
+    async fn run_actor(self: Arc<Self>, mut rx: mpsc::Receiver<StreamActorMessage>) {
         while let Some(msg) = rx.recv().await {
             match msg {
-                LiveActorMessage::StreamAccepted { request_id } => {
+                StreamActorMessage::StreamAccepted { request_id } => {
                     if let Some(pending) = self.pending_outgoing.write().await.remove(&request_id) {
                         let active = ActiveStream {
                             request_id,
@@ -579,7 +626,7 @@ impl LiveService {
                         });
                     }
                 }
-                LiveActorMessage::StreamRejected { request_id, reason } => {
+                StreamActorMessage::StreamRejected { request_id, reason } => {
                     if self.pending_outgoing.write().await.remove(&request_id).is_some() {
                         let event = ProtocolEvent::StreamRejected(
                             crate::protocol::StreamRejectedEvent { request_id, reason: reason.clone() },
@@ -588,7 +635,7 @@ impl LiveService {
                         info!(request_id = %hex::encode(&request_id[..8]), reason = ?reason, "stream rejected");
                     }
                 }
-                LiveActorMessage::StreamEnded { request_id } => {
+                StreamActorMessage::StreamEnded { request_id } => {
                     let was_active = self.active_streams.write().await.remove(&request_id);
                     let was_incoming = self.pending_incoming.write().await.remove(&request_id);
                     self.accepted_incoming.write().await.remove(&request_id);
@@ -606,7 +653,7 @@ impl LiveService {
                         let _ = self.event_tx.send(event).await;
                     }
                 }
-                LiveActorMessage::StreamQuery { request_id, topic_id, querier_id } => {
+                StreamActorMessage::StreamQuery { request_id, topic_id, querier_id } => {
                     self.handle_stream_query(&request_id, &topic_id, querier_id).await;
                 }
             }

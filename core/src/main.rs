@@ -706,6 +706,8 @@ async fn handle_request(protocol: &Protocol, bootstrap: &BootstrapInfo, active_t
         ("POST", "/api/dm/sync/respond") => handle_dm_sync_respond(protocol, body).await,
         // DM share endpoints
         ("POST", "/api/dm/share") => handle_dm_share(protocol, body).await,
+        // DM stream endpoints
+        ("POST", "/api/dm/stream/request") => handle_dm_stream_request(protocol, body).await,
         // Stream endpoints
         ("POST", "/api/stream/request") => handle_stream_request(protocol, body).await,
         ("POST", "/api/stream/accept") => handle_stream_accept(protocol, body).await,
@@ -1296,6 +1298,34 @@ async fn handle_dm_share(protocol: &Protocol, body: &str) -> String {
 // ============================================================================
 // Stream API Handlers
 // ============================================================================
+
+/// Request a DM stream to a peer (peer-to-peer, no topic)
+/// POST /api/dm/stream/request
+/// Body: {"peer": "hex...", "name": "stream-name"}
+async fn handle_dm_stream_request(protocol: &Protocol, body: &str) -> String {
+    let peer_hex = match extract_json_string(body, "peer") {
+        Some(p) => p,
+        None => return http_response(400, "Missing 'peer' field"),
+    };
+    let name = extract_json_string(body, "name").unwrap_or_else(|| "test".to_string());
+
+    let peer_bytes = match hex::decode(&peer_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid peer ID"),
+    };
+
+    match protocol.dm_stream_request(&peer_bytes, &name).await {
+        Ok(request_id) => {
+            let json = format!(r#"{{"request_id":"{}"}}"#, hex::encode(request_id));
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(500, &format!("Failed to request DM stream: {}", e)),
+    }
+}
 
 /// Request a stream to a peer
 /// POST /api/stream/request

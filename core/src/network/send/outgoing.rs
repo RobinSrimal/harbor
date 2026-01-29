@@ -168,8 +168,8 @@ pub struct SendService {
     send_timeout: Duration,
     /// Active connections cache
     connections: Arc<RwLock<HashMap<EndpointId, Connection>>>,
-    /// Live service for stream signaling routing (set after construction)
-    live_service: RwLock<Option<Arc<crate::network::live::LiveService>>>,
+    /// Stream service for stream signaling routing (set after construction)
+    stream_service: RwLock<Option<Arc<crate::network::stream::StreamService>>>,
 }
 
 impl SendService {
@@ -187,18 +187,18 @@ impl SendService {
             event_tx,
             send_timeout: Duration::from_secs(5),
             connections: Arc::new(RwLock::new(HashMap::new())),
-            live_service: RwLock::new(None),
+            stream_service: RwLock::new(None),
         }
     }
 
-    /// Set the LiveService reference (called after both services are constructed)
-    pub async fn set_live_service(&self, live: Arc<crate::network::live::LiveService>) {
-        *self.live_service.write().await = Some(live);
+    /// Set the StreamService reference (called after both services are constructed)
+    pub async fn set_stream_service(&self, stream: Arc<crate::network::stream::StreamService>) {
+        *self.stream_service.write().await = Some(stream);
     }
 
-    /// Get the LiveService reference (if set)
-    pub(crate) async fn live_service(&self) -> Option<Arc<crate::network::live::LiveService>> {
-        self.live_service.read().await.clone()
+    /// Get the StreamService reference (if set)
+    pub(crate) async fn stream_service(&self) -> Option<Arc<crate::network::stream::StreamService>> {
+        self.stream_service.read().await.clone()
     }
 
     /// Get our EndpointID
@@ -570,7 +570,7 @@ impl SendService {
 
     // ========== Incoming ==========
 
-    /// Process an incoming packet using service-owned db, event_tx, identity, and live_service.
+    /// Process an incoming packet using service-owned db, event_tx, identity, and stream_service.
     pub async fn process_incoming_packet(
         &self,
         packet: &SendPacket,
@@ -581,7 +581,7 @@ impl SendService {
         let our_id = self.endpoint_id();
         let db = &self.db;
         let event_tx = &self.event_tx;
-        let live = self.live_service().await;
+        let stream = self.stream_service().await;
 
         // Determine verification mode from payload prefix
         let mode = get_verification_mode_from_payload(&packet.ciphertext)
@@ -824,11 +824,11 @@ impl SendService {
                 TopicMessage::Content(_) => {}
                 TopicMessage::SyncUpdate(_) => {}
                 TopicMessage::SyncRequest => {}
-                // Stream signaling — route to LiveService
+                // Stream signaling — route to StreamService
                 TopicMessage::StreamRequest(_) => {
                     drop(db_lock);
-                    if let Some(ref live) = live {
-                        live.handle_signaling(msg, topic_id, sender_id, source).await;
+                    if let Some(ref stream) = stream {
+                        stream.handle_signaling(msg, topic_id, sender_id, source).await;
                     }
 
                     {
@@ -933,14 +933,15 @@ impl SendService {
                 );
                 let _ = self.event_tx.send(event).await;
             }
-            // DM stream signaling — route to LiveService
+            // DM stream signaling — route to StreamService
             DmMessage::StreamAccept(_)
             | DmMessage::StreamReject(_)
             | DmMessage::StreamQuery(_)
             | DmMessage::StreamActive(_)
-            | DmMessage::StreamEnded(_) => {
-                if let Some(live) = self.live_service().await {
-                    live.handle_dm_signaling(&dm_msg, packet.endpoint_id).await;
+            | DmMessage::StreamEnded(_)
+            | DmMessage::StreamRequest(_) => {
+                if let Some(stream_svc) = self.stream_service().await {
+                    stream_svc.handle_dm_signaling(&dm_msg, packet.endpoint_id).await;
                 }
             }
         }

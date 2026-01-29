@@ -5,7 +5,7 @@
 
 mod dht;
 mod harbor;
-mod live;
+mod stream;
 mod send;
 mod share;
 mod sync;
@@ -18,7 +18,7 @@ use iroh::protocol::Router;
 use crate::network::dht::{DhtService, DHT_ALPN};
 use crate::network::harbor::HarborService;
 use crate::network::harbor::protocol::HARBOR_ALPN;
-use crate::network::live::{LiveService, LIVE_ALPN};
+use crate::network::stream::{StreamService, STREAM_ALPN};
 use crate::network::send::{SendService, protocol::SEND_ALPN};
 use crate::network::share::{ShareService, SHARE_ALPN};
 use crate::network::sync::{SyncService, SYNC_ALPN};
@@ -31,14 +31,14 @@ pub(crate) fn build_router(
     harbor_service: Arc<HarborService>,
     share_service: Arc<ShareService>,
     sync_service: Arc<SyncService>,
-    live_service: Arc<LiveService>,
+    stream_service: Arc<StreamService>,
 ) -> Router {
     let mut builder = iroh::protocol::Router::builder(endpoint)
         .accept(SEND_ALPN, send_service)
         .accept(HARBOR_ALPN, harbor_service)
         .accept(SHARE_ALPN, share_service)
         .accept(SYNC_ALPN, sync_service)
-        .accept(LIVE_ALPN, live_service);
+        .accept(STREAM_ALPN, stream_service);
 
     if let Some(dht) = dht_service {
         builder = builder.accept(DHT_ALPN, dht);

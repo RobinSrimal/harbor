@@ -281,7 +281,7 @@ impl Protocol {
             .map_err(|e| ProtocolError::Database(e.to_string()))
     }
 
-    // ========== Live Streaming API ==========
+    // ========== Stream API ==========
 
     /// Request to stream to a peer in a topic
     ///
@@ -295,8 +295,24 @@ impl Protocol {
         catalog: Vec<u8>,
     ) -> Result<[u8; 32], ProtocolError> {
         self.check_running().await?;
-        self.live_service
+        self.stream_service
             .request_stream(topic_id, peer_id, name, catalog)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Request a DM stream to a peer (peer-to-peer, no topic)
+    ///
+    /// Sends a stream request directly via DM. The destination must accept
+    /// before media can flow. Returns the unique request ID.
+    pub async fn dm_stream_request(
+        &self,
+        peer_id: &[u8; 32],
+        name: &str,
+    ) -> Result<[u8; 32], ProtocolError> {
+        self.check_running().await?;
+        self.stream_service
+            .dm_request_stream(peer_id, name)
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
     }
@@ -304,7 +320,7 @@ impl Protocol {
     /// Accept an incoming stream request
     pub async fn accept_stream(&self, request_id: &[u8; 32]) -> Result<(), ProtocolError> {
         self.check_running().await?;
-        self.live_service
+        self.stream_service
             .accept_stream(request_id)
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
@@ -317,7 +333,7 @@ impl Protocol {
         reason: Option<String>,
     ) -> Result<(), ProtocolError> {
         self.check_running().await?;
-        self.live_service
+        self.stream_service
             .reject_stream(request_id, reason)
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
@@ -326,7 +342,7 @@ impl Protocol {
     /// End an active outgoing stream
     pub async fn end_stream(&self, request_id: &[u8; 32]) -> Result<(), ProtocolError> {
         self.check_running().await?;
-        self.live_service
+        self.stream_service
             .end_stream(request_id)
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
@@ -336,15 +352,15 @@ impl Protocol {
     ///
     /// Returns the session after `StreamConnected` has been emitted.
     /// Use `create_broadcast` / `consume_broadcast` on the returned session.
-    pub async fn get_live_session(
+    pub async fn get_stream_session(
         &self,
         request_id: &[u8; 32],
-    ) -> Result<std::sync::Arc<crate::network::live::session::LiveSession>, ProtocolError> {
+    ) -> Result<std::sync::Arc<crate::network::stream::session::StreamSession>, ProtocolError> {
         self.check_running().await?;
-        self.live_service
+        self.stream_service
             .get_session(request_id)
             .await
-            .ok_or_else(|| ProtocolError::NotFound("live session not found".into()))
+            .ok_or_else(|| ProtocolError::NotFound("stream session not found".into()))
     }
 
     /// Create a broadcast producer on an active MOQ session (source side)
@@ -357,10 +373,10 @@ impl Protocol {
         broadcast_name: &str,
     ) -> Result<moq_lite::BroadcastProducer, ProtocolError> {
         self.check_running().await?;
-        let session = self.live_service
+        let session = self.stream_service
             .get_session(request_id)
             .await
-            .ok_or_else(|| ProtocolError::NotFound("live session not found".into()))?;
+            .ok_or_else(|| ProtocolError::NotFound("stream session not found".into()))?;
         session
             .create_broadcast(broadcast_name)
             .ok_or_else(|| ProtocolError::Network("failed to create broadcast".into()))
@@ -376,10 +392,10 @@ impl Protocol {
         broadcast_name: &str,
     ) -> Result<moq_lite::BroadcastConsumer, ProtocolError> {
         self.check_running().await?;
-        let session = self.live_service
+        let session = self.stream_service
             .get_session(request_id)
             .await
-            .ok_or_else(|| ProtocolError::NotFound("live session not found".into()))?;
+            .ok_or_else(|| ProtocolError::NotFound("stream session not found".into()))?;
         session
             .consume_broadcast(broadcast_name)
             .ok_or_else(|| ProtocolError::Network("broadcast not available".into()))

@@ -114,6 +114,8 @@ source "$SCRIPT_DIR/scenarios/dm_sync_basic.sh"
 source "$SCRIPT_DIR/scenarios/dm_sync_offline.sh"
 source "$SCRIPT_DIR/scenarios/dm_share_basic.sh"
 source "$SCRIPT_DIR/scenarios/dm_share_offline.sh"
+source "$SCRIPT_DIR/scenarios/dm_stream_basic.sh"
+source "$SCRIPT_DIR/scenarios/dm_stream_offline.sh"
 source "$SCRIPT_DIR/scenarios/suites.sh"
 
 # ============================================================================
@@ -281,6 +283,12 @@ case $SCENARIO in
     dm-share-offline)
         scenario_dm_share_offline
         ;;
+    dm-stream-basic)
+        scenario_dm_stream_basic
+        ;;
+    dm-stream-offline)
+        scenario_dm_stream_offline
+        ;;
     advanced)
         run_advanced_suite
         ;;
@@ -301,6 +309,7 @@ case $SCENARIO in
         echo "  Sync:       sync-basic, sync-concurrent, sync-offline, sync-initial"
         echo "  Stream:     stream-basic, stream-reject, stream-end"
         echo "  DM:         dm-basic, dm-offline"
+        echo "  DM Stream:  dm-stream-basic, dm-stream-offline"
         echo "  Suites:     membership, advanced, share, sync, full"
         echo ""
         exit 1

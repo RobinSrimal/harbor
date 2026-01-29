@@ -465,6 +465,23 @@ api_stream_request() {
     echo "$result"
 }
 
+# Request a DM stream to a peer (peer-to-peer, no topic)
+# Usage: api_dm_stream_request <node> <peer_hex> [name]
+# Returns: JSON with request_id
+api_dm_stream_request() {
+    local n=$1
+    local peer=$2
+    local name=${3:-"test"}
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/dm/stream/request" \
+        -H "Content-Type: application/json" \
+        -d "{\"peer\":\"$peer\",\"name\":\"$name\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/dm/stream/request"
+    echo "$result"
+}
+
 # Accept a stream request
 # Usage: api_stream_accept <node> <request_id_hex>
 api_stream_accept() {

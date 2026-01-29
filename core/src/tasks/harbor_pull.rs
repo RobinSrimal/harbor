@@ -24,7 +24,7 @@ use crate::security::{
 };
 use crate::network::send::dm_messages::DmMessage;
 
-use crate::network::live::LiveService;
+use crate::network::stream::StreamService;
 use crate::network::send::PacketSource;
 use crate::protocol::{Protocol, IncomingMessage, ProtocolEvent};
 
@@ -38,7 +38,7 @@ impl Protocol {
         pull_interval: Duration,
         pull_max_nodes: usize,
         pull_early_stop: usize,
-        live_service: Arc<LiveService>,
+        stream_service: Arc<StreamService>,
     ) {
         let db = harbor_service.db().clone();
         let dht_service = harbor_service.dht_service().clone();
@@ -161,13 +161,14 @@ impl Protocol {
                                                     });
                                                     let _ = event_tx.send(event).await;
                                                 }
-                                                // DM stream signaling — route to LiveService
+                                                // DM stream signaling — route to StreamService
                                                 Ok(ref dm_msg @ DmMessage::StreamAccept(_))
                                                 | Ok(ref dm_msg @ DmMessage::StreamReject(_))
                                                 | Ok(ref dm_msg @ DmMessage::StreamQuery(_))
                                                 | Ok(ref dm_msg @ DmMessage::StreamActive(_))
-                                                | Ok(ref dm_msg @ DmMessage::StreamEnded(_)) => {
-                                                    live_service.handle_dm_signaling(dm_msg, packet_info.sender_id).await;
+                                                | Ok(ref dm_msg @ DmMessage::StreamEnded(_))
+                                                | Ok(ref dm_msg @ DmMessage::StreamRequest(_)) => {
+                                                    stream_service.handle_dm_signaling(dm_msg, packet_info.sender_id).await;
                                                 }
                                                 Err(e) => {
                                                     debug!(error = %e, "failed to decode pulled DM message");
@@ -394,10 +395,10 @@ impl Protocol {
                                                     });
                                                     let _ = event_tx.send(event).await;
                                                 }
-                                                // Stream signaling — route to LiveService
+                                                // Stream signaling — route to StreamService
                                                 TopicMessage::StreamRequest(_) => {
                                                     drop(db_lock);
-                                                    live_service.handle_signaling(
+                                                    stream_service.handle_signaling(
                                                         msg, &topic_id, packet_info.sender_id,
                                                         PacketSource::HarborPull,
                                                     ).await;

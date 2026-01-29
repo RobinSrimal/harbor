@@ -20,7 +20,7 @@ use crate::data::{get_or_create_identity, start_db, LocalIdentity};
 use crate::network::dht::DhtService;
 use crate::data::BlobStore;
 use crate::network::harbor::HarborService;
-use crate::network::live::LiveService;
+use crate::network::stream::StreamService;
 use crate::network::send::SendService;
 use crate::network::share::{ShareConfig, ShareService};
 use crate::network::sync::SyncService;
@@ -66,8 +66,8 @@ pub struct Protocol {
     pub(crate) share_service: Arc<ShareService>,
     /// Sync service for CRDT synchronization
     pub(crate) sync_service: Arc<SyncService>,
-    /// Live streaming service
-    pub(crate) live_service: Arc<LiveService>,
+    /// Stream service
+    pub(crate) stream_service: Arc<StreamService>,
     /// Topic service for topic lifecycle
     pub(crate) topic_service: Arc<TopicService>,
     /// Stats service for monitoring
@@ -216,8 +216,8 @@ impl Protocol {
             send_service.clone(),
         ));
 
-        // Initialize Live streaming service
-        let live_service = LiveService::new(
+        // Initialize Stream service
+        let stream_service = StreamService::new(
             endpoint.clone(),
             identity.clone(),
             db.clone(),
@@ -225,8 +225,8 @@ impl Protocol {
             send_service.clone(),
         );
 
-        // Give SendService access to LiveService (for routing stream signaling)
-        send_service.set_live_service(live_service.clone()).await;
+        // Give SendService access to StreamService (for routing stream signaling)
+        send_service.set_stream_service(stream_service.clone()).await;
 
         // Initialize Topic service
         let topic_service = Arc::new(TopicService::new(
@@ -252,7 +252,7 @@ impl Protocol {
             harbor_service.clone(),
             share_service.clone(),
             sync_service.clone(),
-            live_service.clone(),
+            stream_service.clone(),
         );
 
         let protocol = Self {
@@ -265,7 +265,7 @@ impl Protocol {
             harbor_service,
             share_service,
             sync_service,
-            live_service,
+            stream_service,
             topic_service,
             stats_service,
             event_tx,

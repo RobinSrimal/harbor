@@ -1,47 +1,47 @@
-//! Live protocol incoming handler
+//! Stream protocol incoming handler
 //!
-//! Handles incoming Live protocol connections (MOQ media transport).
-//! Peers connect via LIVE_ALPN after a stream request has been accepted.
+//! Handles incoming Stream protocol connections (MOQ media transport).
+//! Peers connect via STREAM_ALPN after a stream request has been accepted.
 //!
 //! The incoming side is the **destination** — the peer who accepted the stream.
-//! The source opens a QUIC connection with LIVE_ALPN, and this handler performs
-//! the MOQ handshake via `moq_lite::Server`, creating a `LiveSession` that the
+//! The source opens a QUIC connection with STREAM_ALPN, and this handler performs
+//! the MOQ handshake via `moq_lite::Server`, creating a `StreamSession` that the
 //! destination app uses to consume the broadcast.
 
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tracing::{debug, info, warn};
 use web_transport_iroh::QuicRequest;
 
-use crate::network::live::LiveService;
-use crate::network::live::session::LiveSession;
+use crate::network::stream::StreamService;
+use crate::network::stream::session::StreamSession;
 
-impl ProtocolHandler for LiveService {
+impl ProtocolHandler for StreamService {
     async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
         let peer_id = *conn.remote_id().as_bytes();
         info!(
             peer = %hex::encode(&peer_id[..8]),
-            "incoming Live (MOQ) connection"
+            "incoming Stream (MOQ) connection"
         );
 
         if let Err(e) = self.handle_incoming_moq(conn, peer_id).await {
-            debug!(error = %e, peer = %hex::encode(&peer_id[..8]), "Live connection handler error");
+            debug!(error = %e, peer = %hex::encode(&peer_id[..8]), "Stream connection handler error");
         }
         Ok(())
     }
 }
 
-impl LiveService {
+impl StreamService {
     /// Handle an incoming MOQ connection from the stream source.
     ///
     /// The destination (us) accepted the stream via signaling. Now the source
-    /// opens a QUIC connection with LIVE_ALPN. We perform the MOQ handshake
-    /// and create a LiveSession for consuming the broadcast.
+    /// opens a QUIC connection with STREAM_ALPN. We perform the MOQ handshake
+    /// and create a StreamSession for consuming the broadcast.
     pub(crate) async fn handle_incoming_moq(
         &self,
         conn: iroh::endpoint::Connection,
         peer_id: [u8; 32],
-    ) -> Result<(), crate::network::live::LiveError> {
-        use crate::network::live::LiveError;
+    ) -> Result<(), crate::network::stream::StreamError> {
+        use crate::network::stream::StreamError;
 
         // 1. Wrap iroh Connection as a raw WebTransport session (no HTTP/3 — direct ALPN)
         let wt_session = QuicRequest::accept(conn).ok();
@@ -57,7 +57,7 @@ impl LiveService {
                     peer = %hex::encode(&peer_id[..8]),
                     "incoming MOQ connection from peer with no accepted stream request"
                 );
-                return Err(LiveError::RequestNotFound);
+                return Err(StreamError::RequestNotFound);
             }
         };
 
@@ -70,7 +70,7 @@ impl LiveService {
             .with_consume(origin.producer.clone());
 
         let moq_session = moq_server.accept(wt_session).await
-            .map_err(|e| LiveError::Moq(e.to_string()))?;
+            .map_err(|e| StreamError::Moq(e.to_string()))?;
 
         info!(
             peer = %hex::encode(&peer_id[..8]),
@@ -78,8 +78,8 @@ impl LiveService {
             "MOQ session established (destination side)"
         );
 
-        // 5. Create LiveSession and store it
-        let live_session = LiveSession::from_parts(
+        // 5. Create StreamSession and store it
+        let live_session = StreamSession::from_parts(
             moq_session,
             origin.producer,
             origin.consumer,
@@ -96,7 +96,7 @@ impl LiveService {
         let event = crate::protocol::ProtocolEvent::StreamConnected(
             crate::protocol::StreamConnectedEvent {
                 request_id: pending.request_id,
-                topic_id: pending.topic_id,
+                topic_id: crate::network::stream::optional_topic_id(&pending.topic_id),
                 peer_id,
                 is_source: false,
             },
