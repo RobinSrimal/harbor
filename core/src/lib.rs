@@ -50,6 +50,7 @@ pub(crate) mod tasks;
 
 // Infrastructure modules (pub for flexibility)
 pub mod data;
+pub mod keychain;
 pub mod network;
 pub mod resilience;
 pub mod security;
@@ -88,4 +89,10 @@ pub use protocol::{
     TopicDetails,
     TopicMemberInfo,
     TopicSummary,
+    // Stream events
+    StreamRequestEvent,
+    StreamAcceptedEvent,
+    StreamRejectedEvent,
+    StreamEndedEvent,
+    StreamConnectedEvent,
 };

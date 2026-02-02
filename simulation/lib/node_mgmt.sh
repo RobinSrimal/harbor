@@ -11,6 +11,9 @@
 # Node management
 declare -a NODE_PIDS
 
+# Database encryption key for all simulation nodes (shared so they all use the same format)
+export HARBOR_DB_KEY="${HARBOR_DB_KEY:-486172626f724e6f64654b6579323032355f76315f7365727665725f6b657921}"
+
 # Find binary
 find_harbor_binary() {
     if [ -f "$SCRIPT_DIR/../target/release/harbor-cli" ]; then

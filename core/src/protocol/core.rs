@@ -99,15 +99,11 @@ impl Protocol {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "harbor_protocol.db".to_string());
 
-        // Generate or use provided key - convert to hex string for passphrase
+        // Require a database encryption key — the caller must always provide one
         use zeroize::Zeroize;
-        let mut db_key = config.db_key.unwrap_or_else(|| {
-            // Generate a random key using rand
-            use rand::{rngs::OsRng, Rng};
-            let mut key = [0u8; 32];
-            OsRng.fill(&mut key);
-            key
-        });
+        let mut db_key = config.db_key.ok_or_else(|| {
+            ProtocolError::Database("db_key is required — set it via ProtocolConfig::with_db_key()".to_string())
+        })?;
         let passphrase = hex::encode(&db_key);
         db_key.zeroize();
 

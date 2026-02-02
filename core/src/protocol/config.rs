@@ -15,7 +15,7 @@ pub struct ProtocolConfig {
     pub blob_path: Option<PathBuf>,
     
     /// Database encryption key (32 bytes)
-    /// If None, generates a random key (not recommended for production)
+    /// Required — Protocol::start() will return an error if not set.
     pub db_key: Option<[u8; 32]>,
     
     /// Bootstrap nodes for DHT (EndpointIDs as hex strings)

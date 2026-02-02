@@ -21,13 +21,26 @@ use harbor_core::{Protocol, ProtocolConfig, TopicInvite};
 /// Maps request_id → TrackProducer for reuse across publish calls
 type ActiveTracks = Arc<RwLock<HashMap<[u8; 32], moq_lite::TrackProducer>>>;
 
-/// Fixed database key for persistent identity (32 bytes)
-const DB_KEY: [u8; 32] = [
-    0x48, 0x61, 0x72, 0x62, 0x6f, 0x72, 0x4e, 0x6f,  // "HarborNo"
-    0x64, 0x65, 0x4b, 0x65, 0x79, 0x32, 0x30, 0x32,  // "deKey202"
-    0x35, 0x5f, 0x76, 0x31, 0x5f, 0x73, 0x65, 0x72,  // "5_v1_ser"
-    0x76, 0x65, 0x72, 0x5f, 0x6b, 0x65, 0x79, 0x21,  // "ver_key!"
-];
+/// Parse HARBOR_DB_KEY env var (64 hex chars) into a 32-byte key.
+fn db_key_from_env() -> [u8; 32] {
+    let hex_str = env::var("HARBOR_DB_KEY").unwrap_or_else(|_| {
+        eprintln!("Error: HARBOR_DB_KEY environment variable is not set.");
+        eprintln!("  Set it to a 64-character hex string (32 bytes), e.g.:");
+        eprintln!("  export HARBOR_DB_KEY=$(openssl rand -hex 32)");
+        std::process::exit(1);
+    });
+    let bytes = hex::decode(&hex_str).unwrap_or_else(|_| {
+        eprintln!("Error: HARBOR_DB_KEY is not valid hex.");
+        std::process::exit(1);
+    });
+    if bytes.len() != 32 {
+        eprintln!("Error: HARBOR_DB_KEY must be exactly 64 hex characters (32 bytes), got {}.", hex_str.len());
+        std::process::exit(1);
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    key
+}
 
 fn print_usage() {
     println!("Harbor Protocol Node v0.1.0");
@@ -82,6 +95,7 @@ fn print_usage() {
     println!("  POST /api/dm/share          Share a file via DM (JSON: recipient, file_path)");
     println!();
     println!("Environment:");
+    println!("  HARBOR_DB_KEY               Database encryption key (64 hex chars, required)");
     println!("  RUST_LOG                    Set log level (e.g., info, debug)");
 }
 
@@ -152,15 +166,17 @@ async fn main() {
     println!("Harbor Protocol Node v0.1.0");
     println!();
 
+    let db_key = db_key_from_env();
+
     // Build config - use testing intervals if --testing flag is set
     let mut config = if testing_mode {
         ProtocolConfig::for_testing()
-            .with_db_key(DB_KEY)
+            .with_db_key(db_key)
             .with_db_path(db_path.clone())
             .with_blob_path(blob_path.clone())
     } else {
         ProtocolConfig::default()
-            .with_db_key(DB_KEY)
+            .with_db_key(db_key)
             .with_db_path(db_path.clone())
             .with_blob_path(blob_path.clone())
     };
