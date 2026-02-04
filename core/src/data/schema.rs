@@ -14,6 +14,7 @@ pub fn create_all_tables(conn: &Connection) -> rusqlite::Result<()> {
     create_harbor_table(conn)?;
     create_membership_tables(conn)?;
     create_share_tables(conn)?;
+    create_control_tables(conn)?;
     Ok(())
 }
 
@@ -112,15 +113,19 @@ pub fn create_dht_table(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Topic table: stores subscribed topics with their HarborID and members
+/// Topic table: stores subscribed topics with their HarborID, admin, and members
 ///
 /// All BLOB fields are 32 bytes (256-bit identifiers).
+/// The admin_id references the peers table - the topic creator is the initial admin.
+/// Note: Our own endpoint ID is inserted into peers table on init, so we can be admin.
 pub fn create_topic_table(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS topics (
             topic_id BLOB PRIMARY KEY NOT NULL CHECK (length(topic_id) = 32),
             harbor_id BLOB NOT NULL CHECK (length(harbor_id) = 32),
-            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            admin_id BLOB NOT NULL CHECK (length(admin_id) = 32),
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY (admin_id) REFERENCES peers(endpoint_id)
         )",
         [],
     )?;
@@ -132,7 +137,8 @@ pub fn create_topic_table(conn: &Connection) -> rusqlite::Result<()> {
             endpoint_id BLOB NOT NULL CHECK (length(endpoint_id) = 32),
             joined_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             PRIMARY KEY (topic_id, endpoint_id),
-            FOREIGN KEY (topic_id) REFERENCES topics(topic_id) ON DELETE CASCADE
+            FOREIGN KEY (topic_id) REFERENCES topics(topic_id) ON DELETE CASCADE,
+            FOREIGN KEY (endpoint_id) REFERENCES peers(endpoint_id)
         )",
         [],
     )?;
@@ -268,18 +274,64 @@ pub fn create_harbor_table(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Membership tables placeholder (Tier 2/3 - not used in Tier 1)
+/// Membership tables: epoch keys and pending decryption
 ///
-/// These tables are reserved for future tiers:
-/// - Tier 2: Admin-managed topics with epoch-based keys
-/// - Tier 3: Full MLS with TreeKEM
+/// All topics have an admin (the creator) who can:
+/// - Invite/remove members
+/// - Rotate epoch keys
+/// - Transfer admin role
 ///
-/// For Tier 1 (Open Topics), we only need:
-/// - `topics` table (subscriptions)
+/// Current tables used:
+/// - `topics` table (subscriptions, admin_id)
 /// - `topic_members` table (member list from invite + Join/Leave messages)
-pub fn create_membership_tables(_conn: &Connection) -> rusqlite::Result<()> {
-    // No additional tables needed for Tier 1
-    // Future tiers will add: mls_group_state, epoch_keys, etc.
+/// - `epoch_keys` table (epoch keys per topic for decryption)
+/// - `pending_decryption` table (packets awaiting epoch keys)
+pub fn create_membership_tables(conn: &Connection) -> rusqlite::Result<()> {
+    // Epoch keys table: stores encryption keys per topic per epoch
+    // Keys are retained for 3 months, then pruned
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS epoch_keys (
+            topic_id BLOB NOT NULL CHECK (length(topic_id) = 32),
+            epoch INTEGER NOT NULL,
+            key_data BLOB NOT NULL CHECK (length(key_data) = 32),
+            received_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (topic_id, epoch),
+            FOREIGN KEY (topic_id) REFERENCES topics(topic_id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    // Pending decryption table: packets pulled from Harbor awaiting epoch keys
+    // When the epoch key arrives, these packets are decrypted and processed
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS pending_decryption (
+            packet_id BLOB PRIMARY KEY NOT NULL CHECK (length(packet_id) = 32),
+            topic_id BLOB NOT NULL CHECK (length(topic_id) = 32),
+            harbor_id BLOB NOT NULL CHECK (length(harbor_id) = 32),
+            sender_id BLOB NOT NULL CHECK (length(sender_id) = 32),
+            epoch INTEGER NOT NULL,
+            packet_data BLOB NOT NULL,
+            received_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY (topic_id) REFERENCES topics(topic_id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    // Index for finding pending packets by topic and epoch (for processing when key arrives)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_topic_epoch
+         ON pending_decryption(topic_id, epoch)",
+        [],
+    )?;
+
+    // Index for finding expired epoch keys during cleanup
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_epoch_keys_expires
+         ON epoch_keys(expires_at)",
+        [],
+    )?;
+
     Ok(())
 }
 
@@ -358,6 +410,69 @@ pub fn create_share_tables(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Control tables: peer connections, tokens, and pending invites
+///
+/// Used by the Control ALPN for lifecycle and relationship management:
+/// - `connection_list`: tracks peer relationships (connected, pending, blocked)
+/// - `connect_tokens`: one-time tokens for QR code / invite string flow
+/// - `pending_topic_invites`: topic invites awaiting user decision
+pub fn create_control_tables(conn: &Connection) -> rusqlite::Result<()> {
+    // Connection list: tracks peer relationships
+    // States: pending_outgoing, pending_incoming, connected, declined, blocked
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS connection_list (
+            peer_id BLOB PRIMARY KEY NOT NULL CHECK (length(peer_id) = 32),
+            state TEXT NOT NULL CHECK (state IN ('pending_outgoing', 'pending_incoming', 'connected', 'declined', 'blocked')),
+            display_name TEXT,
+            relay_url TEXT,
+            request_id BLOB CHECK (length(request_id) = 32),
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        )",
+        [],
+    )?;
+
+    // Index for filtering by state
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_connection_list_state ON connection_list(state)",
+        [],
+    )?;
+
+    // Connect tokens: one-time secrets for QR code / invite string flow
+    // Tokens live until consumed, no expiry
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS connect_tokens (
+            token BLOB PRIMARY KEY NOT NULL CHECK (length(token) = 32),
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        )",
+        [],
+    )?;
+
+    // Pending topic invites: invites awaiting user decision
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS pending_topic_invites (
+            message_id BLOB PRIMARY KEY NOT NULL CHECK (length(message_id) = 32),
+            topic_id BLOB NOT NULL CHECK (length(topic_id) = 32),
+            sender_id BLOB NOT NULL CHECK (length(sender_id) = 32),
+            topic_name TEXT,
+            epoch INTEGER NOT NULL,
+            epoch_key BLOB NOT NULL CHECK (length(epoch_key) = 32),
+            admin_id BLOB NOT NULL CHECK (length(admin_id) = 32),
+            members_blob BLOB NOT NULL,
+            received_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        )",
+        [],
+    )?;
+
+    // Index for finding invites by topic
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_invites_topic ON pending_topic_invites(topic_id)",
+        [],
+    )?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +507,11 @@ mod tests {
         assert!(tables.contains(&"harbor_cache".to_string()));
         assert!(tables.contains(&"harbor_recipients".to_string()));
         assert!(tables.contains(&"pulled_packets".to_string()));
+        assert!(tables.contains(&"epoch_keys".to_string()));
+        assert!(tables.contains(&"pending_decryption".to_string()));
+        assert!(tables.contains(&"connection_list".to_string()));
+        assert!(tables.contains(&"connect_tokens".to_string()));
+        assert!(tables.contains(&"pending_topic_invites".to_string()));
     }
 
     #[test]
@@ -538,22 +658,31 @@ mod tests {
     #[test]
     fn test_topic_table_check_constraints() {
         let conn = in_memory_db();
+        create_peer_table(&conn).unwrap();
         create_topic_table(&conn).unwrap();
+
+        // Insert admin peer first (for foreign key)
+        let admin_id = [0u8; 32];
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            rusqlite::params![admin_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
 
         // Valid 32-byte IDs should work
         let topic_id = [1u8; 32];
         let harbor_id = [2u8; 32];
         conn.execute(
-            "INSERT INTO topics (topic_id, harbor_id) VALUES (?1, ?2)",
-            rusqlite::params![topic_id.as_slice(), harbor_id.as_slice()],
+            "INSERT INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![topic_id.as_slice(), harbor_id.as_slice(), admin_id.as_slice()],
         )
         .unwrap();
 
         // Wrong size harbor_id should fail
         let bad_harbor = [3u8; 16];
         let result = conn.execute(
-            "INSERT INTO topics (topic_id, harbor_id) VALUES (?1, ?2)",
-            rusqlite::params![[4u8; 32].as_slice(), bad_harbor.as_slice()],
+            "INSERT INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![[4u8; 32].as_slice(), bad_harbor.as_slice(), admin_id.as_slice()],
         );
         assert!(result.is_err(), "Should reject harbor_id with wrong size");
     }
@@ -561,11 +690,273 @@ mod tests {
     // ========== Membership Tables Tests (Tier 1 - placeholder) ==========
 
     #[test]
-    fn test_create_membership_tables_tier1() {
+    fn test_create_membership_tables() {
         let conn = in_memory_db();
-        // Tier 1 doesn't create additional tables
+        create_peer_table(&conn).unwrap();
+        create_topic_table(&conn).unwrap();
         create_membership_tables(&conn).unwrap();
-        // Function should succeed (no-op for Tier 1)
+
+        // Verify epoch_keys table exists
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(tables.contains(&"epoch_keys".to_string()));
+        assert!(tables.contains(&"pending_decryption".to_string()));
+    }
+
+    #[test]
+    fn test_epoch_keys_schema() {
+        let conn = in_memory_db();
+        create_peer_table(&conn).unwrap();
+        create_topic_table(&conn).unwrap();
+        create_membership_tables(&conn).unwrap();
+
+        let topic_id = [1u8; 32];
+        let harbor_id = [2u8; 32];
+        let admin_id = [3u8; 32];
+        let key_data = [4u8; 32];
+
+        // Insert admin peer first (for foreign key)
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            rusqlite::params![admin_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
+
+        // Insert topic
+        conn.execute(
+            "INSERT INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![topic_id.as_slice(), harbor_id.as_slice(), admin_id.as_slice()],
+        )
+        .unwrap();
+
+        // Insert epoch key
+        let expires_at = 1704067200i64 + 7776000; // 90 days
+        conn.execute(
+            "INSERT INTO epoch_keys (topic_id, epoch, key_data, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![topic_id.as_slice(), 1, key_data.as_slice(), expires_at],
+        )
+        .unwrap();
+
+        // Query back
+        let (retrieved_epoch, retrieved_key): (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT epoch, key_data FROM epoch_keys WHERE topic_id = ?1",
+                [topic_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(retrieved_epoch, 1);
+        assert_eq!(retrieved_key, key_data.to_vec());
+    }
+
+    #[test]
+    fn test_pending_decryption_schema() {
+        let conn = in_memory_db();
+        create_peer_table(&conn).unwrap();
+        create_topic_table(&conn).unwrap();
+        create_membership_tables(&conn).unwrap();
+
+        let topic_id = [1u8; 32];
+        let harbor_id = [2u8; 32];
+        let admin_id = [3u8; 32];
+        let packet_id = [4u8; 32];
+        let sender_id = [5u8; 32];
+        let packet_data = b"encrypted payload";
+
+        // Insert admin peer first (for foreign key)
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            rusqlite::params![admin_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
+
+        // Insert topic
+        conn.execute(
+            "INSERT INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![topic_id.as_slice(), harbor_id.as_slice(), admin_id.as_slice()],
+        )
+        .unwrap();
+
+        // Insert pending packet
+        conn.execute(
+            "INSERT INTO pending_decryption (packet_id, topic_id, harbor_id, sender_id, epoch, packet_data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                packet_id.as_slice(),
+                topic_id.as_slice(),
+                harbor_id.as_slice(),
+                sender_id.as_slice(),
+                2,
+                packet_data.as_slice()
+            ],
+        )
+        .unwrap();
+
+        // Query by topic and epoch (the main use case)
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_decryption WHERE topic_id = ?1 AND epoch = ?2",
+                rusqlite::params![topic_id.as_slice(), 2],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(count, 1);
+    }
+
+    // ========== Control Tables Tests ==========
+
+    #[test]
+    fn test_create_control_tables() {
+        let conn = in_memory_db();
+        create_control_tables(&conn).unwrap();
+
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(tables.contains(&"connection_list".to_string()));
+        assert!(tables.contains(&"connect_tokens".to_string()));
+        assert!(tables.contains(&"pending_topic_invites".to_string()));
+    }
+
+    #[test]
+    fn test_connection_list_schema() {
+        let conn = in_memory_db();
+        create_control_tables(&conn).unwrap();
+
+        let peer_id = [1u8; 32];
+        let request_id = [2u8; 32];
+
+        // Insert a connection
+        conn.execute(
+            "INSERT INTO connection_list (peer_id, state, display_name, relay_url, request_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                peer_id.as_slice(),
+                "connected",
+                "Alice",
+                "https://relay.example.com",
+                request_id.as_slice()
+            ],
+        )
+        .unwrap();
+
+        // Query back
+        let (state, name): (String, String) = conn
+            .query_row(
+                "SELECT state, display_name FROM connection_list WHERE peer_id = ?1",
+                [peer_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(state, "connected");
+        assert_eq!(name, "Alice");
+
+        // Invalid state should fail
+        let result = conn.execute(
+            "INSERT INTO connection_list (peer_id, state) VALUES (?1, ?2)",
+            rusqlite::params![[3u8; 32].as_slice(), "invalid_state"],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_connect_tokens_schema() {
+        let conn = in_memory_db();
+        create_control_tables(&conn).unwrap();
+
+        let token = [42u8; 32];
+
+        // Insert a token
+        conn.execute(
+            "INSERT INTO connect_tokens (token) VALUES (?1)",
+            [token.as_slice()],
+        )
+        .unwrap();
+
+        // Query back
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM connect_tokens WHERE token = ?1",
+                [token.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(exists);
+
+        // Delete (consume) the token
+        conn.execute(
+            "DELETE FROM connect_tokens WHERE token = ?1",
+            [token.as_slice()],
+        )
+        .unwrap();
+
+        // Should be gone
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM connect_tokens WHERE token = ?1",
+                [token.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(!exists);
+    }
+
+    #[test]
+    fn test_pending_topic_invites_schema() {
+        let conn = in_memory_db();
+        create_control_tables(&conn).unwrap();
+
+        let message_id = [1u8; 32];
+        let topic_id = [2u8; 32];
+        let sender_id = [3u8; 32];
+        let epoch_key = [4u8; 32];
+        let admin_id = [5u8; 32];
+        let members_blob: Vec<u8> = vec![]; // Empty member list
+
+        // Insert a pending invite
+        conn.execute(
+            "INSERT INTO pending_topic_invites (message_id, topic_id, sender_id, topic_name, epoch, epoch_key, admin_id, members_blob)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                message_id.as_slice(),
+                topic_id.as_slice(),
+                sender_id.as_slice(),
+                "Test Topic",
+                1,
+                epoch_key.as_slice(),
+                admin_id.as_slice(),
+                members_blob,
+            ],
+        )
+        .unwrap();
+
+        // Query back
+        let (name, epoch): (String, i64) = conn
+            .query_row(
+                "SELECT topic_name, epoch FROM pending_topic_invites WHERE message_id = ?1",
+                [message_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(name, "Test Topic");
+        assert_eq!(epoch, 1);
     }
 }
 

@@ -77,6 +77,14 @@ Scenarios are run in the order they appear in `simulate.sh` (source order):
 | 35 | dm-share-basic | `./simulate.sh dm-share-basic` | |
 | 36 | dm-share-offline | `./simulate.sh dm-share-offline` | |
 
+### Control Protocol
+| # | Scenario | Command | Status |
+|---|----------|---------|--------|
+| 37 | control-connect | `./simulate.sh control-connect` | |
+| 38 | control-topic-invite | `./simulate.sh control-topic-invite` | |
+| 39 | control-suggest | `./simulate.sh control-suggest` | |
+| 40 | control-offline | `./simulate.sh control-offline` | |
+
 ## Notes
 
 - Each scenario is self-contained (starts nodes, runs test, cleans up)

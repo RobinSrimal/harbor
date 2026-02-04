@@ -18,14 +18,19 @@ use crate::network::harbor::HarborService;
 use crate::network::harbor::protocol::HarborPacketType;
 use crate::network::send::topic_messages::TopicMessage;
 use crate::security::{
-    verify_and_decrypt_packet_with_mode, harbor_id_from_topic,
+    verify_and_decrypt_with_epoch,
+    harbor_id_from_topic,
     verify_and_decrypt_dm_packet,
-    VerificationMode, SendPacket,
+    VerificationMode, SendPacket, EpochKeys,
 };
 use crate::network::send::dm_messages::DmMessage;
 
 use crate::network::stream::StreamService;
 use crate::network::send::PacketSource;
+use crate::network::control::protocol::{
+    ControlPacketType, TopicInvite, Suggest, RemoveMember,
+    ConnectRequest, ConnectAccept, ConnectDecline,
+};
 use crate::protocol::{Protocol, IncomingMessage, ProtocolEvent};
 
 impl Protocol {
@@ -127,6 +132,180 @@ impl Protocol {
                                                 let _ = mark_pulled(&db_lock, &our_id, &packet_info.packet_id);
                                             }
 
+                                            // Check if this is a Control packet (type byte < 0x80)
+                                            // or a DM packet (type byte >= 0x80)
+                                            if !plaintext.is_empty() && plaintext[0] < 0x80 {
+                                                // Control packet - parse type and data
+                                                if let Some(ctrl_type) = ControlPacketType::from_byte(plaintext[0]) {
+                                                    let ctrl_data = &plaintext[1..];
+                                                    match ctrl_type {
+                                                        ControlPacketType::TopicInvite => {
+                                                            if let Ok(invite) = postcard::from_bytes::<TopicInvite>(ctrl_data) {
+                                                                // Store as pending invite
+                                                                {
+                                                                    let db_lock = db.lock().await;
+                                                                    let _ = crate::data::store_pending_invite(
+                                                                        &db_lock,
+                                                                        &invite.message_id,
+                                                                        &invite.topic_id,
+                                                                        &invite.sender_id,
+                                                                        invite.topic_name.as_deref(),
+                                                                        invite.epoch,
+                                                                        &invite.epoch_key,
+                                                                        &invite.admin_id,
+                                                                        &invite.members,
+                                                                    );
+                                                                }
+                                                                // Emit event
+                                                                let member_count = invite.members.len();
+                                                                let event = ProtocolEvent::TopicInviteReceived(
+                                                                    crate::protocol::TopicInviteReceivedEvent {
+                                                                        message_id: invite.message_id,
+                                                                        topic_id: invite.topic_id,
+                                                                        sender_id: invite.sender_id,
+                                                                        topic_name: invite.topic_name.clone(),
+                                                                        admin_id: invite.admin_id,
+                                                                        member_count,
+                                                                    }
+                                                                );
+                                                                let _ = event_tx.send(event).await;
+                                                                info!(
+                                                                    topic = %hex::encode(&invite.topic_id[..8]),
+                                                                    sender = %hex::encode(&invite.sender_id[..8]),
+                                                                    admin = %hex::encode(&invite.admin_id[..8]),
+                                                                    "TOPIC_INVITE_RECEIVED via Harbor pull"
+                                                                );
+                                                            }
+                                                        }
+                                                        ControlPacketType::Suggest => {
+                                                            if let Ok(suggest) = postcard::from_bytes::<Suggest>(ctrl_data) {
+                                                                // Emit event
+                                                                let event = ProtocolEvent::PeerSuggested(
+                                                                    crate::protocol::PeerSuggestedEvent {
+                                                                        introducer_id: suggest.sender_id,
+                                                                        suggested_peer_id: suggest.suggested_peer,
+                                                                        relay_url: suggest.relay_url,
+                                                                        note: suggest.note,
+                                                                    }
+                                                                );
+                                                                let _ = event_tx.send(event).await;
+                                                                info!(
+                                                                    suggested = %hex::encode(&suggest.suggested_peer[..8]),
+                                                                    "PEER_SUGGESTED via Harbor pull"
+                                                                );
+                                                            }
+                                                        }
+                                                        ControlPacketType::ConnectRequest => {
+                                                            if let Ok(req) = postcard::from_bytes::<ConnectRequest>(ctrl_data) {
+                                                                // Store connection and emit event
+                                                                {
+                                                                    let db_lock = db.lock().await;
+                                                                    let _ = crate::data::upsert_connection(
+                                                                        &db_lock,
+                                                                        &req.sender_id,
+                                                                        crate::data::ConnectionState::PendingIncoming,
+                                                                        req.display_name.as_deref(),
+                                                                        req.relay_url.as_deref(),
+                                                                        Some(&req.request_id),
+                                                                    );
+                                                                }
+                                                                let event = ProtocolEvent::ConnectionRequest(
+                                                                    crate::protocol::ConnectionRequestEvent {
+                                                                        peer_id: req.sender_id,
+                                                                        request_id: req.request_id,
+                                                                        display_name: req.display_name,
+                                                                        relay_url: req.relay_url,
+                                                                    }
+                                                                );
+                                                                let _ = event_tx.send(event).await;
+                                                            }
+                                                        }
+                                                        ControlPacketType::ConnectAccept => {
+                                                            if let Ok(accept) = postcard::from_bytes::<ConnectAccept>(ctrl_data) {
+                                                                {
+                                                                    let db_lock = db.lock().await;
+                                                                    let _ = crate::data::update_connection_state(
+                                                                        &db_lock,
+                                                                        &accept.sender_id,
+                                                                        crate::data::ConnectionState::Connected,
+                                                                    );
+                                                                }
+                                                                let event = ProtocolEvent::ConnectionAccepted(
+                                                                    crate::protocol::ConnectionAcceptedEvent {
+                                                                        peer_id: accept.sender_id,
+                                                                        request_id: accept.request_id,
+                                                                    }
+                                                                );
+                                                                let _ = event_tx.send(event).await;
+                                                            }
+                                                        }
+                                                        ControlPacketType::ConnectDecline => {
+                                                            if let Ok(decline) = postcard::from_bytes::<ConnectDecline>(ctrl_data) {
+                                                                {
+                                                                    let db_lock = db.lock().await;
+                                                                    let _ = crate::data::update_connection_state(
+                                                                        &db_lock,
+                                                                        &decline.sender_id,
+                                                                        crate::data::ConnectionState::Declined,
+                                                                    );
+                                                                }
+                                                                let event = ProtocolEvent::ConnectionDeclined(
+                                                                    crate::protocol::ConnectionDeclinedEvent {
+                                                                        request_id: decline.request_id,
+                                                                        peer_id: decline.sender_id,
+                                                                        reason: decline.reason,
+                                                                    }
+                                                                );
+                                                                let _ = event_tx.send(event).await;
+                                                            }
+                                                        }
+                                                        ControlPacketType::RemoveMember => {
+                                                            if let Ok(remove) = postcard::from_bytes::<RemoveMember>(ctrl_data) {
+                                                                {
+                                                                    let db_lock = db.lock().await;
+                                                                    // Store new epoch key
+                                                                    let _ = crate::data::store_epoch_key(
+                                                                        &db_lock,
+                                                                        &remove.topic_id,
+                                                                        remove.new_epoch,
+                                                                        &remove.new_epoch_key,
+                                                                    );
+                                                                    // Remove the member from our local list
+                                                                    let _ = crate::data::remove_topic_member(
+                                                                        &db_lock,
+                                                                        &remove.topic_id,
+                                                                        &remove.removed_member,
+                                                                    );
+                                                                }
+                                                                let event = ProtocolEvent::TopicEpochRotated(
+                                                                    crate::protocol::TopicEpochRotatedEvent {
+                                                                        topic_id: remove.topic_id,
+                                                                        new_epoch: remove.new_epoch,
+                                                                        removed_member: remove.removed_member,
+                                                                    }
+                                                                );
+                                                                let _ = event_tx.send(event).await;
+                                                            }
+                                                        }
+                                                        // TopicJoin/TopicLeave are topic-scoped, not DM
+                                                        _ => {
+                                                            debug!(packet_type = ?ctrl_type, "ignoring unexpected control packet type in DM pull");
+                                                        }
+                                                    }
+                                                } else {
+                                                    debug!(type_byte = plaintext[0], "unknown control packet type byte");
+                                                }
+
+                                                // Send ack to Harbor Node
+                                                let ack = crate::network::harbor::protocol::DeliveryAck {
+                                                    packet_id: packet_info.packet_id,
+                                                    recipient_id: our_id,
+                                                };
+                                                let _ = harbor_service.send_harbor_ack(harbor_node, &ack).await;
+                                                continue;
+                                            }
+
+                                            // Regular DM message (0x80+ type byte)
                                             match DmMessage::decode(&plaintext) {
                                                 Ok(DmMessage::Content(data)) => {
                                                     let event = ProtocolEvent::DmReceived(crate::protocol::DmReceivedEvent {
@@ -274,8 +453,38 @@ impl Protocol {
                                     HarborPacketType::Content | HarborPacketType::Leave => VerificationMode::Full,
                                 };
 
+                                // All topics have stored epoch keys (at least epoch 0)
+                                // Look up the stored epoch key for the packet's epoch
+                                let epoch_key_opt = {
+                                    let db_lock = db.lock().await;
+                                    crate::data::get_epoch_key(&db_lock, &topic_id, send_packet.epoch)
+                                        .ok()
+                                        .flatten()
+                                };
+
+                                let decrypt_result = match epoch_key_opt {
+                                    Some(stored_key) => {
+                                        // Derive encryption keys from stored epoch secret
+                                        let epoch_keys = EpochKeys::derive_from_secret(
+                                            send_packet.epoch,
+                                            &stored_key.key_data,
+                                        );
+                                        verify_and_decrypt_with_epoch(&send_packet, &topic_id, &epoch_keys, mode)
+                                    }
+                                    None => {
+                                        // No epoch key stored - member was likely removed
+                                        warn!(
+                                            topic = %hex::encode(&topic_id[..8]),
+                                            epoch = send_packet.epoch,
+                                            packet_id = %hex::encode(&packet_info.packet_id[..8]),
+                                            "NO_EPOCH_KEY_FOR_EPOCH - cannot decrypt (member likely removed)"
+                                        );
+                                        continue;
+                                    }
+                                };
+
                                 // Verify and decrypt
-                                match verify_and_decrypt_packet_with_mode(&send_packet, &topic_id, mode) {
+                                match decrypt_result {
                                     Ok(plaintext) => {
                                         // Mark as pulled
                                         {
@@ -349,8 +558,7 @@ impl Protocol {
                                                             ) {
                                                                 warn!(error = %e, "failed to store blob metadata");
                                                             } else {
-                                                                let total_chunks = ((ann.total_size + CHUNK_SIZE - 1) 
-                                                                    / CHUNK_SIZE) as u32;
+                                                                let total_chunks = ann.total_size.div_ceil(CHUNK_SIZE) as u32;
                                                                 let _ = init_blob_sections(
                                                                     &db_lock,
                                                                     &ann.hash,

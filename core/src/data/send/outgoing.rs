@@ -124,7 +124,7 @@ pub fn get_outgoing_packet(
         "SELECT packet_id, topic_id, harbor_id, packet_data, created_at, replicated_to_harbor, packet_type
          FROM outgoing_packets WHERE packet_id = ?1",
         [packet_id.as_slice()],
-        |row| parse_outgoing_packet_row(row),
+        parse_outgoing_packet_row,
     )
     .optional()
 }
@@ -191,7 +191,7 @@ pub fn get_packets_needing_replication(
     )?;
 
     let packets = stmt
-        .query_map([], |row| parse_outgoing_packet_row(row))?
+        .query_map([], parse_outgoing_packet_row)?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(packets)

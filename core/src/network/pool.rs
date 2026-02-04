@@ -248,7 +248,7 @@ impl ConnectionPool {
         let now = std::time::Instant::now();
 
         // Find oldest idle connection
-        while let Some(oldest_id) = lru.front().copied() {
+        if let Some(oldest_id) = lru.front().copied() {
             if let Some(cached) = connections.get(&oldest_id) {
                 // Check if idle
                 if now.duration_since(cached.last_used) > self.config.idle_timeout {
@@ -260,13 +260,12 @@ impl ConnectionPool {
                     cached.connection.close(0u32.into(), b"idle");
                     connections.remove(&oldest_id);
                     lru.pop_front();
-                    return;
                 }
+                // If oldest isn't idle, none will be
             } else {
                 // Connection not found, remove from LRU
                 lru.pop_front();
             }
-            break; // If oldest isn't idle, none will be
         }
     }
 

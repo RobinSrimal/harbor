@@ -1,22 +1,28 @@
 //! Send Protocol - Core messaging for Harbor
 //!
-//! The Send protocol delivers encrypted packets to topic members and handles
-//! read receipts via irpc RPC (bi-stream request/response).
+//! The Send protocol delivers messages to topic members and DM recipients
+//! via irpc RPC (bi-stream request/response).
 //!
 //! # Protocol Flow
 //!
-//! 1. Create packet (encrypt → MAC → sign)
-//! 2. Send to all topic members via irpc DeliverPacket RPC
+//! 1. Store raw payload in outgoing_packets table
+//! 2. Deliver raw payload to recipients via DeliverTopic/DeliverDm (QUIC TLS provides encryption)
 //! 3. Receive Receipt inline as RPC response
-//! 4. If receipts missing after timeout, replicate to Harbor Nodes
+//! 4. If receipts missing after timeout, seal() and replicate to Harbor Nodes
+//!
+//! # Direct vs Harbor Delivery
+//!
+//! - **Direct delivery**: Uses QUIC TLS only (no app-level crypto) - fast path
+//! - **Harbor storage**: Uses seal() to apply full crypto stack (encrypt + MAC + sign)
 //!
 //! # Module Structure
 //!
 //! - `outgoing.rs` - SendService (single entry point for all send operations)
 //! - `incoming.rs` - Receiving packets (process_incoming_packet, ProcessResult, ProcessError)
-//! - `protocol.rs` - irpc wire protocol (SendRpcProtocol, DeliverPacket, Receipt)
+//! - `protocol.rs` - irpc wire protocol (SendRpcProtocol, DeliverTopic, DeliverDm, Receipt)
 //! - `pool.rs` - Connection pooling
 //! - `topic_messages.rs` - TopicMessage format
+//! - `dm_messages.rs` - DmMessage format
 
 pub mod dm_messages;
 pub mod incoming;

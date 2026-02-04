@@ -3,7 +3,6 @@
 //! Type definitions for incoming packet processing. The actual logic
 //! lives on `SendService` methods in `outgoing.rs`.
 
-use crate::resilience::PoWVerifyResult;
 use crate::security::PacketError;
 use super::protocol::Receipt;
 
@@ -51,26 +50,17 @@ pub struct ProcessResult {
     pub content_payload: Option<Vec<u8>>,
 }
 
-/// Error during PoW-protected receive operations
+/// Error during receive operations
 #[derive(Debug)]
 pub enum ReceiveError {
     /// Failed to verify/decrypt packet
     PacketVerification(PacketError),
-    /// Proof of Work required but not provided
-    PoWRequired,
-    /// Invalid Proof of Work
-    InvalidPoW(PoWVerifyResult),
-    /// PoW target mismatch (wrong topic or recipient)
-    PoWTargetMismatch,
 }
 
 impl std::fmt::Display for ReceiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReceiveError::PacketVerification(e) => write!(f, "packet verification failed: {}", e),
-            ReceiveError::PoWRequired => write!(f, "proof of work required"),
-            ReceiveError::InvalidPoW(result) => write!(f, "invalid proof of work: {}", result),
-            ReceiveError::PoWTargetMismatch => write!(f, "proof of work target mismatch"),
         }
     }
 }
@@ -117,18 +107,6 @@ mod tests {
 
         let err = ProcessError::SenderMismatch("wrong sender".to_string());
         assert!(err.to_string().contains("sender mismatch"));
-    }
-
-    #[test]
-    fn test_receive_error_display() {
-        let err = ReceiveError::PoWRequired;
-        assert_eq!(err.to_string(), "proof of work required");
-
-        let err = ReceiveError::PoWTargetMismatch;
-        assert_eq!(err.to_string(), "proof of work target mismatch");
-
-        let err = ReceiveError::InvalidPoW(PoWVerifyResult::Expired);
-        assert!(err.to_string().contains("invalid proof of work"));
     }
 
     #[test]

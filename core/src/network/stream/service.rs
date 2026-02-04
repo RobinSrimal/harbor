@@ -476,14 +476,11 @@ impl StreamService {
         sender_id: [u8; 32],
         source: crate::network::send::PacketSource,
     ) {
-        match msg {
-            TopicMessage::StreamRequest(req) => {
-                self.handle_incoming_stream_request(
-                    &req.request_id, topic_id, sender_id,
-                    &req.name, &req.catalog, source,
-                ).await;
-            }
-            _ => {}
+        if let TopicMessage::StreamRequest(req) = msg {
+            self.handle_incoming_stream_request(
+                &req.request_id, topic_id, sender_id,
+                &req.name, &req.catalog, source,
+            ).await;
         }
     }
 

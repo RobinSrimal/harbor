@@ -493,7 +493,16 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                     | ProtocolEvent::DmSyncUpdate(_)
                     | ProtocolEvent::DmSyncRequest(_)
                     | ProtocolEvent::DmSyncResponse(_)
-                    | ProtocolEvent::DmFileAnnounced(_) => continue,
+                    | ProtocolEvent::DmFileAnnounced(_)
+                    // Control events — not yet surfaced to test-app frontend
+                    | ProtocolEvent::ConnectionRequest(_)
+                    | ProtocolEvent::ConnectionAccepted(_)
+                    | ProtocolEvent::ConnectionDeclined(_)
+                    | ProtocolEvent::TopicInviteReceived(_)
+                    | ProtocolEvent::TopicMemberJoined(_)
+                    | ProtocolEvent::TopicMemberLeft(_)
+                    | ProtocolEvent::TopicEpochRotated(_)
+                    | ProtocolEvent::PeerSuggested(_) => continue,
                 };
                 events.push(app_event);
             }

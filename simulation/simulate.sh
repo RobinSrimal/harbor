@@ -54,11 +54,19 @@
 #     sync-offline     - Offline node receives sync updates
 #     sync-initial     - New member gets full document state
 #
+#   Control:
+#     control-connect       - Control connection flow with invite token
+#     control-topic-invite  - Topic invite/accept flow via Control ALPN
+#     control-suggest       - Peer introduction/suggestion flow
+#     control-offline       - Offline delivery via Harbor for Control messages
+#     control-remove-member - Member removal with epoch key rotation
+#
 #   Suites:
 #     membership       - Run all membership scenarios
 #     advanced         - Run all advanced scenarios
 #     share            - Run all file sharing scenarios
 #     sync             - Run all CRDT sync scenarios
+#     control          - Run all control scenarios
 #     full             - Run all scenarios (default)
 
 set -e
@@ -116,6 +124,11 @@ source "$SCRIPT_DIR/scenarios/dm_share_basic.sh"
 source "$SCRIPT_DIR/scenarios/dm_share_offline.sh"
 source "$SCRIPT_DIR/scenarios/dm_stream_basic.sh"
 source "$SCRIPT_DIR/scenarios/dm_stream_offline.sh"
+source "$SCRIPT_DIR/scenarios/control_connect.sh"
+source "$SCRIPT_DIR/scenarios/control_topic_invite.sh"
+source "$SCRIPT_DIR/scenarios/control_suggest.sh"
+source "$SCRIPT_DIR/scenarios/control_offline.sh"
+source "$SCRIPT_DIR/scenarios/control_remove_member.sh"
 source "$SCRIPT_DIR/scenarios/suites.sh"
 
 # ============================================================================
@@ -289,6 +302,25 @@ case $SCENARIO in
     dm-stream-offline)
         scenario_dm_stream_offline
         ;;
+    # Control scenarios
+    control-connect)
+        scenario_control_connect
+        ;;
+    control-topic-invite)
+        scenario_control_topic_invite
+        ;;
+    control-suggest)
+        scenario_control_suggest
+        ;;
+    control-offline)
+        scenario_control_offline
+        ;;
+    control-remove-member)
+        scenario_control_remove_member
+        ;;
+    control)
+        run_control_suite
+        ;;
     advanced)
         run_advanced_suite
         ;;
@@ -310,7 +342,8 @@ case $SCENARIO in
         echo "  Stream:     stream-basic, stream-reject, stream-end"
         echo "  DM:         dm-basic, dm-offline"
         echo "  DM Stream:  dm-stream-basic, dm-stream-offline"
-        echo "  Suites:     membership, advanced, share, sync, full"
+        echo "  Control:    control-connect, control-topic-invite, control-suggest, control-offline, control-remove-member"
+        echo "  Suites:     membership, advanced, share, sync, control, full"
         echo ""
         exit 1
         ;;

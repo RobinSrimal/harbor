@@ -1,16 +1,15 @@
 //! Send protocol wire format
 //!
 //! Uses irpc for typed RPC over QUIC bi-streams:
-//! - DeliverPacket: Send a packet, receive a Receipt as response
+//! - DeliverTopic: Send raw topic payload, receive a Receipt as response
+//! - DeliverDm: Send raw DM payload, receive a Receipt as response
 //!
-//! This replaces the previous manual encode/decode with irpc's
-//! varint length-prefix + postcard serialization.
+//! QUIC TLS provides transport encryption - no app-level crypto needed for direct delivery.
+//! For Harbor storage, packets are sealed on-the-fly during replication (see seal module).
 
 use irpc::channel::oneshot;
 use irpc::rpc_requests;
 use serde::{Deserialize, Serialize};
-
-use crate::security::SendPacket;
 
 /// Send protocol ALPN
 pub const SEND_ALPN: &[u8] = b"harbor/send/0";
@@ -31,30 +30,83 @@ impl Receipt {
     }
 }
 
-/// Deliver a packet to a peer
+// =============================================================================
+// Direct delivery messages (QUIC TLS only, no app-level crypto)
+// =============================================================================
+
+/// Direct delivery of a topic message (raw payload over QUIC TLS)
+///
+/// Used for direct peer-to-peer delivery when recipient is online.
+/// QUIC TLS provides transport encryption - no app-level crypto needed.
+///
+/// Uses `harbor_id` (hash of topic_id) instead of raw topic_id to avoid
+/// exposing topic membership on the wire. The `membership_proof` proves
+/// the sender knows the actual topic_id without revealing it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeliverPacket {
-    /// The packet to deliver
-    pub packet: SendPacket,
+pub struct DeliverTopic {
+    /// Hash of topic_id - hides actual topic from wire
+    pub harbor_id: [u8; 32],
+    /// Cryptographic proof of topic membership: BLAKE3(topic_id || harbor_id || sender_id)
+    pub membership_proof: [u8; 32],
+    /// Raw encoded TopicMessage payload
+    pub payload: Vec<u8>,
+}
+
+/// Create a membership proof for DeliverTopic
+///
+/// The proof is BLAKE3(topic_id || harbor_id || sender_id).
+/// Verifying this proves the sender knows the topic_id (the shared secret).
+pub fn create_membership_proof(
+    topic_id: &[u8; 32],
+    harbor_id: &[u8; 32],
+    sender_id: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(topic_id);
+    hasher.update(harbor_id);
+    hasher.update(sender_id);
+    *hasher.finalize().as_bytes()
+}
+
+/// Verify a membership proof for DeliverTopic
+///
+/// Returns true if the proof matches, proving sender knows topic_id.
+pub fn verify_membership_proof(
+    topic_id: &[u8; 32],
+    harbor_id: &[u8; 32],
+    sender_id: &[u8; 32],
+    proof: &[u8; 32],
+) -> bool {
+    let expected = create_membership_proof(topic_id, harbor_id, sender_id);
+    expected == *proof
+}
+
+/// Direct delivery of a DM (raw payload over QUIC TLS)
+///
+/// Used for direct peer-to-peer delivery when recipient is online.
+/// QUIC TLS provides transport encryption - no app-level crypto needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliverDm {
+    /// Raw encoded DmMessage payload
+    pub payload: Vec<u8>,
 }
 
 /// Send RPC protocol definition using irpc
 #[rpc_requests(message = SendRpcMessage)]
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SendRpcProtocol {
-    /// Deliver a packet and receive a receipt
+    /// Direct topic message delivery (QUIC TLS only, raw payload)
     #[rpc(tx = oneshot::Sender<Receipt>)]
-    DeliverPacket(DeliverPacket),
+    DeliverTopic(DeliverTopic),
+
+    /// Direct DM delivery (QUIC TLS only, raw payload)
+    #[rpc(tx = oneshot::Sender<Receipt>)]
+    DeliverDm(DeliverDm),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::{create_packet, generate_key_pair};
-
-    fn test_topic_id() -> [u8; 32] {
-        [42u8; 32]
-    }
 
     #[test]
     fn test_receipt_creation() {
@@ -72,18 +124,50 @@ mod tests {
     }
 
     #[test]
-    fn test_deliver_packet_serialization() {
-        let kp = generate_key_pair();
-        let packet = create_packet(
-            &test_topic_id(),
-            &kp.private_key,
-            &kp.public_key,
-            b"Hello!",
-        ).unwrap();
+    fn test_deliver_topic_serialization() {
+        let topic_id = [42u8; 32];
+        let sender_id = [1u8; 32];
+        let harbor_id = crate::security::harbor_id_from_topic(&topic_id);
+        let proof = create_membership_proof(&topic_id, &harbor_id, &sender_id);
 
-        let deliver = DeliverPacket { packet: packet.clone() };
+        let deliver = DeliverTopic {
+            harbor_id,
+            membership_proof: proof,
+            payload: b"Hello!".to_vec(),
+        };
         let bytes = postcard::to_allocvec(&deliver).unwrap();
-        let decoded: DeliverPacket = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.packet.packet_id, packet.packet_id);
+        let decoded: DeliverTopic = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.harbor_id, deliver.harbor_id);
+        assert_eq!(decoded.membership_proof, deliver.membership_proof);
+        assert_eq!(decoded.payload, deliver.payload);
+    }
+
+    #[test]
+    fn test_membership_proof() {
+        let topic_id = [42u8; 32];
+        let sender_id = [1u8; 32];
+        let harbor_id = crate::security::harbor_id_from_topic(&topic_id);
+        let proof = create_membership_proof(&topic_id, &harbor_id, &sender_id);
+
+        // Verify with correct values
+        assert!(verify_membership_proof(&topic_id, &harbor_id, &sender_id, &proof));
+
+        // Verify with wrong topic_id fails
+        let wrong_topic = [99u8; 32];
+        assert!(!verify_membership_proof(&wrong_topic, &harbor_id, &sender_id, &proof));
+
+        // Verify with wrong sender_id fails
+        let wrong_sender = [99u8; 32];
+        assert!(!verify_membership_proof(&topic_id, &harbor_id, &wrong_sender, &proof));
+    }
+
+    #[test]
+    fn test_deliver_dm_serialization() {
+        let deliver = DeliverDm {
+            payload: b"Hello DM!".to_vec(),
+        };
+        let bytes = postcard::to_allocvec(&deliver).unwrap();
+        let decoded: DeliverDm = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.payload, deliver.payload);
     }
 }

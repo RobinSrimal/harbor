@@ -354,20 +354,19 @@ impl DhtActor {
             // Notify service to add verified nodes to routing table
             if !verified.is_empty() {
                 info!(count = verified.len(), "verified {} candidate nodes", verified.len());
-                if let Some(ref svc_weak) = service {
-                    if let Some(svc) = svc_weak.upgrade() {
-                        svc.nodes_seen(&verified).await.ok();
-                    }
+                if let Some(ref svc_weak) = service
+                    && let Some(svc) = svc_weak.upgrade()
+                {
+                    svc.nodes_seen(&verified).await.ok();
                 }
             }
 
             // Send relay URL confirmation results back to actor
-            if !relay_confirmations.is_empty() {
-                if let Some(ref svc_weak) = service {
-                    if let Some(svc) = svc_weak.upgrade() {
-                        svc.confirm_relay_urls(relay_confirmations).await.ok();
-                    }
-                }
+            if !relay_confirmations.is_empty()
+                && let Some(ref svc_weak) = service
+                && let Some(svc) = svc_weak.upgrade()
+            {
+                svc.confirm_relay_urls(relay_confirmations).await.ok();
             }
 
             // Log failed verifications at INFO level for visibility

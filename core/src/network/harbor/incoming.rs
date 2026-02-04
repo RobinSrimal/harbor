@@ -8,7 +8,7 @@
 //! - Connection handler (accepts QUIC connections, dispatches to handlers)
 
 use rusqlite::Connection;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 use crate::data::harbor::{
     all_recipients_delivered, cache_packet, delete_packet, get_packets_for_recipient,
@@ -120,50 +120,6 @@ impl HarborService {
 
         // Check rate limits (both connection and harbor limits)
         self.check_store_rate_limit(&request.sender_id, &request.harbor_id)?;
-
-        // Verify Proof of Work if enabled
-        if self.pow_config.enabled {
-            match &request.proof_of_work {
-                Some(pow) => {
-                    use crate::resilience::{verify_pow, PoWVerifyResult};
-
-                    // Verify PoW is bound to this request
-                    if pow.harbor_id != request.harbor_id {
-                        warn!(
-                            packet_id = %packet_id_hex,
-                            "Harbor STORE: rejected - PoW harbor_id mismatch"
-                        );
-                        return Err(HarborError::InvalidPoW(PoWVerifyResult::InsufficientDifficulty));
-                    }
-                    if pow.packet_id != request.packet_id {
-                        warn!(
-                            packet_id = %packet_id_hex,
-                            "Harbor STORE: rejected - PoW packet_id mismatch"
-                        );
-                        return Err(HarborError::InvalidPoW(PoWVerifyResult::InsufficientDifficulty));
-                    }
-
-                    // Verify PoW meets requirements
-                    let result = verify_pow(pow, &self.pow_config);
-                    if !result.is_valid() {
-                        warn!(
-                            packet_id = %packet_id_hex,
-                            result = %result,
-                            "Harbor STORE: rejected - invalid PoW"
-                        );
-                        return Err(HarborError::InvalidPoW(result));
-                    }
-                    trace!(packet_id = %packet_id_hex, nonce = pow.nonce, "PoW verified");
-                }
-                None => {
-                    warn!(
-                        packet_id = %packet_id_hex,
-                        "Harbor STORE: rejected - PoW required but not provided"
-                    );
-                    return Err(HarborError::PoWRequired);
-                }
-            }
-        }
 
         // Check storage limits before accepting
         let packet_size = request.packet_data.len() as u64;
@@ -644,7 +600,6 @@ mod tests {
             sender_id: sender_keypair.public_key,
             recipients: vec![test_id(40), test_id(41)],
             packet_type: HarborPacketType::Content,
-            proof_of_work: None, // PoW disabled in without_rate_limiting()
         };
 
         let response = service.handle_store(&mut conn, request).unwrap();
@@ -667,7 +622,6 @@ mod tests {
             sender_id: test_id(30),
             recipients: vec![test_id(40)],
             packet_type: HarborPacketType::Content,
-            proof_of_work: None,
         };
 
         let response = service.handle_store(&mut conn, request).unwrap();
@@ -997,7 +951,6 @@ mod tests {
             sender_id: test_id(30),
             recipients: vec![test_id(40)],
             packet_type: HarborPacketType::Content,
-            proof_of_work: None,
         });
 
         // Authenticated node ID is test_id(40)

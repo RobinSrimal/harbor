@@ -189,7 +189,7 @@ pub fn get_cached_packet(
         "SELECT packet_id, harbor_id, sender_id, packet_data, packet_type, synced, created_at, expires_at
          FROM harbor_cache WHERE packet_id = ?1",
         [packet_id.as_slice()],
-        |row| parse_cached_packet_row(row),
+        parse_cached_packet_row,
     )
     .optional()
 }
@@ -228,7 +228,7 @@ pub fn get_packets_for_recipient(
     let packets = stmt
         .query_map(
             params![harbor_id.as_slice(), recipient_id.as_slice(), since_timestamp, now, WILDCARD_RECIPIENT.as_slice()],
-            |row| parse_cached_packet_row(row),
+            parse_cached_packet_row,
         )?
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -321,7 +321,7 @@ pub fn get_packets_for_sync(
     )?;
 
     let packets = stmt
-        .query_map(params![harbor_id.as_slice(), now], |row| parse_cached_packet_row(row))?
+        .query_map(params![harbor_id.as_slice(), now], parse_cached_packet_row)?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(packets)

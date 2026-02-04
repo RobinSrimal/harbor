@@ -556,3 +556,259 @@ extract_request_id() {
     echo "$json" | grep -o '"request_id":"[^"]*"' | cut -d'"' -f4
 }
 
+# ============================================================================
+# CONTROL API HELPERS
+# ============================================================================
+
+# Request a connection to a peer
+# Usage: api_control_connect <node> <peer_hex> [relay_url] [display_name] [token_hex]
+api_control_connect() {
+    local n=$1
+    local peer=$2
+    local relay_url=${3:-}
+    local display_name=${4:-}
+    local token=${5:-}
+    local port=$(api_port $n)
+
+    local body="{\"peer\":\"$peer\""
+    [ -n "$relay_url" ] && body="$body,\"relay_url\":\"$relay_url\""
+    [ -n "$display_name" ] && body="$body,\"display_name\":\"$display_name\""
+    [ -n "$token" ] && body="$body,\"token\":\"$token\""
+    body="$body}"
+
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/control/connect" \
+        -H "Content-Type: application/json" \
+        -d "$body")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/control/connect"
+    echo "$result"
+}
+
+# Accept a pending connection request
+# Usage: api_control_accept <node> <request_id_hex>
+api_control_accept() {
+    local n=$1
+    local request_id=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/control/accept" \
+        -H "Content-Type: application/json" \
+        -d "{\"request_id\":\"$request_id\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/control/accept"
+    echo "$result"
+}
+
+# Decline a pending connection request
+# Usage: api_control_decline <node> <request_id_hex> [reason]
+api_control_decline() {
+    local n=$1
+    local request_id=$2
+    local reason=${3:-}
+    local port=$(api_port $n)
+    local body="{\"request_id\":\"$request_id\""
+    [ -n "$reason" ] && body="$body,\"reason\":\"$reason\""
+    body="$body}"
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/control/decline" \
+        -H "Content-Type: application/json" \
+        -d "$body")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/control/decline"
+    echo "$result"
+}
+
+# Generate a connect invite (for QR code / invite string)
+# Usage: api_control_generate_invite <node>
+# Returns: JSON with endpoint_id, token, relay_url, invite
+api_control_generate_invite() {
+    local n=$1
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/control/invite")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/control/invite"
+    echo "$result"
+}
+
+# Connect using an invite string
+# Usage: api_control_connect_with_invite <node> <invite_string>
+api_control_connect_with_invite() {
+    local n=$1
+    local invite=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/control/connect-with-invite" \
+        -H "Content-Type: application/json" \
+        -d "{\"invite\":\"$invite\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/control/connect-with-invite"
+    echo "$result"
+}
+
+# Block a peer
+# Usage: api_control_block <node> <peer_hex>
+api_control_block() {
+    local n=$1
+    local peer=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/control/block" \
+        -H "Content-Type: application/json" \
+        -d "{\"peer\":\"$peer\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/control/block"
+    echo "$result"
+}
+
+# Unblock a peer
+# Usage: api_control_unblock <node> <peer_hex>
+api_control_unblock() {
+    local n=$1
+    local peer=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/control/unblock" \
+        -H "Content-Type: application/json" \
+        -d "{\"peer\":\"$peer\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/control/unblock"
+    echo "$result"
+}
+
+# List all connections
+# Usage: api_control_list_connections <node>
+api_control_list_connections() {
+    local n=$1
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/api/control/connections")
+    local exit_code=$?
+    log_api_error $exit_code $n "GET /api/control/connections"
+    echo "$result"
+}
+
+# Invite a peer to a topic
+# Usage: api_control_topic_invite <node> <peer_hex> <topic_hex>
+api_control_topic_invite() {
+    local n=$1
+    local peer=$2
+    local topic=$3
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/control/topic-invite" \
+        -H "Content-Type: application/json" \
+        -d "{\"peer\":\"$peer\",\"topic\":\"$topic\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/control/topic-invite"
+    echo "$result"
+}
+
+# Accept a topic invitation
+# Usage: api_control_topic_accept <node> <message_id_hex>
+api_control_topic_accept() {
+    local n=$1
+    local message_id=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/control/topic-accept" \
+        -H "Content-Type: application/json" \
+        -d "{\"message_id\":\"$message_id\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/control/topic-accept"
+    echo "$result"
+}
+
+# Decline a topic invitation
+# Usage: api_control_topic_decline <node> <message_id_hex>
+api_control_topic_decline() {
+    local n=$1
+    local message_id=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/control/topic-decline" \
+        -H "Content-Type: application/json" \
+        -d "{\"message_id\":\"$message_id\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/control/topic-decline"
+    echo "$result"
+}
+
+# Leave a topic via Control protocol
+# Usage: api_control_leave <node> <topic_hex>
+api_control_leave() {
+    local n=$1
+    local topic=$2
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/control/leave" \
+        -H "Content-Type: application/json" \
+        -d "{\"topic\":\"$topic\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/control/leave"
+    echo "$result"
+}
+
+# Remove a member from a topic (admin only)
+# Usage: api_control_remove_member <node> <topic_hex> <member_hex>
+api_control_remove_member() {
+    local n=$1
+    local topic=$2
+    local member=$3
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/control/remove-member" \
+        -H "Content-Type: application/json" \
+        -d "{\"topic\":\"$topic\",\"member\":\"$member\"}")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/control/remove-member"
+    echo "$result"
+}
+
+# Suggest a peer introduction
+# Usage: api_control_suggest <node> <to_peer_hex> <suggested_peer_hex> [note]
+api_control_suggest() {
+    local n=$1
+    local to_peer=$2
+    local suggested_peer=$3
+    local note=${4:-}
+    local port=$(api_port $n)
+    local body="{\"to_peer\":\"$to_peer\",\"suggested_peer\":\"$suggested_peer\""
+    [ -n "$note" ] && body="$body,\"note\":\"$note\""
+    body="$body}"
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 30 -X POST "http://127.0.0.1:$port/api/control/suggest" \
+        -H "Content-Type: application/json" \
+        -d "$body")
+    local exit_code=$?
+    log_api_error $exit_code $n "POST /api/control/suggest"
+    echo "$result"
+}
+
+# List pending topic invites
+# Usage: api_control_pending_invites <node>
+api_control_pending_invites() {
+    local n=$1
+    local port=$(api_port $n)
+    local result
+    result=$(curl -s --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/api/control/pending-invites")
+    local exit_code=$?
+    log_api_error $exit_code $n "GET /api/control/pending-invites"
+    echo "$result"
+}
+
+# Extract invite string from generate_invite response
+# Usage: extract_invite_string <json>
+extract_invite_string() {
+    local json=$1
+    echo "$json" | grep -o '"invite":"[^"]*"' | cut -d'"' -f4
+}
+
+# Extract message_id from topic invite response
+# Usage: extract_message_id <json>
+extract_message_id() {
+    local json=$1
+    echo "$json" | grep -o '"message_id":"[^"]*"' | cut -d'"' -f4
+}
+

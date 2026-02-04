@@ -133,7 +133,7 @@ impl Protocol {
                         
                         // Apply the response
                         let mut db_lock = db.lock().await;
-                        if let Err(e) = harbor_service.apply_sync_response(&mut *db_lock, response) {
+                        if let Err(e) = harbor_service.apply_sync_response(&mut db_lock, response) {
                             warn!(
                                 harbor_id = %harbor_id_hex,
                                 partner = %partner_hex,

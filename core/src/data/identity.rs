@@ -127,6 +127,18 @@ pub fn has_identity(conn: &Connection) -> rusqlite::Result<bool> {
     Ok(count > 0)
 }
 
+/// Ensure our endpoint ID is in the peers table
+///
+/// This allows us to be the admin of topics we create and be a member of topics.
+/// Uses INSERT OR IGNORE to handle the case where we're already in the table.
+pub fn ensure_self_in_peers(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO peers (endpoint_id, last_seen) VALUES (?1, strftime('%s', 'now'))",
+        params![endpoint_id.as_slice()],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

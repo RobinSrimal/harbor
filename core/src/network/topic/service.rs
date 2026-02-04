@@ -15,8 +15,9 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, trace};
 
 use crate::data::{
-    add_topic_member, cleanup_pulled_for_topic, get_all_topics,
-    get_topic_members, get_peer_relay_info, remove_topic_member, subscribe_topic, unsubscribe_topic,
+    add_topic_member, cleanup_pulled_for_topic, ensure_peer_exists, get_all_topics,
+    get_topic_admin, get_topic_members, get_peer_relay_info, remove_topic_member,
+    subscribe_topic_with_admin, unsubscribe_topic,
     LocalIdentity, WILDCARD_RECIPIENT,
 };
 use crate::network::harbor::protocol::HarborPacketType;
@@ -105,13 +106,17 @@ impl TopicService {
 
         {
             let db = self.db.lock().await;
-            subscribe_topic(&db, &topic_id)
+            // Ensure we're in the peers table (for FK constraint)
+            ensure_peer_exists(&db, &our_id)
+                .map_err(|e| TopicError::Database(e.to_string()))?;
+            // Create topic with us as admin
+            subscribe_topic_with_admin(&db, &topic_id, &our_id)
                 .map_err(|e| TopicError::Database(e.to_string()))?;
             add_topic_member(&db, &topic_id, &our_id)
                 .map_err(|e| TopicError::Database(e.to_string()))?;
         }
 
-        Ok(TopicInvite::new_with_info(topic_id, vec![our_info]))
+        Ok(TopicInvite::new_with_info(topic_id, our_id, vec![our_info]))
     }
 
     /// Join an existing topic
@@ -122,10 +127,22 @@ impl TopicService {
     pub async fn join_topic(&self, invite: TopicInvite) -> Result<(), TopicError> {
         let our_id = self.endpoint_id();
         let member_ids = invite.member_ids();
+        // Get admin from invite (falls back to first member for legacy invites)
+        let admin_id = invite.admin_id().unwrap_or(our_id);
 
         {
             let db = self.db.lock().await;
-            subscribe_topic(&db, &invite.topic_id)
+            // Ensure all peers exist in the peers table (for FK constraints)
+            ensure_peer_exists(&db, &our_id)
+                .map_err(|e| TopicError::Database(e.to_string()))?;
+            ensure_peer_exists(&db, &admin_id)
+                .map_err(|e| TopicError::Database(e.to_string()))?;
+            for member_id in &member_ids {
+                ensure_peer_exists(&db, member_id)
+                    .map_err(|e| TopicError::Database(e.to_string()))?;
+            }
+            // Create topic subscription with the admin from invite
+            subscribe_topic_with_admin(&db, &invite.topic_id, &admin_id)
                 .map_err(|e| TopicError::Database(e.to_string()))?;
 
             add_topic_member(&db, &invite.topic_id, &our_id)
@@ -245,6 +262,11 @@ impl TopicService {
             return Err(TopicError::TopicNotFound);
         }
 
+        // Get the admin for this topic
+        let admin_id = get_topic_admin(&db, topic_id)
+            .map_err(|e| TopicError::Database(e.to_string()))?
+            .ok_or(TopicError::TopicNotFound)?;
+
         let our_id = self.endpoint_id();
         let our_relay = self.relay_url();
 
@@ -272,6 +294,6 @@ impl TopicService {
             })
             .collect();
 
-        Ok(TopicInvite::new_with_info(*topic_id, member_info))
+        Ok(TopicInvite::new_with_info(*topic_id, admin_id, member_info))
     }
 }

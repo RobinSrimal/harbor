@@ -85,15 +85,7 @@ pub struct ProtocolConfig {
     /// Cleanup interval for expired data (seconds)
     /// Default: 3600 (1 hour)
     pub cleanup_interval_secs: u64,
-    
-    /// Enable proof of work for Harbor stores
-    /// Default: true
-    pub enable_pow: bool,
-    
-    /// PoW difficulty (leading zero bits)
-    /// Default: 18 (~10-50ms)
-    pub pow_difficulty: u8,
-    
+
     /// How often to check for incomplete blobs and retry pulling (seconds)
     /// Default: 30
     pub share_pull_interval_secs: u64,
@@ -122,8 +114,6 @@ impl fmt::Debug for ProtocolConfig {
             .field("dht_stable_refresh_interval_secs", &self.dht_stable_refresh_interval_secs)
             .field("dht_save_interval_secs", &self.dht_save_interval_secs)
             .field("cleanup_interval_secs", &self.cleanup_interval_secs)
-            .field("enable_pow", &self.enable_pow)
-            .field("pow_difficulty", &self.pow_difficulty)
             .field("share_pull_interval_secs", &self.share_pull_interval_secs)
             .finish()
     }
@@ -155,8 +145,6 @@ impl Default for ProtocolConfig {
             dht_stable_refresh_interval_secs: 120,
             dht_save_interval_secs: 60,
             cleanup_interval_secs: 3600,
-            enable_pow: true,
-            pow_difficulty: 18,
             share_pull_interval_secs: 30,
         }
     }
@@ -204,18 +192,6 @@ impl ProtocolConfig {
         self
     }
 
-    /// Disable proof of work (not recommended)
-    pub fn without_pow(mut self) -> Self {
-        self.enable_pow = false;
-        self
-    }
-
-    /// Set PoW difficulty (leading zero bits)
-    pub fn with_pow_difficulty(mut self, difficulty: u8) -> Self {
-        self.pow_difficulty = difficulty;
-        self
-    }
-
     /// Set Harbor-to-Harbor sync interval
     pub fn with_harbor_sync_interval(mut self, secs: u64) -> Self {
         self.harbor_sync_interval_secs = secs;
@@ -257,8 +233,6 @@ impl ProtocolConfig {
             dht_stable_refresh_interval_secs: 120, // Same as default
             dht_save_interval_secs: 60,      // Same as default
             cleanup_interval_secs: 3600,     // Same as default
-            enable_pow: false,
-            pow_difficulty: 8,
             share_pull_interval_secs: 10,    // Faster for testing
         }
     }
@@ -351,9 +325,7 @@ mod tests {
     fn test_default_config() {
         let config = ProtocolConfig::default();
         assert_eq!(config.max_storage_bytes, 10 * 1024 * 1024 * 1024);
-        assert!(config.enable_pow);
         assert!(!config.bootstrap_nodes.is_empty());
-        assert_eq!(config.pow_difficulty, 18);
         assert_eq!(config.harbor_sync_interval_secs, 300);
         assert_eq!(config.harbor_sync_candidates, 5);
         assert_eq!(config.harbor_pull_interval_secs, 60);
@@ -368,20 +340,17 @@ mod tests {
     fn test_new_equals_default() {
         let config1 = ProtocolConfig::new();
         let config2 = ProtocolConfig::default();
-        
+
         assert_eq!(config1.max_storage_bytes, config2.max_storage_bytes);
-        assert_eq!(config1.enable_pow, config2.enable_pow);
     }
 
     #[test]
     fn test_builder_pattern() {
         let config = ProtocolConfig::new()
             .with_max_storage(1024)
-            .without_pow()
             .with_bootstrap_node("abc123".to_string());
 
         assert_eq!(config.max_storage_bytes, 1024);
-        assert!(!config.enable_pow);
         assert!(config.bootstrap_nodes.contains(&"abc123".to_string()));
     }
 
@@ -426,7 +395,6 @@ mod tests {
     #[test]
     fn test_testing_config() {
         let config = ProtocolConfig::for_testing();
-        assert!(!config.enable_pow);
         assert!(config.bootstrap_nodes.is_empty());
         assert_eq!(config.max_storage_bytes, 10 * 1024 * 1024); // 10 MB
         assert_eq!(config.harbor_sync_interval_secs, 5);
@@ -446,13 +414,11 @@ mod tests {
             .with_db_path(PathBuf::from("/test"))
             .with_db_key([1u8; 32])
             .with_max_storage(5000)
-            .without_pow()
             .with_bootstrap_nodes(vec!["node1".to_string()]);
 
         assert_eq!(config.db_path, Some(PathBuf::from("/test")));
         assert_eq!(config.db_key, Some([1u8; 32]));
         assert_eq!(config.max_storage_bytes, 5000);
-        assert!(!config.enable_pow);
         assert_eq!(config.bootstrap_nodes, vec!["node1".to_string()]);
     }
 
@@ -490,12 +456,6 @@ mod tests {
     }
 
     #[test]
-    fn test_with_pow_difficulty() {
-        let config = ProtocolConfig::new().with_pow_difficulty(24);
-        assert_eq!(config.pow_difficulty, 24);
-    }
-
-    #[test]
     fn test_with_harbor_sync_interval() {
         let config = ProtocolConfig::new().with_harbor_sync_interval(600);
         assert_eq!(config.harbor_sync_interval_secs, 600);
@@ -520,7 +480,6 @@ mod tests {
             .with_db_key([99u8; 32])
             .with_bootstrap_nodes(vec!["node1".to_string(), "node2".to_string()])
             .with_max_storage(1_000_000)
-            .with_pow_difficulty(20)
             .with_harbor_sync_interval(600)
             .with_harbor_sync_candidates(8)
             .with_harbor_pull_interval(30);
@@ -529,8 +488,6 @@ mod tests {
         assert_eq!(config.db_key, Some([99u8; 32]));
         assert_eq!(config.bootstrap_nodes.len(), 2);
         assert_eq!(config.max_storage_bytes, 1_000_000);
-        assert!(config.enable_pow);
-        assert_eq!(config.pow_difficulty, 20);
         assert_eq!(config.harbor_sync_interval_secs, 600);
         assert_eq!(config.harbor_sync_candidates, 8);
         assert_eq!(config.harbor_pull_interval_secs, 30);

@@ -95,4 +95,18 @@ pub use protocol::{
     StreamRejectedEvent,
     StreamEndedEvent,
     StreamConnectedEvent,
+    // Control types
+    ConnectInvite,
+    ConnectionInfo,
+    ConnectionState,
+    PendingTopicInvite,
+    // Control events
+    ConnectionRequestEvent,
+    ConnectionAcceptedEvent,
+    ConnectionDeclinedEvent,
+    TopicInviteReceivedEvent,
+    TopicMemberJoinedEvent,
+    TopicMemberLeftEvent,
+    TopicEpochRotatedEvent,
+    PeerSuggestedEvent,
 };

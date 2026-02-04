@@ -70,7 +70,6 @@ impl HarborService {
             sender_id: self.endpoint_id,
             recipients: undelivered_recipients,
             packet_type,
-            proof_of_work: None, // Client must set this before sending
         }
     }
 

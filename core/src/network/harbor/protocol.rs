@@ -4,8 +4,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::resilience::ProofOfWork;
-
 /// ALPN for Harbor protocol
 pub const HARBOR_ALPN: &[u8] = b"harbor/store/0";
 
@@ -77,11 +75,6 @@ pub struct StoreRequest {
     pub recipients: Vec<[u8; 32]>,
     /// Type of packet (affects verification mode)
     pub packet_type: HarborPacketType,
-    /// Proof of Work (required when PoW is enabled on Harbor Node)
-    /// 
-    /// The PoW must be bound to this request's `harbor_id` and `packet_id`.
-    /// This prevents replay attacks and spam.
-    pub proof_of_work: Option<ProofOfWork>,
 }
 
 /// Response to store request
@@ -236,7 +229,6 @@ mod tests {
             sender_id: [3u8; 32],
             recipients: vec![[10u8; 32], [11u8; 32]],
             packet_type: HarborPacketType::Content,
-            proof_of_work: None,
         });
 
         let encoded = msg.encode();

@@ -98,17 +98,17 @@ impl DhtService {
                     // Persist requester to database for recovery after restart
                     // Note: relay URL is NOT written here — it flows through the in-memory
                     // node_relay_urls map → save_routing_table → DB with correct freshness
-                    if let Some(requester_id) = requester {
-                        if requester_id != our_id {
-                            let db_lock = db.lock().await;
-                            let entry = crate::data::dht::DhtEntry {
-                                endpoint_id: requester_id,
-                                bucket_index: 0, // Will be recalculated on load
-                                added_at: current_timestamp(),
-                            };
-                            // Ignore errors - best effort
-                            let _ = crate::data::dht::insert_dht_entry(&db_lock, &entry);
-                        }
+                    if let Some(requester_id) = requester
+                        && requester_id != our_id
+                    {
+                        let db_lock = db.lock().await;
+                        let entry = crate::data::dht::DhtEntry {
+                            endpoint_id: requester_id,
+                            bucket_index: 0, // Will be recalculated on load
+                            added_at: current_timestamp(),
+                        };
+                        // Ignore errors - best effort
+                        let _ = crate::data::dht::insert_dht_entry(&db_lock, &entry);
                     }
                 }
             }

@@ -97,7 +97,7 @@ impl StorageConfig {
     pub fn for_testing() -> Self {
         Self {
             max_total_bytes: 10 * 1024 * 1024,            // 10 MB
-            max_per_harbor_bytes: 1 * 1024 * 1024,        // 1 MB per topic
+            max_per_harbor_bytes: 1024 * 1024,             // 1 MB per topic
             enabled: true,
         }
     }

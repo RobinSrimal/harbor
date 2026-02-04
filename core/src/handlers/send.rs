@@ -1,24 +1,20 @@
 //! Send protocol incoming handler
 //!
 //! Handles incoming Send protocol connections via irpc:
-//! - DeliverPacket RPC: receives packet, processes it, responds with Receipt
+//! - DeliverTopic: receives raw topic payload, processes it, responds with Receipt
+//! - DeliverDm: receives raw DM payload, processes it, responds with Receipt
 //!
-//! The handler is responsible for:
-//! - Reading irpc requests from the connection
-//! - Finding matching topic for packets
-//! - Delegating business logic to the service layer
-//! - Responding with receipts via irpc
+//! Direct delivery uses QUIC TLS for encryption - no app-level crypto needed.
+//! The handler verifies topic membership and delegates processing to the service layer.
 
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::data::get_topics_for_member;
-use crate::network::send::protocol::{Receipt, SendRpcMessage, SendRpcProtocol};
-use crate::network::send::{ProcessError, PacketSource};
-use crate::security::harbor_id_from_topic;
-
+use crate::network::send::protocol::{Receipt, SendRpcMessage, SendRpcProtocol, verify_membership_proof};
 use crate::network::send::SendService;
 use crate::protocol::ProtocolError;
+use crate::security::harbor_id_from_topic;
 
 impl ProtocolHandler for SendService {
     async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
@@ -34,7 +30,7 @@ impl SendService {
     /// Handle a single incoming Send protocol connection
     ///
     /// Uses irpc for wire framing (varint length-prefix + postcard).
-    /// Processes DeliverPacket requests and responds with Receipts.
+    /// Processes DeliverTopic and DeliverDm requests, responds with Receipts.
     pub(crate) async fn handle_send_connection(
         &self,
         conn: iroh::endpoint::Connection,
@@ -59,70 +55,91 @@ impl SendService {
             };
 
             match msg {
-                SendRpcMessage::DeliverPacket(deliver_msg) => {
-                    let packet = deliver_msg.packet.clone();
-
+                // =====================================================================
+                // Direct delivery: raw payload over QUIC TLS (no app-level crypto)
+                // =====================================================================
+                SendRpcMessage::DeliverTopic(deliver_msg) => {
                     trace!(
-                        harbor_id = %hex::encode(packet.harbor_id),
+                        harbor_id = %hex::encode(&deliver_msg.harbor_id[..8]),
                         sender = %hex::encode(&sender_id[..8]),
-                        "received DeliverPacket request"
+                        payload_len = deliver_msg.payload.len(),
+                        "received DeliverTopic (direct delivery)"
                     );
 
-                    // Check if this is a DM packet
-                    if packet.is_dm() {
-                        let result = self.process_incoming_dm_packet(&packet).await;
-                        let response = match result {
-                            Ok(r) => r.receipt,
-                            Err(e) => {
-                                debug!(error = %e, "DM packet processing error");
-                                Receipt::new(packet.packet_id, our_id)
-                            }
-                        };
-                        deliver_msg.tx.send(response).await.ok();
-                        continue;
-                    }
-
-                    // Find which topic this packet belongs to
+                    // Find which topic this message belongs to by matching harbor_id
                     let topics = {
                         let db_lock = db.lock().await;
                         get_topics_for_member(&db_lock, &our_id)
                             .map_err(|e| ProtocolError::Database(e.to_string()))?
                     };
 
-                    // Try each topic we're subscribed to
-                    let mut receipt = None;
-                    for topic_id in topics {
-                        let harbor_id = harbor_id_from_topic(&topic_id);
-                        if packet.harbor_id != harbor_id {
-                            continue;
-                        }
-
-                        trace!(topic = %hex::encode(&topic_id[..8]), "found matching topic for packet");
-
-                        // Delegate business logic to the service layer
-                        match self.process_incoming_packet(&packet, &topic_id, sender_id, PacketSource::Direct).await {
-                            Ok(result) => {
-                                receipt = Some(result.receipt);
+                    // Find matching topic and verify membership proof
+                    let mut matched_topic: Option<[u8; 32]> = None;
+                    for topic_id in &topics {
+                        let expected_harbor_id = harbor_id_from_topic(topic_id);
+                        if expected_harbor_id == deliver_msg.harbor_id {
+                            // Verify membership proof: sender must know the topic_id
+                            if verify_membership_proof(
+                                topic_id,
+                                &deliver_msg.harbor_id,
+                                &sender_id,
+                                &deliver_msg.membership_proof,
+                            ) {
+                                matched_topic = Some(*topic_id);
                                 break;
-                            }
-                            Err(ProcessError::VerificationFailed(e)) => {
-                                trace!(error = %e, topic = %hex::encode(topic_id), "verification failed for topic");
-                                continue;
-                            }
-                            Err(e) => {
-                                debug!(error = %e, "packet processing error");
-                                continue;
+                            } else {
+                                warn!(
+                                    harbor_id = %hex::encode(&deliver_msg.harbor_id[..8]),
+                                    sender = %hex::encode(&sender_id[..8]),
+                                    "DeliverTopic membership proof verification failed"
+                                );
                             }
                         }
                     }
 
-                    // Respond with receipt (or a default "unknown topic" receipt)
-                    let response = receipt.unwrap_or_else(|| {
-                        debug!(harbor_id = hex::encode(packet.harbor_id), "packet for unknown topic");
-                        Receipt::new(packet.packet_id, our_id)
-                    });
+                    let topic_id = match matched_topic {
+                        Some(id) => id,
+                        None => {
+                            debug!(
+                                harbor_id = %hex::encode(&deliver_msg.harbor_id[..8]),
+                                "DeliverTopic for unknown topic or invalid proof"
+                            );
+                            let dummy_packet_id = [0u8; 32];
+                            deliver_msg.tx.send(Receipt::new(dummy_packet_id, our_id)).await.ok();
+                            continue;
+                        }
+                    };
 
-                    // Send response via irpc oneshot
+                    // Process raw TopicMessage payload (already plaintext from QUIC TLS)
+                    let result = self.process_raw_topic_payload(&topic_id, sender_id, &deliver_msg.payload).await;
+                    let response = match result {
+                        Ok(r) => r.receipt,
+                        Err(e) => {
+                            debug!(error = %e, "DeliverTopic processing error");
+                            let dummy_packet_id = [0u8; 32];
+                            Receipt::new(dummy_packet_id, our_id)
+                        }
+                    };
+                    deliver_msg.tx.send(response).await.ok();
+                }
+
+                SendRpcMessage::DeliverDm(deliver_msg) => {
+                    trace!(
+                        sender = %hex::encode(&sender_id[..8]),
+                        payload_len = deliver_msg.payload.len(),
+                        "received DeliverDm (direct delivery)"
+                    );
+
+                    // Process raw DmMessage payload (already plaintext from QUIC TLS)
+                    let result = self.process_raw_dm_payload(sender_id, &deliver_msg.payload).await;
+                    let response = match result {
+                        Ok(r) => r.receipt,
+                        Err(e) => {
+                            debug!(error = %e, "DeliverDm processing error");
+                            let dummy_packet_id = [0u8; 32];
+                            Receipt::new(dummy_packet_id, our_id)
+                        }
+                    };
                     deliver_msg.tx.send(response).await.ok();
                 }
             }

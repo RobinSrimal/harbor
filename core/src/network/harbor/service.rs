@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use crate::data::LocalIdentity;
 use crate::network::dht::DhtService;
 use crate::protocol::ProtocolEvent;
-use crate::resilience::{PoWConfig, PoWVerifyResult, RateLimitConfig, RateLimiter};
+use crate::resilience::{RateLimitConfig, RateLimiter};
 use crate::resilience::{StorageConfig, StorageManager};
 
 /// Harbor Node service
@@ -59,8 +59,6 @@ pub struct HarborService {
     pub(super) endpoint_id: [u8; 32],
     /// Rate limiter for abuse prevention (thread-safe via Mutex)
     pub(super) rate_limiter: Mutex<RateLimiter>,
-    /// Proof of Work configuration
-    pub(super) pow_config: PoWConfig,
     /// Storage quota manager
     pub(super) storage_manager: StorageManager,
 
@@ -81,7 +79,6 @@ impl HarborService {
         db: Arc<TokioMutex<DbConnection>>,
         event_tx: mpsc::Sender<ProtocolEvent>,
         dht_service: Option<Arc<DhtService>>,
-        pow_config: PoWConfig,
         storage_config: StorageConfig,
         connect_timeout: Duration,
         response_timeout: Duration,
@@ -95,7 +92,6 @@ impl HarborService {
             dht_service,
             endpoint_id,
             rate_limiter: Mutex::new(RateLimiter::with_config(RateLimitConfig::default())),
-            pow_config,
             storage_manager: StorageManager::new(storage_config),
             connect_timeout,
             response_timeout,
@@ -106,7 +102,6 @@ impl HarborService {
     pub fn with_full_config(
         endpoint_id: [u8; 32],
         rate_config: RateLimitConfig,
-        pow_config: PoWConfig,
         storage_config: StorageConfig,
     ) -> Self {
         Self {
@@ -117,25 +112,15 @@ impl HarborService {
             dht_service: None,
             endpoint_id,
             rate_limiter: Mutex::new(RateLimiter::with_config(rate_config)),
-            pow_config,
             storage_manager: StorageManager::new(storage_config),
             connect_timeout: Duration::from_secs(5),
             response_timeout: Duration::from_secs(30),
         }
     }
 
-    /// Create a new Harbor service with custom rate limit and PoW configs
-    pub fn with_config(
-        endpoint_id: [u8; 32],
-        rate_config: RateLimitConfig,
-        pow_config: PoWConfig,
-    ) -> Self {
-        Self::with_full_config(endpoint_id, rate_config, pow_config, StorageConfig::default())
-    }
-
-    /// Create a new Harbor service with custom rate limit config (default PoW and storage)
+    /// Create a new Harbor service with custom rate limit config
     pub fn with_rate_limit_config(endpoint_id: [u8; 32], config: RateLimitConfig) -> Self {
-        Self::with_config(endpoint_id, config, PoWConfig::default())
+        Self::with_full_config(endpoint_id, config, StorageConfig::default())
     }
 
     /// Create a new Harbor service with all abuse protection disabled (for testing)
@@ -146,7 +131,6 @@ impl HarborService {
                 enabled: false,
                 ..Default::default()
             },
-            PoWConfig::disabled(),
             StorageConfig::disabled(),
         )
     }
@@ -183,16 +167,6 @@ impl HarborService {
         &self.dht_service
     }
 
-    /// Get the PoW difficulty bits (for clients to know what difficulty to use)
-    pub fn pow_difficulty(&self) -> u8 {
-        self.pow_config.difficulty_bits
-    }
-
-    /// Check if PoW is required
-    pub fn pow_enabled(&self) -> bool {
-        self.pow_config.enabled
-    }
-
     /// Get the storage configuration
     pub fn storage_config(&self) -> &StorageConfig {
         self.storage_manager.config()
@@ -223,10 +197,6 @@ pub enum HarborError {
         /// Time to wait before retrying
         retry_after: Duration,
     },
-    /// Proof of Work required but not provided
-    PoWRequired,
-    /// Invalid Proof of Work
-    InvalidPoW(PoWVerifyResult),
     /// Total storage limit exceeded
     StorageFull {
         /// Current total bytes stored
@@ -256,8 +226,6 @@ impl std::fmt::Display for HarborError {
             HarborError::RateLimited { retry_after } => {
                 write!(f, "rate limited: retry after {}ms", retry_after.as_millis())
             }
-            HarborError::PoWRequired => write!(f, "proof of work required"),
-            HarborError::InvalidPoW(result) => write!(f, "invalid proof of work: {}", result),
             HarborError::StorageFull { current, limit } => {
                 write!(
                     f,
@@ -323,13 +291,6 @@ mod tests {
         assert!(rate_err.to_string().contains("rate limited"));
         assert!(rate_err.to_string().contains("1000ms"));
 
-        let pow_required = HarborError::PoWRequired;
-        assert!(pow_required.to_string().contains("proof of work required"));
-
-        let pow_invalid = HarborError::InvalidPoW(PoWVerifyResult::Expired);
-        assert!(pow_invalid.to_string().contains("invalid proof of work"));
-        assert!(pow_invalid.to_string().contains("expired"));
-
         let storage_full = HarborError::StorageFull {
             current: 100,
             limit: 50,
@@ -360,9 +321,7 @@ mod tests {
             max_stores_per_harbor_id: 100, // High so connection limit hits first
             window_duration: Duration::from_secs(60),
         };
-        // Disable PoW so we can test rate limiting in isolation
-        let pow_config = PoWConfig::disabled();
-        let service = HarborService::with_config(test_id(1), rate_config, pow_config);
+        let service = HarborService::with_rate_limit_config(test_id(1), rate_config);
 
         let sender_keypair = generate_key_pair();
         let topic_id = test_id(20);
@@ -388,7 +347,6 @@ mod tests {
                 packet_data: packet_bytes.clone(),
                 recipients: vec![test_id(40)],
                 packet_type: HarborPacketType::Content,
-                proof_of_work: None, // PoW disabled in this test
             };
             let result = service.handle_store(&mut conn, request);
             assert!(result.is_ok(), "Request {} should succeed", i);
@@ -402,7 +360,6 @@ mod tests {
             packet_data: packet_bytes,
             recipients: vec![test_id(40)],
             packet_type: HarborPacketType::Content,
-            proof_of_work: None,
         };
         let result = service.handle_store(&mut conn, request);
         assert!(matches!(result, Err(HarborError::RateLimited { .. })));
@@ -436,7 +393,6 @@ mod tests {
                 packet_data: packet_bytes.clone(),
                 recipients: vec![test_id(40)],
                 packet_type: HarborPacketType::Content,
-                proof_of_work: None,
             };
             let result = service.handle_store(&mut conn, request);
             assert!(
@@ -480,7 +436,6 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
-            PoWConfig::disabled(),
             storage_config,
         );
 
@@ -492,7 +447,6 @@ mod tests {
             packet_data: packet_bytes.clone(),
             recipients: vec![test_id(40)],
             packet_type: HarborPacketType::Content,
-            proof_of_work: None,
         };
         let result = service.handle_store(&mut conn, request1);
         let response = result.expect("First request should not error");
@@ -520,7 +474,6 @@ mod tests {
             packet_data: packet_bytes2,
             recipients: vec![test_id(40)],
             packet_type: HarborPacketType::Content,
-            proof_of_work: None,
         };
         let result = service.handle_store(&mut conn, request2);
         assert!(
@@ -563,7 +516,6 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
-            PoWConfig::disabled(),
             storage_config,
         );
 
@@ -575,7 +527,6 @@ mod tests {
             packet_data: packet_bytes.clone(),
             recipients: vec![test_id(40)],
             packet_type: HarborPacketType::Content,
-            proof_of_work: None,
         };
         let result = service.handle_store(&mut conn, request1);
         let response = result.expect("First request should not error");
@@ -602,7 +553,6 @@ mod tests {
             packet_data: packet_bytes2,
             recipients: vec![test_id(40)],
             packet_type: HarborPacketType::Content,
-            proof_of_work: None,
         };
         let result = service.handle_store(&mut conn, request2);
         assert!(
@@ -630,7 +580,6 @@ mod tests {
             packet_data: packet_bytes3,
             recipients: vec![test_id(40)],
             packet_type: HarborPacketType::Content,
-            proof_of_work: None,
         };
         let result = service.handle_store(&mut conn, request3);
         let response = result.expect("Third request should not error");
@@ -672,7 +621,6 @@ mod tests {
                 packet_data: packet_bytes.clone(),
                 recipients: vec![test_id(40)],
                 packet_type: HarborPacketType::Content,
-                proof_of_work: None,
             };
             let result = service.handle_store(&mut conn, request);
             assert!(

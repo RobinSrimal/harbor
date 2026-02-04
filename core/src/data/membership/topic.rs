@@ -5,8 +5,10 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::data::dht::current_timestamp;
+use crate::data::dht::{current_timestamp, ensure_peer_exists};
+use crate::data::membership::epoch::store_epoch_key;
 use crate::security::topic_keys::{TopicKeys, harbor_id_from_topic};
+use crate::security::derive_epoch_secret_from_topic;
 
 /// A topic subscription stored in the database
 #[derive(Clone)]
@@ -71,24 +73,54 @@ pub struct TopicMember {
     pub joined_at: i64,
 }
 
-/// Subscribe to a topic
+/// Subscribe to a topic (for joining an existing topic via invite)
 ///
-/// Creates the topic subscription and stores the derived keys.
+/// Creates the topic subscription with the sender as admin.
+/// Uses INSERT OR IGNORE to preserve the original `created_at` timestamp
+/// if the topic already exists.
+///
+/// For creating new topics where you are the admin, use `subscribe_topic_with_admin`.
+pub fn subscribe_topic(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<TopicSubscription> {
+    // For backwards compatibility, use a placeholder admin
+    // This will be overwritten when proper invite flow sets the real admin
+    let placeholder_admin = [0u8; 32];
+    subscribe_topic_with_admin(conn, topic_id, &placeholder_admin)
+}
+
+/// Subscribe to a topic with explicit admin
+///
+/// Creates the topic subscription, stores the admin_id, and stores epoch 0 key.
 /// Does NOT add any members - use `add_topic_member` for that.
 ///
 /// Uses INSERT OR IGNORE to preserve the original `created_at` timestamp
 /// if the topic already exists. This is important for Harbor pull filtering -
 /// we want to receive packets sent after our ORIGINAL join time, not after
 /// a rejoin/restart.
-pub fn subscribe_topic(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<TopicSubscription> {
+///
+/// Also stores epoch 0 key (derived from topic_id) so all topics start with
+/// an epoch key. This simplifies the encryption flow - no special case for
+/// "no epoch key yet" since every topic has at least epoch 0.
+pub fn subscribe_topic_with_admin(
+    conn: &Connection,
+    topic_id: &[u8; 32],
+    admin_id: &[u8; 32],
+) -> rusqlite::Result<TopicSubscription> {
     let subscription = TopicSubscription::new(*topic_id);
-    
+
+    // Ensure admin exists in peers table (for FK constraint)
+    ensure_peer_exists(conn, admin_id)?;
+
     // Use INSERT OR IGNORE to preserve original created_at on rejoin
     conn.execute(
-        "INSERT OR IGNORE INTO topics (topic_id, harbor_id) VALUES (?1, ?2)",
-        params![topic_id.as_slice(), subscription.harbor_id.as_slice()],
+        "INSERT OR IGNORE INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+        params![topic_id.as_slice(), subscription.harbor_id.as_slice(), admin_id.as_slice()],
     )?;
-    
+
+    // Store epoch 0 key derived from topic_id
+    // This ensures all topics have at least one epoch key from the start
+    let epoch_0_secret = derive_epoch_secret_from_topic(topic_id, 0);
+    store_epoch_key(conn, topic_id, 0, &epoch_0_secret)?;
+
     // Return the actual subscription from DB (may have older created_at)
     get_topic(conn, topic_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
@@ -109,6 +141,42 @@ pub fn is_subscribed(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM topics WHERE topic_id = ?1",
         [topic_id.as_slice()],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Get the admin ID for a topic
+pub fn get_topic_admin(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<Option<[u8; 32]>> {
+    conn.query_row(
+        "SELECT admin_id FROM topics WHERE topic_id = ?1",
+        [topic_id.as_slice()],
+        |row| {
+            let admin_vec: Vec<u8> = row.get(0)?;
+            if admin_vec.len() != 32 {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    0,
+                    "admin_id".to_string(),
+                    rusqlite::types::Type::Blob,
+                ));
+            }
+            let mut admin_id = [0u8; 32];
+            admin_id.copy_from_slice(&admin_vec);
+            Ok(admin_id)
+        },
+    )
+    .optional()
+}
+
+/// Check if a peer is the admin of a topic
+pub fn is_topic_admin(
+    conn: &Connection,
+    topic_id: &[u8; 32],
+    peer_id: &[u8; 32],
+) -> rusqlite::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM topics WHERE topic_id = ?1 AND admin_id = ?2",
+        params![topic_id.as_slice(), peer_id.as_slice()],
         |row| row.get(0),
     )?;
     Ok(count > 0)
@@ -153,7 +221,7 @@ pub fn get_topic(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<Opt
     conn.query_row(
         "SELECT topic_id, harbor_id, created_at FROM topics WHERE topic_id = ?1",
         [topic_id.as_slice()],
-        |row| parse_topic_row(row),
+        parse_topic_row,
     )
     .optional()
 }
@@ -163,7 +231,7 @@ pub fn get_topic_by_harbor_id(conn: &Connection, harbor_id: &[u8; 32]) -> rusqli
     conn.query_row(
         "SELECT topic_id, harbor_id, created_at FROM topics WHERE harbor_id = ?1",
         [harbor_id.as_slice()],
-        |row| parse_topic_row(row),
+        parse_topic_row,
     )
     .optional()
 }
@@ -175,7 +243,7 @@ pub fn get_all_topics(conn: &Connection) -> rusqlite::Result<Vec<TopicSubscripti
     )?;
     
     let topics = stmt
-        .query_map([], |row| parse_topic_row(row))?
+        .query_map([], parse_topic_row)?
         .collect::<Result<Vec<_>, _>>()?;
     
     Ok(topics)
@@ -189,6 +257,9 @@ pub fn add_topic_member(
     topic_id: &[u8; 32],
     endpoint_id: &[u8; 32],
 ) -> rusqlite::Result<()> {
+    // Ensure member exists in peers table (for FK constraint)
+    ensure_peer_exists(conn, endpoint_id)?;
+
     conn.execute(
         "INSERT OR REPLACE INTO topic_members (topic_id, endpoint_id) VALUES (?1, ?2)",
         params![topic_id.as_slice(), endpoint_id.as_slice()],
@@ -258,21 +329,23 @@ pub fn set_topic_members(
     members: &[[u8; 32]],
 ) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
-    
+
     // Remove existing members
     tx.execute(
         "DELETE FROM topic_members WHERE topic_id = ?1",
         [topic_id.as_slice()],
     )?;
-    
+
     // Add new members
     for member in members {
+        // Ensure member exists in peers table (for FK constraint)
+        ensure_peer_exists(&tx, member)?;
         tx.execute(
             "INSERT OR REPLACE INTO topic_members (topic_id, endpoint_id) VALUES (?1, ?2)",
             params![topic_id.as_slice(), member.as_slice()],
         )?;
     }
-    
+
     tx.commit()
 }
 
@@ -311,13 +384,14 @@ pub fn get_joined_at(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::schema::{create_topic_table, create_peer_table};
+    use crate::data::schema::{create_topic_table, create_peer_table, create_membership_tables};
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
         create_peer_table(&conn).unwrap();
         create_topic_table(&conn).unwrap();
+        create_membership_tables(&conn).unwrap();
         conn
     }
 

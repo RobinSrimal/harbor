@@ -220,24 +220,36 @@ impl EpochKeys {
     }
 
     /// Derive keys from TopicID and epoch
-    /// 
+    ///
     /// This is the primary method for Tier 1 (Open Topics).
     /// For Tier 1, epoch is always 0.
     /// For Tier 2+, epoch increments with membership changes.
     pub fn derive_from_topic(topic_id: &[u8; 32], epoch: u64) -> Self {
-        use blake3::Hasher;
-        
-        // Derive epoch secret from topic_id and epoch
-        let mut hasher = Hasher::new();
-        hasher.update(b"harbor-epoch-secret");
-        hasher.update(topic_id);
-        hasher.update(&epoch.to_le_bytes());
-        let epoch_secret_hash = hasher.finalize();
-        let mut epoch_secret = [0u8; 32];
-        epoch_secret.copy_from_slice(&epoch_secret_hash.as_bytes()[..32]);
-        
+        let epoch_secret = derive_epoch_secret_from_topic(topic_id, epoch);
         Self::derive_from_secret(epoch, &epoch_secret)
     }
+}
+
+/// Derive an epoch secret from TopicID and epoch number.
+///
+/// This is the raw secret that can be stored in the database for later use.
+/// To get the actual encryption/MAC keys, use `EpochKeys::derive_from_secret()`.
+///
+/// For epoch 0, this derives the "initial" topic key from the topic_id.
+/// For epoch > 0, this derives a deterministic key (though in practice,
+/// admin-distributed keys are generated randomly and stored directly).
+pub fn derive_epoch_secret_from_topic(topic_id: &[u8; 32], epoch: u64) -> [u8; 32] {
+    use blake3::Hasher;
+
+    let mut hasher = Hasher::new();
+    hasher.update(b"harbor-epoch-secret");
+    hasher.update(topic_id);
+    hasher.update(&epoch.to_le_bytes());
+    let epoch_secret_hash = hasher.finalize();
+    let mut epoch_secret = [0u8; 32];
+    epoch_secret.copy_from_slice(&epoch_secret_hash.as_bytes()[..32]);
+
+    epoch_secret
 }
 
 impl std::fmt::Debug for EpochKeys {
@@ -445,16 +457,16 @@ pub fn verify_and_decrypt_with_epoch(
     }
 
     // Step 2: Verify signature (only in Full mode)
-    if mode == VerificationMode::Full {
-        if !verify_packet(
+    if mode == VerificationMode::Full
+        && !verify_packet(
             &packet.endpoint_id,
             &packet.endpoint_id,
             &packet.nonce,
             &packet.ciphertext,
             &packet.signature,
-        ) {
-            return Err(PacketError::InvalidSignature);
-        }
+        )
+    {
+        return Err(PacketError::InvalidSignature);
     }
 
     // Step 3: Decrypt with AAD = HarborID || EndpointID || epoch

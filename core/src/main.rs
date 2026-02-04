@@ -94,6 +94,23 @@ fn print_usage() {
     println!("DM Share Endpoints:");
     println!("  POST /api/dm/share          Share a file via DM (JSON: recipient, file_path)");
     println!();
+    println!("Control Endpoints (peer connections & topic invites):");
+    println!("  POST /api/control/connect          Request peer connection (JSON: peer, relay_url?, display_name?, token?)");
+    println!("  POST /api/control/accept           Accept connection request (JSON: request_id)");
+    println!("  POST /api/control/decline          Decline connection request (JSON: request_id, reason?)");
+    println!("  POST /api/control/invite           Generate connect invite (QR code)");
+    println!("  POST /api/control/connect-with-invite  Connect using invite (JSON: invite)");
+    println!("  POST /api/control/block            Block a peer (JSON: peer)");
+    println!("  POST /api/control/unblock          Unblock a peer (JSON: peer)");
+    println!("  GET  /api/control/connections      List all connections");
+    println!("  POST /api/control/topic-invite     Invite peer to topic (JSON: peer, topic)");
+    println!("  POST /api/control/topic-accept     Accept topic invite (JSON: message_id)");
+    println!("  POST /api/control/topic-decline    Decline topic invite (JSON: message_id)");
+    println!("  POST /api/control/leave            Leave topic (JSON: topic)");
+    println!("  POST /api/control/remove-member    Remove member from topic (JSON: topic, member)");
+    println!("  POST /api/control/suggest          Suggest peer introduction (JSON: to_peer, suggested_peer, note?)");
+    println!("  GET  /api/control/pending-invites  List pending topic invites");
+    println!();
     println!("Environment:");
     println!("  HARBOR_DB_KEY               Database encryption key (64 hex chars, required)");
     println!("  RUST_LOG                    Set log level (e.g., info, debug)");
@@ -494,6 +511,70 @@ async fn main() {
                                 "DM file announced"
                             );
                         }
+                        // Control events
+                        harbor_core::ProtocolEvent::ConnectionRequest(ev) => {
+                            info!(
+                                peer = %hex::encode(&ev.peer_id[..8]),
+                                request_id = %hex::encode(&ev.request_id[..8]),
+                                display_name = ?ev.display_name,
+                                "CONNECTION_REQUEST received"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::ConnectionAccepted(ev) => {
+                            info!(
+                                peer = %hex::encode(&ev.peer_id[..8]),
+                                request_id = %hex::encode(&ev.request_id[..8]),
+                                "CONNECTION_ACCEPTED"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::ConnectionDeclined(ev) => {
+                            info!(
+                                peer = %hex::encode(&ev.peer_id[..8]),
+                                request_id = %hex::encode(&ev.request_id[..8]),
+                                reason = ?ev.reason,
+                                "CONNECTION_DECLINED"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::TopicInviteReceived(ev) => {
+                            info!(
+                                sender = %hex::encode(&ev.sender_id[..8]),
+                                topic = %hex::encode(&ev.topic_id[..8]),
+                                message_id = %hex::encode(&ev.message_id[..8]),
+                                topic_name = ?ev.topic_name,
+                                member_count = ev.member_count,
+                                "TOPIC_INVITE_RECEIVED"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::TopicMemberJoined(ev) => {
+                            info!(
+                                topic = %hex::encode(&ev.topic_id[..8]),
+                                member = %hex::encode(&ev.member_id[..8]),
+                                "TOPIC_MEMBER_JOINED"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::TopicMemberLeft(ev) => {
+                            info!(
+                                topic = %hex::encode(&ev.topic_id[..8]),
+                                member = %hex::encode(&ev.member_id[..8]),
+                                "TOPIC_MEMBER_LEFT"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::TopicEpochRotated(ev) => {
+                            info!(
+                                topic = %hex::encode(&ev.topic_id[..8]),
+                                new_epoch = ev.new_epoch,
+                                removed_member = %hex::encode(&ev.removed_member[..8]),
+                                "TOPIC_EPOCH_ROTATED"
+                            );
+                        }
+                        harbor_core::ProtocolEvent::PeerSuggested(ev) => {
+                            info!(
+                                introducer = %hex::encode(&ev.introducer_id[..8]),
+                                suggested = %hex::encode(&ev.suggested_peer_id[..8]),
+                                note = ?ev.note,
+                                "PEER_SUGGESTED"
+                            );
+                        }
                     }
                 }
             } else {
@@ -730,6 +811,22 @@ async fn handle_request(protocol: &Protocol, bootstrap: &BootstrapInfo, active_t
         ("POST", "/api/stream/reject") => handle_stream_reject(protocol, body).await,
         ("POST", "/api/stream/publish") => handle_stream_publish(active_tracks, body).await,
         ("POST", "/api/stream/end") => handle_stream_end(protocol, body).await,
+        // Control endpoints
+        ("POST", "/api/control/connect") => handle_control_connect(protocol, body).await,
+        ("POST", "/api/control/accept") => handle_control_accept(protocol, body).await,
+        ("POST", "/api/control/decline") => handle_control_decline(protocol, body).await,
+        ("POST", "/api/control/invite") => handle_control_generate_invite(protocol).await,
+        ("POST", "/api/control/connect-with-invite") => handle_control_connect_with_invite(protocol, body).await,
+        ("POST", "/api/control/block") => handle_control_block(protocol, body).await,
+        ("POST", "/api/control/unblock") => handle_control_unblock(protocol, body).await,
+        ("GET", "/api/control/connections") => handle_control_list_connections(protocol).await,
+        ("POST", "/api/control/topic-invite") => handle_control_topic_invite(protocol, body).await,
+        ("POST", "/api/control/topic-accept") => handle_control_topic_accept(protocol, body).await,
+        ("POST", "/api/control/topic-decline") => handle_control_topic_decline(protocol, body).await,
+        ("POST", "/api/control/leave") => handle_control_leave(protocol, body).await,
+        ("POST", "/api/control/remove-member") => handle_control_remove_member(protocol, body).await,
+        ("POST", "/api/control/suggest") => handle_control_suggest(protocol, body).await,
+        ("GET", "/api/control/pending-invites") => handle_control_pending_invites(protocol).await,
         ("GET", "/api/stats") => handle_stats(protocol).await,
         ("GET", "/api/topics") => handle_list_topics(protocol).await,
         ("GET", "/api/bootstrap") => handle_bootstrap(bootstrap),
@@ -1492,6 +1589,416 @@ async fn handle_stream_end(protocol: &Protocol, body: &str) -> String {
     match protocol.end_stream(&id_bytes).await {
         Ok(()) => http_response(200, "Stream ended"),
         Err(e) => http_response(500, &format!("Failed to end stream: {}", e)),
+    }
+}
+
+// ============================================================================
+// Control API Handlers
+// ============================================================================
+
+/// Request a connection to a peer
+/// POST /api/control/connect
+/// Body: {"peer": "hex64", "relay_url": "optional", "display_name": "optional", "token": "hex64 optional"}
+async fn handle_control_connect(protocol: &Protocol, body: &str) -> String {
+    let peer_hex = match extract_json_string(body, "peer") {
+        Some(p) => p,
+        None => return http_response(400, "Missing 'peer' field"),
+    };
+    let relay_url = extract_json_string(body, "relay_url");
+    let display_name = extract_json_string(body, "display_name");
+    let token_hex = extract_json_string(body, "token");
+
+    let peer_bytes = match hex::decode(&peer_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid peer ID (must be 64 hex chars)"),
+    };
+
+    let token = if let Some(t) = token_hex {
+        match hex::decode(&t) {
+            Ok(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                Some(arr)
+            }
+            _ => return http_response(400, "Invalid token (must be 64 hex chars)"),
+        }
+    } else {
+        None
+    };
+
+    match protocol.request_connection(&peer_bytes, relay_url.as_deref(), display_name.as_deref(), token).await {
+        Ok(request_id) => {
+            let json = format!(r#"{{"request_id":"{}"}}"#, hex::encode(request_id));
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(500, &format!("Failed to request connection: {}", e)),
+    }
+}
+
+/// Accept a pending connection request
+/// POST /api/control/accept
+/// Body: {"request_id": "hex64"}
+async fn handle_control_accept(protocol: &Protocol, body: &str) -> String {
+    let id_hex = match extract_json_string(body, "request_id") {
+        Some(h) => h,
+        None => return http_response(400, "Missing 'request_id' field"),
+    };
+    let id_bytes = match hex::decode(&id_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid request_id"),
+    };
+
+    match protocol.accept_connection(&id_bytes).await {
+        Ok(()) => http_response(200, "Connection accepted"),
+        Err(e) => http_response(500, &format!("Failed to accept connection: {}", e)),
+    }
+}
+
+/// Decline a pending connection request
+/// POST /api/control/decline
+/// Body: {"request_id": "hex64", "reason": "optional"}
+async fn handle_control_decline(protocol: &Protocol, body: &str) -> String {
+    let id_hex = match extract_json_string(body, "request_id") {
+        Some(h) => h,
+        None => return http_response(400, "Missing 'request_id' field"),
+    };
+    let reason = extract_json_string(body, "reason");
+
+    let id_bytes = match hex::decode(&id_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid request_id"),
+    };
+
+    match protocol.decline_connection(&id_bytes, reason.as_deref()).await {
+        Ok(()) => http_response(200, "Connection declined"),
+        Err(e) => http_response(500, &format!("Failed to decline connection: {}", e)),
+    }
+}
+
+/// Generate a connect invite (for QR code / invite string)
+/// POST /api/control/invite
+async fn handle_control_generate_invite(protocol: &Protocol) -> String {
+    match protocol.generate_connect_invite().await {
+        Ok(invite) => {
+            let json = format!(
+                r#"{{"endpoint_id":"{}","token":"{}","relay_url":"{}","invite":"{}"}}"#,
+                hex::encode(invite.endpoint_id),
+                hex::encode(invite.token),
+                invite.relay_url.as_deref().unwrap_or(""),
+                invite.encode()
+            );
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(500, &format!("Failed to generate invite: {}", e)),
+    }
+}
+
+/// Connect using an invite string
+/// POST /api/control/connect-with-invite
+/// Body: {"invite": "endpoint:token:relay"}
+async fn handle_control_connect_with_invite(protocol: &Protocol, body: &str) -> String {
+    let invite_str = match extract_json_string(body, "invite") {
+        Some(i) => i,
+        None => return http_response(400, "Missing 'invite' field"),
+    };
+
+    match protocol.connect_with_invite(&invite_str).await {
+        Ok(request_id) => {
+            let json = format!(r#"{{"request_id":"{}"}}"#, hex::encode(request_id));
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(500, &format!("Failed to connect with invite: {}", e)),
+    }
+}
+
+/// Block a peer
+/// POST /api/control/block
+/// Body: {"peer": "hex64"}
+async fn handle_control_block(protocol: &Protocol, body: &str) -> String {
+    let peer_hex = match extract_json_string(body, "peer") {
+        Some(p) => p,
+        None => return http_response(400, "Missing 'peer' field"),
+    };
+    let peer_bytes = match hex::decode(&peer_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid peer ID"),
+    };
+
+    match protocol.block_peer(&peer_bytes).await {
+        Ok(()) => http_response(200, "Peer blocked"),
+        Err(e) => http_response(500, &format!("Failed to block peer: {}", e)),
+    }
+}
+
+/// Unblock a peer
+/// POST /api/control/unblock
+/// Body: {"peer": "hex64"}
+async fn handle_control_unblock(protocol: &Protocol, body: &str) -> String {
+    let peer_hex = match extract_json_string(body, "peer") {
+        Some(p) => p,
+        None => return http_response(400, "Missing 'peer' field"),
+    };
+    let peer_bytes = match hex::decode(&peer_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid peer ID"),
+    };
+
+    match protocol.unblock_peer(&peer_bytes).await {
+        Ok(()) => http_response(200, "Peer unblocked"),
+        Err(e) => http_response(500, &format!("Failed to unblock peer: {}", e)),
+    }
+}
+
+/// List all connections
+/// GET /api/control/connections
+async fn handle_control_list_connections(protocol: &Protocol) -> String {
+    match protocol.list_connections().await {
+        Ok(connections) => {
+            let conn_jsons: Vec<String> = connections.iter().map(|c| {
+                let state_str = match c.state {
+                    harbor_core::ConnectionState::PendingOutgoing => "pending_outgoing",
+                    harbor_core::ConnectionState::PendingIncoming => "pending_incoming",
+                    harbor_core::ConnectionState::Connected => "connected",
+                    harbor_core::ConnectionState::Declined => "declined",
+                    harbor_core::ConnectionState::Blocked => "blocked",
+                };
+                format!(
+                    r#"{{"peer_id":"{}","state":"{}","display_name":"{}","relay_url":"{}"}}"#,
+                    hex::encode(c.peer_id),
+                    state_str,
+                    c.display_name.as_deref().unwrap_or(""),
+                    c.relay_url.as_deref().unwrap_or("")
+                )
+            }).collect();
+            let json = format!(r#"{{"connections":[{}]}}"#, conn_jsons.join(","));
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(500, &format!("Failed to list connections: {}", e)),
+    }
+}
+
+/// Invite a peer to a topic
+/// POST /api/control/topic-invite
+/// Body: {"peer": "hex64", "topic": "hex64"}
+async fn handle_control_topic_invite(protocol: &Protocol, body: &str) -> String {
+    let peer_hex = match extract_json_string(body, "peer") {
+        Some(p) => p,
+        None => return http_response(400, "Missing 'peer' field"),
+    };
+    let topic_hex = match extract_json_string(body, "topic") {
+        Some(t) => t,
+        None => return http_response(400, "Missing 'topic' field"),
+    };
+
+    let peer_bytes = match hex::decode(&peer_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid peer ID"),
+    };
+    let topic_bytes = match hex::decode(&topic_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID"),
+    };
+
+    match protocol.invite_to_topic(&peer_bytes, &topic_bytes).await {
+        Ok(message_id) => {
+            let json = format!(r#"{{"message_id":"{}"}}"#, hex::encode(message_id));
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(500, &format!("Failed to invite to topic: {}", e)),
+    }
+}
+
+/// Accept a topic invitation
+/// POST /api/control/topic-accept
+/// Body: {"message_id": "hex64"}
+async fn handle_control_topic_accept(protocol: &Protocol, body: &str) -> String {
+    let id_hex = match extract_json_string(body, "message_id") {
+        Some(h) => h,
+        None => return http_response(400, "Missing 'message_id' field"),
+    };
+    let id_bytes = match hex::decode(&id_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid message_id"),
+    };
+
+    match protocol.accept_topic_invite(&id_bytes).await {
+        Ok(()) => http_response(200, "Topic invite accepted"),
+        Err(e) => http_response(500, &format!("Failed to accept topic invite: {}", e)),
+    }
+}
+
+/// Decline a topic invitation
+/// POST /api/control/topic-decline
+/// Body: {"message_id": "hex64"}
+async fn handle_control_topic_decline(protocol: &Protocol, body: &str) -> String {
+    let id_hex = match extract_json_string(body, "message_id") {
+        Some(h) => h,
+        None => return http_response(400, "Missing 'message_id' field"),
+    };
+    let id_bytes = match hex::decode(&id_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid message_id"),
+    };
+
+    match protocol.decline_topic_invite(&id_bytes).await {
+        Ok(()) => http_response(200, "Topic invite declined"),
+        Err(e) => http_response(500, &format!("Failed to decline topic invite: {}", e)),
+    }
+}
+
+/// Leave a topic via Control protocol
+/// POST /api/control/leave
+/// Body: {"topic": "hex64"}
+async fn handle_control_leave(protocol: &Protocol, body: &str) -> String {
+    let topic_hex = match extract_json_string(body, "topic") {
+        Some(t) => t,
+        None => return http_response(400, "Missing 'topic' field"),
+    };
+    let topic_bytes = match hex::decode(&topic_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID"),
+    };
+
+    match protocol.control_leave_topic(&topic_bytes).await {
+        Ok(()) => http_response(200, "Left topic"),
+        Err(e) => http_response(500, &format!("Failed to leave topic: {}", e)),
+    }
+}
+
+/// Remove a member from a topic (admin only)
+/// POST /api/control/remove-member
+/// Body: {"topic": "hex64", "member": "hex64"}
+async fn handle_control_remove_member(protocol: &Protocol, body: &str) -> String {
+    let topic_hex = match extract_json_string(body, "topic") {
+        Some(t) => t,
+        None => return http_response(400, "Missing 'topic' field"),
+    };
+    let member_hex = match extract_json_string(body, "member") {
+        Some(m) => m,
+        None => return http_response(400, "Missing 'member' field"),
+    };
+
+    let topic_bytes = match hex::decode(&topic_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid topic ID"),
+    };
+    let member_bytes = match hex::decode(&member_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid member ID"),
+    };
+
+    match protocol.remove_topic_member(&topic_bytes, &member_bytes).await {
+        Ok(()) => http_response(200, "Member removed"),
+        Err(e) => http_response(500, &format!("Failed to remove member: {}", e)),
+    }
+}
+
+/// Suggest a peer to another peer (introduction)
+/// POST /api/control/suggest
+/// Body: {"to_peer": "hex64", "suggested_peer": "hex64", "note": "optional"}
+async fn handle_control_suggest(protocol: &Protocol, body: &str) -> String {
+    let to_hex = match extract_json_string(body, "to_peer") {
+        Some(t) => t,
+        None => return http_response(400, "Missing 'to_peer' field"),
+    };
+    let suggested_hex = match extract_json_string(body, "suggested_peer") {
+        Some(s) => s,
+        None => return http_response(400, "Missing 'suggested_peer' field"),
+    };
+    let note = extract_json_string(body, "note");
+
+    let to_bytes = match hex::decode(&to_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid to_peer ID"),
+    };
+    let suggested_bytes = match hex::decode(&suggested_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return http_response(400, "Invalid suggested_peer ID"),
+    };
+
+    match protocol.suggest_peer(&to_bytes, &suggested_bytes, note.as_deref()).await {
+        Ok(message_id) => {
+            let json = format!(r#"{{"message_id":"{}"}}"#, hex::encode(message_id));
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(500, &format!("Failed to suggest peer: {}", e)),
+    }
+}
+
+/// List pending topic invites
+/// GET /api/control/pending-invites
+async fn handle_control_pending_invites(protocol: &Protocol) -> String {
+    match protocol.list_pending_invites().await {
+        Ok(invites) => {
+            let invite_jsons: Vec<String> = invites.iter().map(|i| {
+                format!(
+                    r#"{{"message_id":"{}","topic_id":"{}","sender_id":"{}","topic_name":"{}"}}"#,
+                    hex::encode(i.message_id),
+                    hex::encode(i.topic_id),
+                    hex::encode(i.sender_id),
+                    i.topic_name.as_deref().unwrap_or("")
+                )
+            }).collect();
+            let json = format!(r#"{{"pending_invites":[{}]}}"#, invite_jsons.join(","));
+            http_json_response(200, &json)
+        }
+        Err(e) => http_response(500, &format!("Failed to list pending invites: {}", e)),
     }
 }
 

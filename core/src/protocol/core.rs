@@ -16,7 +16,8 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::info;
 
-use crate::data::{get_or_create_identity, start_db, LocalIdentity};
+use crate::data::{ensure_self_in_peers, get_or_create_identity, start_db, LocalIdentity};
+use crate::network::control::ControlService;
 use crate::network::dht::DhtService;
 use crate::data::BlobStore;
 use crate::network::harbor::HarborService;
@@ -70,6 +71,8 @@ pub struct Protocol {
     pub(crate) stream_service: Arc<StreamService>,
     /// Topic service for topic lifecycle
     pub(crate) topic_service: Arc<TopicService>,
+    /// Control service for lifecycle management
+    pub(crate) control_service: Arc<ControlService>,
     /// Stats service for monitoring
     pub(crate) stats_service: Arc<StatsService>,
     /// Event sender (for app notifications: messages, file events, etc.)
@@ -104,7 +107,7 @@ impl Protocol {
         let mut db_key = config.db_key.ok_or_else(|| {
             ProtocolError::Database("db_key is required — set it via ProtocolConfig::with_db_key()".to_string())
         })?;
-        let passphrase = hex::encode(&db_key);
+        let passphrase = hex::encode(db_key);
         db_key.zeroize();
 
         let db = start_db(&db_path, &passphrase).map_err(|e| ProtocolError::Database(e.to_string()))?;
@@ -119,6 +122,10 @@ impl Protocol {
             created_at = identity.created_at,
             "Loaded identity from database"
         );
+
+        // Ensure our own endpoint is in the peers table (needed for FK constraints)
+        ensure_self_in_peers(&db, &identity.public_key)
+            .map_err(|e| ProtocolError::Database(e.to_string()))?;
 
         // Create Iroh endpoint with our identity's secret key
         let secret_key = iroh::SecretKey::from_bytes(&identity.private_key);
@@ -156,15 +163,6 @@ impl Protocol {
         ));
 
         // Initialize Harbor service
-        let pow_config = if config.enable_pow {
-            crate::resilience::PoWConfig {
-                enabled: true,
-                difficulty_bits: config.pow_difficulty,
-                ..crate::resilience::PoWConfig::default()
-            }
-        } else {
-            crate::resilience::PoWConfig::disabled()
-        };
         let storage_config = crate::resilience::StorageConfig {
             max_total_bytes: config.max_storage_bytes,
             ..crate::resilience::StorageConfig::default()
@@ -175,7 +173,6 @@ impl Protocol {
             db.clone(),
             event_tx.clone(),
             dht_service.clone(),
-            pow_config,
             storage_config,
             Duration::from_secs(config.harbor_connect_timeout_secs),
             Duration::from_secs(config.harbor_response_timeout_secs),
@@ -240,6 +237,14 @@ impl Protocol {
             dht_service.clone(),
         ));
 
+        // Initialize Control service
+        let control_service = ControlService::new(
+            endpoint.clone(),
+            identity.clone(),
+            db.clone(),
+            event_tx.clone(),
+        );
+
         // Build the iroh Router for ALPN-based connection dispatch
         let router = crate::handlers::build_router(
             endpoint.clone(),
@@ -249,6 +254,7 @@ impl Protocol {
             share_service.clone(),
             sync_service.clone(),
             stream_service.clone(),
+            control_service.clone(),
         );
 
         let protocol = Self {
@@ -263,6 +269,7 @@ impl Protocol {
             sync_service,
             stream_service,
             topic_service,
+            control_service,
             stats_service,
             event_tx,
             event_rx: Arc::new(RwLock::new(Some(event_rx))),
@@ -368,8 +375,8 @@ mod tests {
     use super::*;
     use crate::data::schema::create_all_tables;
     use crate::data::{
-        add_topic_member, get_all_topics, get_topic_members, remove_topic_member, subscribe_topic,
-        unsubscribe_topic,
+        add_topic_member, ensure_peer_exists, get_all_topics, get_topic_members, remove_topic_member,
+        subscribe_topic, subscribe_topic_with_admin, unsubscribe_topic,
     };
     use crate::protocol::TopicInvite;
 
@@ -387,7 +394,7 @@ mod tests {
     #[test]
     fn test_protocol_config() {
         let config = ProtocolConfig::for_testing();
-        assert!(!config.enable_pow);
+        assert!(config.bootstrap_nodes.is_empty());
     }
 
     #[test]
@@ -526,23 +533,30 @@ mod tests {
     fn test_topic_invite_from_db() {
         let conn = setup_test_db();
         let topic_id = test_id(42);
+        let admin_id = test_id(1);
         let members = vec![test_id(1), test_id(2)];
 
-        // Setup
-        subscribe_topic(&conn, &topic_id).unwrap();
+        // Ensure peers exist for FK constraints
+        for m in &members {
+            ensure_peer_exists(&conn, m).unwrap();
+        }
+
+        // Setup - use subscribe_topic_with_admin
+        subscribe_topic_with_admin(&conn, &topic_id, &admin_id).unwrap();
         for m in &members {
             add_topic_member(&conn, &topic_id, m).unwrap();
         }
 
         // Create invite from DB state
         let db_members = get_topic_members(&conn, &topic_id).unwrap();
-        let invite = TopicInvite::new(topic_id, db_members);
+        let invite = TopicInvite::new(topic_id, admin_id, db_members);
 
         // Serialize and restore
         let hex = invite.to_hex().unwrap();
         let restored = TopicInvite::from_hex(&hex).unwrap();
 
         assert_eq!(restored.topic_id, topic_id);
+        assert_eq!(restored.admin_id, Some(admin_id));
         assert_eq!(restored.members.len(), 2);
     }
 }

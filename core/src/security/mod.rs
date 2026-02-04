@@ -26,6 +26,8 @@ pub use create_key_pair::{generate_key_pair, key_pair_from_bytes, KeyPair};
 pub use send::{
     // Tier 1 functions (topic_id-derived keys, epoch 0)
     create_packet, verify_and_decrypt_packet, verify_and_decrypt_packet_with_mode,
+    // Tier 2 functions (epoch-specific keys)
+    verify_and_decrypt_with_epoch, derive_epoch_secret_from_topic,
     // Types
     EpochKeys, PacketError, SendPacket, VerificationMode,
     // DM
