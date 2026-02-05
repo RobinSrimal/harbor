@@ -49,6 +49,7 @@ harbor-core/
 ├── data/           # SQLCipher-encrypted storage + blob storage
 ├── handlers/       # Incoming/outgoing message handlers
 ├── network/
+│   ├── control/    # Peer lifecycle and relationship management
 │   ├── dht/        # Kademlia DHT implementation
 │   ├── harbor/     # Harbor Node protocol (store, pull, harbor sync)
 │   ├── membership/ # Topic join/leave messages
@@ -63,6 +64,42 @@ harbor-core/
 ```
 
 ## Core Concepts
+
+### Control Protocol (Peer Relationships)
+
+The Control protocol (`harbor/control/0`) manages peer lifecycle and relationships:
+
+```rust
+// Generate a connect token (for QR codes/invite links)
+let token = protocol.generate_connect_token().await?;
+
+// Request a connection to a peer
+protocol.request_connect(&peer_id, Some("Alice"), Some(token)).await?;
+
+// Accept/decline incoming connection requests
+protocol.accept_connect(&peer_id).await?;
+protocol.decline_connect(&peer_id).await?;
+
+// Block a peer
+protocol.block_peer(&peer_id).await?;
+
+// Suggest a peer to another peer
+protocol.suggest_peer(&target_id, &suggested_id, Some("Bob")).await?;
+```
+
+**Message types:**
+- `ConnectRequest` / `ConnectAccept` / `ConnectDecline` - Peer connection flow
+- `TopicInvite` - Invite a connected peer to a topic
+- `TopicJoin` / `TopicLeave` - Membership announcements
+- `RemoveMember` - Admin-only member removal with epoch key rotation
+- `Suggest` - Introduce a third-party peer
+
+**Events emitted:**
+- `ConnectRequest` - A peer wants to connect
+- `ConnectAccepted` / `ConnectDeclined` - Response to your request
+- `TopicInviteReceived` - You've been invited to a topic
+- `MemberJoined` / `MemberLeft` - Topic membership changes
+- `PeerSuggested` - A peer was suggested to you
 
 ### Topics
 
@@ -248,6 +285,9 @@ The protocol uses **SQLCipher** (encrypted SQLite) for persistence.
 | `dht_routing` | DHT routing table entries |
 | `topics` | Subscribed topics with HarborID |
 | `topic_members` | EndpointID + relay URL per topic |
+| `connection_list` | Peer relationships (connected, blocked, pending) |
+| `connect_tokens` | One-time tokens for invite strings |
+| `pending_topic_invites` | Temporary storage for pending topic invites |
 | `outgoing_packets` | Packets awaiting delivery confirmation |
 | `outgoing_recipients` | Per-recipient delivery status |
 | `harbor_cache` | Packets stored as Harbor Node |
@@ -283,8 +323,37 @@ Packet = {
 The `resilience` module provides protection against abuse:
 
 - **Rate Limiting**: Per-connection and per-HarborID limits
-- **Proof of Work**: Optional PoW for Harbor store requests
+- **Proof of Work**: Adaptive PoW with per-peer scaling for Harbor, Control, DHT, and Send protocols
 - **Storage Limits**: Configurable caps with automatic eviction
+
+### Proof of Work
+
+PoW uses BLAKE3 hashing with context-specific challenges:
+
+```rust
+// PoW is computed automatically by the protocol
+// Difficulty scales based on per-peer request/byte volume
+
+// ALPN presets:
+// - Harbor: 18-32 bits, byte-based scaling
+// - Control: 18-28 bits, request-based scaling
+// - DHT: 18-28 bits, request-based scaling
+// - Send: 8-20 bits, byte-based scaling (gentler for high-frequency)
+// - Share/Sync/Stream: Disabled
+```
+
+### Connection Gate
+
+Fast in-memory authorization cache for incoming connections:
+
+```rust
+// A peer is allowed if they are DM-connected OR share a topic with us
+// AND they are NOT blocked
+
+// The gate is updated automatically when:
+// - A peer connection is accepted/declined/blocked
+// - Topic membership changes
+```
 
 ## CLI
 
@@ -333,6 +402,9 @@ RUST_LOG=harbor_core::network::share=debug cargo run -p harbor-core
 
 # Debug streaming
 RUST_LOG=harbor_core::network::stream=debug cargo run -p harbor-core
+
+# Debug control protocol (connections, invites)
+RUST_LOG=harbor_core::network::control=debug cargo run -p harbor-core
 
 # Multiple modules
 RUST_LOG=info,harbor_core::network=debug cargo run -p harbor-core

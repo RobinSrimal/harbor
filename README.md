@@ -14,12 +14,15 @@ A peer-to-peer messaging protocol with offline delivery, built on [Iroh](https:/
 ## Features
 
 - **Messaging** - Topic-based group messaging and direct peer-to-peer messages
+- **Connection management** - Peer relationships with connect requests, blocking, and suggestions
 - **CRDT sync primitives** - Built-in support for collaborative applications
 - **File sharing** - P2P distribution for large files with BLAKE3 chunking
 - **Streaming** - Real-time streaming transport layer between peers
 - **Offline delivery** - Harbor Nodes store messages for offline members
 - **DHT routing** - Kademlia-style distributed hash table for peer discovery
 - **End-to-end encryption** - All messages signed and encrypted
+- **Proof of Work** - Adaptive PoW with per-peer scaling for Harbor, Control, DHT, and Send protocols
+- **Connection gating** - Fast authorization cache for incoming connections
 
 ## Quick Start
 
@@ -40,7 +43,7 @@ harbor/
 │   └── src/
 │       ├── data/       # SQLCipher-encrypted storage + blob storage
 │       ├── handlers/   # Incoming/outgoing message handlers
-│       ├── network/    # Services (DHT, Send, Harbor, Share, Sync, Stream)
+│       ├── network/    # Services (DHT, Send, Harbor, Share, Sync, Stream, Control)
 │       ├── protocol/   # Protocol struct and public API
 │       ├── security/   # Cryptographic operations
 │       ├── tasks/      # Background tasks (harbor pull, maintenance)
@@ -89,6 +92,7 @@ RUST_LOG=harbor_core::network::harbor=debug cargo run -p harbor-core
 | `harbor_core::network::harbor` | Harbor Node operations (store, pull, sync) |
 | `harbor_core::network::dht` | DHT routing, lookups, candidate verification |
 | `harbor_core::network::send` | Direct message sending |
+| `harbor_core::network::control` | Connection requests, topic invites, membership |
 | `harbor_core::network::stream` | Streaming sessions |
 | `harbor_core::protocol` | Protocol API operations |
 
