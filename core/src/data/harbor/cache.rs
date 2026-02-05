@@ -15,46 +15,10 @@ use crate::data::dht::current_timestamp;
 /// Maximum lifetime for cached packets (3 months in seconds)
 pub const PACKET_LIFETIME_SECS: i64 = 90 * 24 * 60 * 60;
 
-/// Packet type for verification mode
-/// - Content (0): Full verification (MAC + signature)
-/// - Join (1): MAC-only verification (sender key unknown to recipients)
-/// - Leave (2): Full verification
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PacketType {
-    Content = 0,
-    Join = 1,
-    Leave = 2,
-}
-
-impl PacketType {
-    /// Check if this packet type requires signature verification
-    pub fn requires_signature(&self) -> bool {
-        match self {
-            PacketType::Content => true,
-            PacketType::Join => false,
-            PacketType::Leave => true,
-        }
-    }
-}
-
-impl From<u8> for PacketType {
-    fn from(value: u8) -> Self {
-        match value {
-            1 => PacketType::Join,
-            2 => PacketType::Leave,
-            _ => PacketType::Content,
-        }
-    }
-}
-
-impl From<PacketType> for u8 {
-    fn from(value: PacketType) -> Self {
-        value as u8
-    }
-}
-
 /// A cached packet stored by a Harbor Node
+///
+/// Harbor stores opaque encrypted bytes. The packet type is not stored
+/// separately - recipients derive the type from plaintext[0] after decryption.
 #[derive(Debug, Clone)]
 pub struct CachedPacket {
     /// Unique packet identifier
@@ -63,10 +27,8 @@ pub struct CachedPacket {
     pub harbor_id: [u8; 32],
     /// Sender's EndpointID
     pub sender_id: [u8; 32],
-    /// Serialized packet data
+    /// Serialized packet data (opaque encrypted bytes)
     pub packet_data: Vec<u8>,
-    /// Type of packet (affects verification mode)
-    pub packet_type: PacketType,
     /// Whether this was synced from another Harbor Node (vs original)
     pub synced: bool,
     /// When the packet was stored
@@ -99,17 +61,14 @@ fn parse_cached_packet_row(row: &rusqlite::Row) -> rusqlite::Result<CachedPacket
     let harbor_id = parse_id(&harbor_id_vec, "harbor_id")?;
     let sender_id = parse_id(&sender_id_vec, "sender_id")?;
 
-    let packet_type_u8: u8 = row.get(4)?;
-
     Ok(CachedPacket {
         packet_id,
         harbor_id,
         sender_id,
         packet_data: row.get(3)?,
-        packet_type: PacketType::from(packet_type_u8),
-        synced: row.get(5)?,
-        created_at: row.get(6)?,
-        expires_at: row.get(7)?,
+        synced: row.get(4)?,
+        created_at: row.get(5)?,
+        expires_at: row.get(6)?,
     })
 }
 
@@ -120,29 +79,29 @@ fn parse_cached_packet_row(row: &rusqlite::Row) -> rusqlite::Result<CachedPacket
 /// - We sync a packet from another Harbor Node
 ///
 /// This operation is atomic - either the packet and all recipients are stored, or none are.
+/// Harbor stores opaque encrypted bytes - no packet type needed.
 pub fn cache_packet(
     conn: &mut Connection,
     packet_id: &[u8; 32],
     harbor_id: &[u8; 32],
     sender_id: &[u8; 32],
     packet_data: &[u8],
-    packet_type: PacketType,
     recipients: &[[u8; 32]],
     synced: bool,
 ) -> rusqlite::Result<()> {
-    cache_packet_with_ttl(conn, packet_id, harbor_id, sender_id, packet_data, packet_type, recipients, synced, None)
+    cache_packet_with_ttl(conn, packet_id, harbor_id, sender_id, packet_data, recipients, synced, None)
 }
 
 /// Store a packet in the harbor cache with an optional custom TTL
 ///
 /// If `ttl_secs` is None, uses the default PACKET_LIFETIME_SECS (3 months).
+/// Harbor stores opaque encrypted bytes - no packet type needed.
 pub fn cache_packet_with_ttl(
     conn: &mut Connection,
     packet_id: &[u8; 32],
     harbor_id: &[u8; 32],
     sender_id: &[u8; 32],
     packet_data: &[u8],
-    packet_type: PacketType,
     recipients: &[[u8; 32]],
     synced: bool,
     ttl_secs: Option<i64>,
@@ -153,15 +112,14 @@ pub fn cache_packet_with_ttl(
     let tx = conn.transaction()?;
 
     tx.execute(
-        "INSERT OR REPLACE INTO harbor_cache 
-         (packet_id, harbor_id, sender_id, packet_data, packet_type, synced, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT OR REPLACE INTO harbor_cache
+         (packet_id, harbor_id, sender_id, packet_data, synced, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             packet_id.as_slice(),
             harbor_id.as_slice(),
             sender_id.as_slice(),
             packet_data,
-            u8::from(packet_type),
             synced,
             now,
             expires_at,
@@ -186,7 +144,7 @@ pub fn get_cached_packet(
     packet_id: &[u8; 32],
 ) -> rusqlite::Result<Option<CachedPacket>> {
     conn.query_row(
-        "SELECT packet_id, harbor_id, sender_id, packet_data, packet_type, synced, created_at, expires_at
+        "SELECT packet_id, harbor_id, sender_id, packet_data, synced, created_at, expires_at
          FROM harbor_cache WHERE packet_id = ?1",
         [packet_id.as_slice()],
         parse_cached_packet_row,
@@ -213,10 +171,10 @@ pub fn get_packets_for_recipient(
     // 1. The specific recipient_id, OR
     // 2. The wildcard recipient (catch-up mode packets available to all members)
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT c.packet_id, c.harbor_id, c.sender_id, c.packet_data, c.packet_type, c.synced, c.created_at, c.expires_at
+        "SELECT DISTINCT c.packet_id, c.harbor_id, c.sender_id, c.packet_data, c.synced, c.created_at, c.expires_at
          FROM harbor_cache c
          JOIN harbor_recipients r ON c.packet_id = r.packet_id
-         WHERE c.harbor_id = ?1 
+         WHERE c.harbor_id = ?1
            AND (r.recipient_id = ?2 OR r.recipient_id = ?5)
            AND r.delivered = 0
            AND c.created_at >= ?3
@@ -314,8 +272,8 @@ pub fn get_packets_for_sync(
 ) -> rusqlite::Result<Vec<CachedPacket>> {
     let now = current_timestamp();
     let mut stmt = conn.prepare(
-        "SELECT packet_id, harbor_id, sender_id, packet_data, packet_type, synced, created_at, expires_at
-         FROM harbor_cache 
+        "SELECT packet_id, harbor_id, sender_id, packet_data, synced, created_at, expires_at
+         FROM harbor_cache
          WHERE harbor_id = ?1 AND expires_at > ?2
          ORDER BY created_at ASC",
     )?;
@@ -487,7 +445,6 @@ mod tests {
             &harbor_id,
             &sender_id,
             b"packet data",
-            PacketType::Content,
             &recipients,
             false,
         )
@@ -498,7 +455,6 @@ mod tests {
         assert_eq!(cached.harbor_id, harbor_id);
         assert_eq!(cached.sender_id, sender_id);
         assert_eq!(cached.packet_data, b"packet data");
-        assert_eq!(cached.packet_type, PacketType::Content);
         assert!(!cached.synced);
     }
 
@@ -515,7 +471,6 @@ mod tests {
             &harbor_id,
             &test_id(3),
             b"packet 1",
-            PacketType::Content,
             &[recipient],
             false,
         )
@@ -527,7 +482,6 @@ mod tests {
             &harbor_id,
             &test_id(4),
             b"packet 2",
-            PacketType::Content,
             &[recipient],
             false,
         )
@@ -549,7 +503,6 @@ mod tests {
             &test_id(2),
             &test_id(3),
             b"data",
-            PacketType::Content,
             &[recipient],
             false,
         )
@@ -575,7 +528,6 @@ mod tests {
             &test_id(2),
             &test_id(3),
             b"data",
-            PacketType::Content,
             &recipients,
             false,
         )
@@ -601,7 +553,6 @@ mod tests {
             &test_id(2),
             &test_id(3),
             b"data",
-            PacketType::Content,
             &recipients,
             false,
         )
@@ -633,7 +584,6 @@ mod tests {
             &test_id(100),
             &test_id(3),
             b"data",
-            PacketType::Content,
             &[test_id(10)],
             false,
         )
@@ -646,7 +596,6 @@ mod tests {
             &test_id(200),
             &test_id(4),
             b"data",
-            PacketType::Content,
             &[test_id(11)],
             true,
         )
@@ -668,7 +617,6 @@ mod tests {
             &test_id(2),
             &test_id(3),
             b"data",
-            PacketType::Content,
             &[test_id(10)],
             false,
         )
@@ -718,7 +666,6 @@ mod tests {
             &harbor_id,
             &test_id(3),
             b"old packet",
-            PacketType::Content,
             &[recipient],
             false,
         )
@@ -745,7 +692,6 @@ mod tests {
             &harbor_id,
             &test_id(3),
             b"original",
-            PacketType::Content,
             &[],
             false,
         )
@@ -758,7 +704,6 @@ mod tests {
             &harbor_id,
             &test_id(4),
             b"synced",
-            PacketType::Content,
             &[],
             true,
         )
@@ -769,26 +714,6 @@ mod tests {
 
         assert!(!original.synced);
         assert!(synced.synced);
-    }
-
-    #[test]
-    fn test_packet_type_requires_signature() {
-        assert!(PacketType::Content.requires_signature());
-        assert!(!PacketType::Join.requires_signature());
-        assert!(PacketType::Leave.requires_signature());
-    }
-
-    #[test]
-    fn test_packet_type_conversions() {
-        assert_eq!(PacketType::from(0), PacketType::Content);
-        assert_eq!(PacketType::from(1), PacketType::Join);
-        assert_eq!(PacketType::from(2), PacketType::Leave);
-        // Unknown values default to Content
-        assert_eq!(PacketType::from(255), PacketType::Content);
-        
-        assert_eq!(u8::from(PacketType::Content), 0);
-        assert_eq!(u8::from(PacketType::Join), 1);
-        assert_eq!(u8::from(PacketType::Leave), 2);
     }
 
     #[test]
@@ -803,7 +728,6 @@ mod tests {
             &test_id(2),
             &test_id(3),
             b"data",
-            PacketType::Content,
             &recipients,
             false,
         )

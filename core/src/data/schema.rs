@@ -207,10 +207,12 @@ pub fn create_outgoing_table(conn: &Connection) -> rusqlite::Result<()> {
 /// This node acts as a Harbor Node for HarborIDs where it has original packets.
 /// Packets have a 3-month lifetime.
 ///
+/// Harbor stores opaque encrypted bytes. The packet type is not stored separately -
+/// recipients derive the type from plaintext[0] after decryption.
+///
 /// All BLOB ID fields are 32 bytes (256-bit identifiers).
 pub fn create_harbor_table(conn: &Connection) -> rusqlite::Result<()> {
     // Main harbor cache table
-    // packet_type: 0=Content, 1=Join, 2=Leave
     // synced: 0=not yet synced to partner harbor nodes, 1=synced
     //         Used for Harbor Protocol replication - ensures packets are
     //         distributed to multiple Harbor Nodes for redundancy
@@ -220,7 +222,6 @@ pub fn create_harbor_table(conn: &Connection) -> rusqlite::Result<()> {
             harbor_id BLOB NOT NULL CHECK (length(harbor_id) = 32),
             sender_id BLOB NOT NULL CHECK (length(sender_id) = 32),
             packet_data BLOB NOT NULL,
-            packet_type INTEGER NOT NULL DEFAULT 0,
             synced INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             expires_at INTEGER NOT NULL

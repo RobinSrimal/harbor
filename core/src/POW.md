@@ -34,12 +34,14 @@ Where `context` is a variable-length byte slice provided by each ALPN. This prev
 | **harbor** | `harbor_id \|\| packet_id` | Same as current. Binds to specific topic + packet. |
 | **control** | `sender_endpoint_id \|\| message_type_byte` | Binds to sender identity and action type. |
 | **dht** | `sender_endpoint_id \|\| query_hash` | Binds to sender and specific query. |
-| **send** | `sender_endpoint_id \|\| topic_id` | Binds to sender and topic. |
-| **share** | `sender_endpoint_id \|\| topic_id` | Binds to sender and topic. |
-| **sync** | `sender_endpoint_id \|\| topic_id` | Binds to sender and topic. |
-| **stream** | `sender_endpoint_id \|\| topic_id` | Binds to sender and topic. |
+| **send** | `sender_endpoint_id \|\| harbor_id` | Binds to sender and topic without exposing topic_id. |
+| **share** | `sender_endpoint_id \|\| harbor_id` | Binds to sender and topic without exposing topic_id. |
+| **sync** | `sender_endpoint_id \|\| harbor_id` | Binds to sender and topic without exposing topic_id. |
+| **stream** | `sender_endpoint_id \|\| harbor_id` | Binds to sender and topic without exposing topic_id. |
 
-For DM-scoped data plane messages, `topic_id` would be replaced with `recipient_endpoint_id`.
+For DM-scoped data plane messages, `harbor_id` would be replaced with `recipient_endpoint_id`.
+
+> Note: `harbor_id = BLAKE3(topic_id)` so the context stays topic-bound without leaking the topic secret.
 
 ## Per-ALPN Configuration
 
@@ -171,6 +173,18 @@ PoW timestamp freshness (default 5 minutes) limits the replay window. For contro
 - Duplicate IDs are dropped
 
 Not needed for other ALPNs (Harbor stores are idempotent, DHT queries are stateless, data plane is gated).
+
+## Topic Binding Without TopicID (Non-PoW)
+
+Independently of PoW, protocols that must bind to a topic but should not
+send the raw `topic_id` on the wire should include:
+
+- `harbor_id` (BLAKE3(topic_id)) for topic lookup
+- `membership_proof = BLAKE3(topic_id || harbor_id || sender_id)` to prove knowledge of the topic
+
+This is used for topic-scoped control messages (TopicJoin, TopicLeave, RemoveMember)
+and for SYNC_ALPN responses/requests. TopicInvite is the exception and must carry
+`topic_id` so the recipient can learn the secret.
 
 ## Refactoring Required
 

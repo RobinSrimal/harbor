@@ -10,7 +10,7 @@ pub mod encrypt;
 pub mod sign;
 
 // Re-export for convenience
-pub use authenticate::{create_mac, verify_mac};
+pub use authenticate::create_mac;
 pub use encrypt::{decrypt, encrypt, generate_nonce};
 pub use sign::{sign_packet, verify_packet};
 

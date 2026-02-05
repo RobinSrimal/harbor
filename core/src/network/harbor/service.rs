@@ -261,7 +261,7 @@ mod tests {
     use crate::security::topic_keys::harbor_id_from_topic;
     use rusqlite::Connection;
 
-    use super::super::protocol::{HarborPacketType, StoreRequest};
+    use super::super::protocol::StoreRequest;
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -346,7 +346,6 @@ mod tests {
                 sender_id: sender_keypair.public_key,
                 packet_data: packet_bytes.clone(),
                 recipients: vec![test_id(40)],
-                packet_type: HarborPacketType::Content,
             };
             let result = service.handle_store(&mut conn, request);
             assert!(result.is_ok(), "Request {} should succeed", i);
@@ -359,7 +358,6 @@ mod tests {
             sender_id: sender_keypair.public_key,
             packet_data: packet_bytes,
             recipients: vec![test_id(40)],
-            packet_type: HarborPacketType::Content,
         };
         let result = service.handle_store(&mut conn, request);
         assert!(matches!(result, Err(HarborError::RateLimited { .. })));
@@ -392,7 +390,6 @@ mod tests {
                 sender_id: sender_keypair.public_key,
                 packet_data: packet_bytes.clone(),
                 recipients: vec![test_id(40)],
-                packet_type: HarborPacketType::Content,
             };
             let result = service.handle_store(&mut conn, request);
             assert!(
@@ -446,7 +443,6 @@ mod tests {
             sender_id: sender_keypair.public_key,
             packet_data: packet_bytes.clone(),
             recipients: vec![test_id(40)],
-            packet_type: HarborPacketType::Content,
         };
         let result = service.handle_store(&mut conn, request1);
         let response = result.expect("First request should not error");
@@ -473,7 +469,6 @@ mod tests {
             sender_id: sender_keypair.public_key,
             packet_data: packet_bytes2,
             recipients: vec![test_id(40)],
-            packet_type: HarborPacketType::Content,
         };
         let result = service.handle_store(&mut conn, request2);
         assert!(
@@ -526,7 +521,6 @@ mod tests {
             sender_id: sender_keypair.public_key,
             packet_data: packet_bytes.clone(),
             recipients: vec![test_id(40)],
-            packet_type: HarborPacketType::Content,
         };
         let result = service.handle_store(&mut conn, request1);
         let response = result.expect("First request should not error");
@@ -552,7 +546,6 @@ mod tests {
             sender_id: sender_keypair.public_key,
             packet_data: packet_bytes2,
             recipients: vec![test_id(40)],
-            packet_type: HarborPacketType::Content,
         };
         let result = service.handle_store(&mut conn, request2);
         assert!(
@@ -579,7 +572,6 @@ mod tests {
             sender_id: sender_keypair.public_key,
             packet_data: packet_bytes3,
             recipients: vec![test_id(40)],
-            packet_type: HarborPacketType::Content,
         };
         let result = service.handle_store(&mut conn, request3);
         let response = result.expect("Third request should not error");
@@ -620,7 +612,6 @@ mod tests {
                 sender_id: sender_keypair.public_key,
                 packet_data: packet_bytes.clone(),
                 recipients: vec![test_id(40)],
-                packet_type: HarborPacketType::Content,
             };
             let result = service.handle_store(&mut conn, request);
             assert!(

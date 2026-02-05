@@ -12,34 +12,16 @@ use tracing::{debug, info, warn};
 
 use crate::data::harbor::{
     all_recipients_delivered, cache_packet, delete_packet, get_packets_for_recipient,
-    get_packets_for_sync, mark_delivered, PacketType,
+    get_packets_for_sync, mark_delivered,
 };
 use crate::resilience::{RateLimitResult, StorageCheckResult};
 use crate::security::send::packet::{verify_for_storage, PacketError};
 
 use super::protocol::{
-    DeliveryAck, DeliveryUpdate, HarborMessage, HarborPacketType, PacketInfo, PullRequest,
+    DeliveryAck, DeliveryUpdate, HarborMessage, PacketInfo, PullRequest,
     PullResponse, StoreRequest, StoreResponse, SyncRequest, SyncResponse,
 };
 use super::service::{HarborError, HarborService};
-
-/// Convert from protocol packet type to data layer packet type
-fn harbor_packet_type_to_data(hpt: HarborPacketType) -> PacketType {
-    match hpt {
-        HarborPacketType::Content => PacketType::Content,
-        HarborPacketType::Join => PacketType::Join,
-        HarborPacketType::Leave => PacketType::Leave,
-    }
-}
-
-/// Convert from data layer packet type to protocol packet type
-fn data_packet_type_to_harbor(pt: PacketType) -> HarborPacketType {
-    match pt {
-        PacketType::Content => HarborPacketType::Content,
-        PacketType::Join => HarborPacketType::Join,
-        PacketType::Leave => HarborPacketType::Leave,
-    }
-}
 
 impl HarborService {
     /// Check rate limit for a connection
@@ -238,9 +220,6 @@ impl HarborService {
             }
         }
 
-        // Convert packet type
-        let packet_type = harbor_packet_type_to_data(request.packet_type);
-
         // Store the packet (now verified!)
         cache_packet(
             conn,
@@ -248,7 +227,6 @@ impl HarborService {
             &request.harbor_id,
             &request.sender_id,
             &request.packet_data,
-            packet_type,
             &request.recipients,
             false, // Not synced, this is an original
         )
@@ -336,7 +314,6 @@ impl HarborService {
                 sender_id: p.sender_id,
                 packet_data: p.packet_data,
                 created_at: p.created_at,
-                packet_type: data_packet_type_to_harbor(p.packet_type),
             })
             .collect();
 
@@ -450,7 +427,6 @@ impl HarborService {
                 sender_id: p.sender_id,
                 packet_data: p.packet_data,
                 created_at: p.created_at,
-                packet_type: data_packet_type_to_harbor(p.packet_type),
             })
             .collect();
 
@@ -599,7 +575,6 @@ mod tests {
             harbor_id,
             sender_id: sender_keypair.public_key,
             recipients: vec![test_id(40), test_id(41)],
-            packet_type: HarborPacketType::Content,
         };
 
         let response = service.handle_store(&mut conn, request).unwrap();
@@ -621,7 +596,6 @@ mod tests {
             harbor_id: test_id(20),
             sender_id: test_id(30),
             recipients: vec![test_id(40)],
-            packet_type: HarborPacketType::Content,
         };
 
         let response = service.handle_store(&mut conn, request).unwrap();
@@ -640,7 +614,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet 1",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -652,7 +625,6 @@ mod tests {
             &test_id(20),
             &test_id(31),
             b"packet 2",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -682,7 +654,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -712,7 +683,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet 1",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -724,7 +694,6 @@ mod tests {
             &test_id(20),
             &test_id(31),
             b"packet 2",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -755,7 +724,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -786,7 +754,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -814,7 +781,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet",
-            PacketType::Content,
             &[test_id(1), test_id(2)],
             false,
         )
@@ -845,7 +811,6 @@ mod tests {
             &test_id(20), // harbor_id
             &test_id(30),
             b"packet data",
-            PacketType::Content,
             &[test_id(40)],
             false,
         )
@@ -879,7 +844,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet data",
-            PacketType::Content,
             &[test_id(40)],
             false,
         )
@@ -912,7 +876,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet data",
-            PacketType::Content,
             &[test_id(40), test_id(41)],
             false,
         )
@@ -950,7 +913,6 @@ mod tests {
             harbor_id: test_id(20),
             sender_id: test_id(30),
             recipients: vec![test_id(40)],
-            packet_type: HarborPacketType::Content,
         });
 
         // Authenticated node ID is test_id(40)
@@ -986,7 +948,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet",
-            PacketType::Content,
             &[test_id(40)],
             false,
         )
@@ -1017,7 +978,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet",
-            PacketType::Content,
             &[test_id(40)],
             false,
         )
@@ -1053,7 +1013,6 @@ mod tests {
             &test_id(20), // harbor_id
             &test_id(30),
             b"packet data",
-            PacketType::Content,
             &[test_id(40), test_id(41)],
             false,
         )

@@ -488,7 +488,7 @@ impl fmt::Display for StorageCheckResult {
 mod tests {
     use super::*;
     use crate::data::schema::create_harbor_table;
-    use crate::data::harbor::{cache_packet, PacketType};
+    use crate::data::harbor::cache_packet;
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -525,7 +525,6 @@ mod tests {
             &test_id(10),
             &test_id(20),
             &data,
-            PacketType::Content,
             &[test_id(30)],
             false,
         ).unwrap();
@@ -536,7 +535,6 @@ mod tests {
             &test_id(10),
             &test_id(21),
             &data,
-            PacketType::Content,
             &[test_id(30)],
             false,
         ).unwrap();
@@ -579,7 +577,6 @@ mod tests {
             &test_id(10),
             &test_id(20),
             &data,
-            PacketType::Content,
             &[test_id(30)],
             false,
         ).unwrap();
@@ -611,7 +608,6 @@ mod tests {
             &test_id(10),
             &test_id(20),
             &data,
-            PacketType::Content,
             &[test_id(30)],
             false,
         ).unwrap();
@@ -644,7 +640,6 @@ mod tests {
                 &test_id(10),
                 &test_id(20),
                 &data,
-                PacketType::Content,
                 &[test_id(30)],
                 false,
             ).unwrap();
@@ -676,7 +671,6 @@ mod tests {
             &test_id(10),
             &test_id(20),
             &data,
-            PacketType::Content,
             &[test_id(30)],
             false,
         ).unwrap();
@@ -687,7 +681,6 @@ mod tests {
             &test_id(10),
             &test_id(21),
             &data,
-            PacketType::Content,
             &[test_id(30)],
             false,
         ).unwrap();
@@ -767,7 +760,6 @@ mod tests {
             &test_id(10),
             &test_id(20),
             &data,
-            PacketType::Content,
             &[test_id(30)],
             false,
         )
@@ -860,7 +852,6 @@ mod tests {
                 &test_id(harbor_seed),
                 &test_id(20),
                 &data,
-                PacketType::Content,
                 &[test_id(30)],
                 false,
             )

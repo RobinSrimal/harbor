@@ -21,25 +21,19 @@ use crate::network::connect;
 
 use crate::data::harbor::{
     cache_packet, cleanup_expired, get_active_harbor_ids, get_cached_packet, get_packets_for_sync,
-    get_undelivered_recipients, mark_pulled, was_pulled, PacketType,
+    get_undelivered_recipients, mark_pulled, was_pulled,
 };
 use crate::network::dht::DhtService;
+use crate::network::process::{ProcessContext, ProcessScope, ProcessError, process_packet};
+use crate::network::stream::StreamService;
 use crate::protocol::ProtocolError;
+use crate::security::{SendPacket, EpochKeys, VerificationMode, verify_and_decrypt_with_epoch, verify_and_decrypt_dm_packet};
 
 use super::protocol::{
-    DeliveryAck, HarborPacketType, HarborMessage, PacketInfo, PullRequest, PullResponse,
+    DeliveryAck, HarborMessage, PacketInfo, PullRequest, PullResponse,
     StoreRequest, SyncRequest, SyncResponse, HARBOR_ALPN,
 };
 use super::service::{HarborError, HarborService};
-
-/// Convert from protocol packet type to data layer packet type
-fn harbor_packet_type_to_data(hpt: HarborPacketType) -> PacketType {
-    match hpt {
-        HarborPacketType::Content => PacketType::Content,
-        HarborPacketType::Join => PacketType::Join,
-        HarborPacketType::Leave => PacketType::Leave,
-    }
-}
 
 impl HarborService {
     // ============ Client Side ============
@@ -53,7 +47,6 @@ impl HarborService {
         harbor_id: [u8; 32],
         packet_data: Vec<u8>,
         undelivered_recipients: Vec<[u8; 32]>,
-        packet_type: HarborPacketType,
     ) -> StoreRequest {
         trace!(
             packet_id = %hex::encode(packet_id),
@@ -69,7 +62,6 @@ impl HarborService {
             harbor_id,
             sender_id: self.endpoint_id,
             recipients: undelivered_recipients,
-            packet_type,
         }
     }
 
@@ -175,6 +167,90 @@ impl HarborService {
         }
     }
 
+    // ============ Packet Processing ============
+
+    /// Process a pulled packet using unified packet dispatch
+    ///
+    /// This is the main entry point for processing packets pulled from Harbor.
+    /// It handles:
+    /// 1. Parsing the SendPacket from raw bytes
+    /// 2. Decryption based on scope (DM key vs topic key)
+    /// 3. Unified dispatch via process_packet()
+    ///
+    /// # Arguments
+    /// * `packet_info` - The packet info from the pull response
+    /// * `scope` - Whether this is a DM or Topic pull (determines decryption key)
+    /// * `stream_service` - Stream service for handling stream signaling
+    ///
+    /// # Returns
+    /// Ok(()) if processing succeeded, or ProcessError if it failed
+    pub async fn process_pulled_packet(
+        &self,
+        packet_info: &PacketInfo,
+        scope: ProcessScope,
+        stream_service: &Arc<StreamService>,
+    ) -> Result<(), ProcessError> {
+        // Parse the SendPacket
+        let send_packet = SendPacket::from_bytes(&packet_info.packet_data)
+            .map_err(|e| ProcessError::Decode(format!("failed to parse SendPacket: {}", e)))?;
+
+        // Decrypt based on scope
+        let plaintext = match &scope {
+            ProcessScope::Dm => {
+                // DM: use our private key
+                let private_key = {
+                    let db_lock = self.db().lock().await;
+                    crate::data::identity::get_identity(&db_lock)
+                        .map_err(|e| ProcessError::Database(e.to_string()))?
+                        .ok_or_else(|| ProcessError::Database("no identity found".into()))?
+                        .private_key
+                };
+
+                verify_and_decrypt_dm_packet(&send_packet, &private_key)
+                    .map_err(|e| ProcessError::Decode(format!("DM decryption failed: {}", e)))?
+            }
+            ProcessScope::Topic { topic_id } => {
+                // Topic: get epoch key and try Full, then MacOnly
+                let epoch_key_opt = {
+                    let db_lock = self.db().lock().await;
+                    crate::data::get_epoch_key(&db_lock, topic_id, send_packet.epoch)
+                        .ok()
+                        .flatten()
+                };
+
+                let stored_key = epoch_key_opt.ok_or_else(|| {
+                    ProcessError::Decode(format!(
+                        "no epoch key for topic {} epoch {}",
+                        hex::encode(&topic_id[..8]),
+                        send_packet.epoch
+                    ))
+                })?;
+
+                let epoch_keys = EpochKeys::derive_from_secret(send_packet.epoch, &stored_key.key_data);
+
+                // Try Full verification first (most common)
+                verify_and_decrypt_with_epoch(&send_packet, topic_id, &epoch_keys, VerificationMode::Full)
+                    .or_else(|_| {
+                        // Fall back to MacOnly for TopicJoin packets
+                        verify_and_decrypt_with_epoch(&send_packet, topic_id, &epoch_keys, VerificationMode::MacOnly)
+                    })
+                    .map_err(|e| ProcessError::Decode(format!("topic decryption failed: {}", e)))?
+            }
+        };
+
+        // Build ProcessContext
+        let ctx = ProcessContext {
+            db: self.db().clone(),
+            event_tx: self.event_tx().clone(),
+            our_id: self.endpoint_id,
+            stream_service: stream_service.clone(),
+            scope,
+        };
+
+        // Dispatch to unified processor
+        process_packet(&plaintext, packet_info.sender_id, packet_info.created_at, &ctx).await
+    }
+
     // ============ Maintenance ============
 
     /// Get HarborIDs we're actively serving as a Harbor Node
@@ -268,7 +344,6 @@ impl HarborService {
                 &response.harbor_id,
                 &packet.sender_id,
                 &packet.packet_data,
-                harbor_packet_type_to_data(packet.packet_type),
                 &recipients,
                 true, // Synced from another Harbor Node
             )
@@ -672,14 +747,12 @@ mod tests {
             test_id(20),
             b"packet data".to_vec(),
             vec![test_id(40), test_id(41)],
-            HarborPacketType::Content,
         );
 
         assert_eq!(request.packet_id, test_id(10));
         assert_eq!(request.harbor_id, test_id(20));
         assert_eq!(request.sender_id, test_id(1));
         assert_eq!(request.recipients.len(), 2);
-        assert_eq!(request.packet_type, HarborPacketType::Content);
     }
 
     #[test]
@@ -710,7 +783,6 @@ mod tests {
                 sender_id: test_id(30),
                 packet_data: b"packet".to_vec(),
                 created_at: current_timestamp(),
-                packet_type: HarborPacketType::Content,
             }],
         };
 
@@ -753,7 +825,6 @@ mod tests {
             &test_id(20), // harbor_id 1
             &test_id(30),
             b"packet 1",
-            PacketType::Content,
             &[test_id(40)],
             false,
         )
@@ -765,7 +836,6 @@ mod tests {
             &test_id(21), // harbor_id 2
             &test_id(31),
             b"packet 2",
-            PacketType::Content,
             &[test_id(41)],
             false,
         )
@@ -805,7 +875,6 @@ mod tests {
                 sender_id: test_id(30),
                 packet_data: b"synced packet".to_vec(),
                 created_at: current_timestamp(),
-                packet_type: HarborPacketType::Content,
             }],
             delivery_updates: vec![],
             members: vec![],
@@ -831,7 +900,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet",
-            PacketType::Content,
             &[test_id(40), test_id(41)],
             false,
         )
@@ -873,7 +941,6 @@ mod tests {
             &harbor_id,
             &test_id(30),
             b"packet A",
-            PacketType::Content,
             &[test_id(40)],
             false,
         )
@@ -886,7 +953,6 @@ mod tests {
             &harbor_id,
             &test_id(31),
             b"packet B",
-            PacketType::Content,
             &[test_id(41)],
             false,
         )
@@ -936,7 +1002,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet data",
-            PacketType::Content,
             &[test_id(40), test_id(41)],
             false,
         )

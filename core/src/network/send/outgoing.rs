@@ -22,14 +22,11 @@ use crate::data::dht::peer::{get_peer_relay_info, update_peer_relay_url, current
 use crate::data::send::store_outgoing_packet;
 use crate::data::send::acknowledge_receipt as db_acknowledge_receipt;
 use crate::data::{
-    get_topic_members, LocalIdentity, WILDCARD_RECIPIENT,
-    add_topic_member, remove_topic_member, mark_pulled,
+    get_topic_members, LocalIdentity, WILDCARD_RECIPIENT, mark_pulled,
     get_blob, insert_blob, init_blob_sections, record_peer_can_seed, CHUNK_SIZE,
 };
 use crate::network::connect;
-use crate::network::harbor::protocol::HarborPacketType;
-use crate::network::send::topic_messages::TopicMessage;
-use crate::network::send::topic_messages::get_verification_mode_from_payload;
+use crate::network::packet::TopicMessage;
 use crate::security::{
     SendPacket, PacketError, verify_and_decrypt_packet, verify_and_decrypt_packet_with_mode,
     VerificationMode, verify_and_decrypt_dm_packet,
@@ -39,8 +36,6 @@ use super::incoming::{ProcessError, ProcessResult, PacketSource};
 /// Options controlling how a packet is sent and stored
 #[derive(Debug, Clone)]
 pub struct SendOptions {
-    /// Packet type for harbor storage semantics
-    pub packet_type: HarborPacketType,
     /// If true, skip storing in outgoing table (direct delivery only, no harbor replication)
     pub skip_harbor: bool,
     /// Override default harbor TTL. None = use default (PACKET_LIFETIME_SECS)
@@ -50,7 +45,6 @@ pub struct SendOptions {
 impl Default for SendOptions {
     fn default() -> Self {
         Self {
-            packet_type: HarborPacketType::Content,
             skip_harbor: false,
             ttl: None,
         }
@@ -66,16 +60,9 @@ impl SendOptions {
     /// Direct-only delivery (no harbor storage)
     pub fn direct_only() -> Self {
         Self {
-            packet_type: HarborPacketType::Content,
             skip_harbor: true,
             ttl: None,
         }
-    }
-
-    /// With a specific packet type
-    pub fn with_packet_type(mut self, packet_type: HarborPacketType) -> Self {
-        self.packet_type = packet_type;
-        self
     }
 
     /// With a custom harbor TTL
@@ -272,7 +259,7 @@ impl SendService {
         }
 
         // Encode as Content message and send
-        let content_msg = super::topic_messages::TopicMessage::Content(payload.to_vec());
+        let content_msg = crate::network::packet::TopicMessage::Content(payload.to_vec());
         let encoded_payload = content_msg.encode();
 
         self.send_to_topic(topic_id, &encoded_payload, &recipients, SendOptions::content())
@@ -289,7 +276,7 @@ impl SendService {
         recipient_id: &[u8; 32],
         payload: &[u8],
     ) -> Result<(), SendError> {
-        use crate::network::send::dm_messages::DmMessage;
+        use crate::network::packet::DmMessage;
 
         let encoded = DmMessage::Content(payload.to_vec()).encode();
         self.send_to_dm(recipient_id, &encoded).await
@@ -326,7 +313,7 @@ impl SendService {
                 &harbor_id,
                 encoded_payload,  // Raw payload, not encrypted
                 &[*recipient_id],
-                HarborPacketType::Content as u8,
+                0, // packet_type is embedded in payload now
             ).map_err(|e| SendError::Database(e.to_string()))?;
         }
 
@@ -395,7 +382,7 @@ impl SendService {
                 &harbor_id,
                 encoded_payload,  // Raw payload, not encrypted
                 &recipient_ids,
-                options.packet_type as u8,
+                0, // packet_type is embedded in payload now
             ).map_err(|e| SendError::Database(e.to_string()))?;
         }
 
@@ -629,7 +616,7 @@ impl SendService {
         // Parse topic message (payload is already plaintext)
         let topic_msg = match TopicMessage::decode(payload) {
             Ok(msg) => {
-                info!(msg_type = ?msg.message_type(), "decoded TopicMessage from raw payload");
+                info!(msg_type = ?msg.packet_type(), "decoded TopicMessage from raw payload");
                 Some(msg)
             }
             Err(e) => {
@@ -660,17 +647,45 @@ impl SendService {
         sender_id: [u8; 32],
         payload: &[u8],
     ) -> Result<ProcessResult, ProcessError> {
-        use crate::network::send::dm_messages::DmMessage;
+        use crate::network::packet::{
+            DmMessage, StreamSignalingMessage, is_dm_message_type, is_stream_signaling_type
+        };
 
         let our_id = self.endpoint_id();
         info!(payload_len = payload.len(), "processing raw DM payload (direct delivery)");
 
-        // Decode DmMessage (payload is already plaintext)
-        let dm_msg = DmMessage::decode(payload)
-            .map_err(|e| ProcessError::VerificationFailed(format!("DM decode: {}", e)))?;
+        if payload.is_empty() {
+            return Err(ProcessError::VerificationFailed("empty payload".to_string()));
+        }
 
         // Generate a packet_id for the receipt
         let packet_id = generate_packet_id();
+
+        let type_byte = payload[0];
+
+        // Check if this is a stream signaling message (0x50-0x5F)
+        if is_stream_signaling_type(type_byte) {
+            let stream_msg = StreamSignalingMessage::decode(payload)
+                .map_err(|e| ProcessError::VerificationFailed(format!("Stream signaling decode: {}", e)))?;
+
+            if let Some(stream_svc) = self.stream_service().await {
+                stream_svc.handle_stream_signaling_msg(&stream_msg, sender_id).await;
+            }
+
+            return Ok(ProcessResult {
+                receipt: super::protocol::Receipt::new(packet_id, our_id),
+                content_payload: None,
+            });
+        }
+
+        // Check if this is a DM message (0x40-0x4F)
+        if !is_dm_message_type(type_byte) {
+            return Err(ProcessError::VerificationFailed(format!("unknown type byte: 0x{:02x}", type_byte)));
+        }
+
+        // Decode DmMessage (payload is already plaintext)
+        let dm_msg = DmMessage::decode(payload)
+            .map_err(|e| ProcessError::VerificationFailed(format!("DM decode: {}", e)))?;
 
         // Handle the decoded DM message
         match dm_msg {
@@ -684,11 +699,11 @@ impl SendService {
                 );
                 let _ = self.event_tx.send(event).await;
             }
-            DmMessage::SyncUpdate(data) => {
+            DmMessage::SyncUpdate(msg) => {
                 let event = crate::protocol::ProtocolEvent::DmSyncUpdate(
                     crate::protocol::DmSyncUpdateEvent {
                         sender_id,
-                        data,
+                        data: msg.data,
                     },
                 );
                 let _ = self.event_tx.send(event).await;
@@ -715,13 +730,8 @@ impl SendService {
                 );
                 let _ = self.event_tx.send(event).await;
             }
-            // DM stream signaling — route to StreamService
-            DmMessage::StreamAccept(_)
-            | DmMessage::StreamReject(_)
-            | DmMessage::StreamQuery(_)
-            | DmMessage::StreamActive(_)
-            | DmMessage::StreamEnded(_)
-            | DmMessage::StreamRequest(_) => {
+            // DM stream request — route to StreamService
+            DmMessage::StreamRequest(_) => {
                 if let Some(stream_svc) = self.stream_service().await {
                     stream_svc.handle_dm_signaling(&dm_msg, sender_id).await;
                 }
@@ -805,59 +815,6 @@ impl SendService {
         if let Some(msg) = topic_msg {
             let db_lock = db.lock().await;
             match msg {
-                TopicMessage::Join(join) => {
-                    if join.joiner != sender_id {
-                        warn!(
-                            joiner = %hex::encode(join.joiner),
-                            sender = %hex::encode(sender_id),
-                            "join message joiner doesn't match packet sender - ignoring"
-                        );
-                    } else {
-                        trace!(
-                            joiner = %hex::encode(join.joiner),
-                            relay = ?join.relay_url,
-                            topic = %hex::encode(topic_id),
-                            "received join message"
-                        );
-
-                        if let Err(e) = add_topic_member(
-                            &db_lock,
-                            topic_id,
-                            &join.joiner,
-                        ) {
-                            warn!(error = %e, "failed to add member");
-                        }
-
-                        if let Some(ref relay_url) = join.relay_url {
-                            let _ = crate::data::update_peer_relay_url(
-                                &db_lock,
-                                &join.joiner,
-                                relay_url,
-                                crate::data::current_timestamp(),
-                            );
-                        }
-
-                        debug!(
-                            joiner = hex::encode(join.joiner),
-                            relay = ?join.relay_url,
-                            "member joined"
-                        );
-                    }
-                }
-                TopicMessage::Leave(leave) => {
-                    if leave.leaver != sender_id {
-                        warn!(
-                            leaver = %hex::encode(leave.leaver),
-                            sender = %hex::encode(sender_id),
-                            "leave message leaver doesn't match packet sender - ignoring"
-                        );
-                    } else {
-                        if let Err(e) = remove_topic_member(&db_lock, topic_id, &leave.leaver) {
-                            warn!(error = %e, "failed to remove member");
-                        }
-                        debug!(leaver = hex::encode(leave.leaver), "member left");
-                    }
-                }
                 TopicMessage::FileAnnouncement(ann) => {
                     if ann.source_id != sender_id {
                         warn!(
@@ -1025,12 +982,13 @@ impl SendService {
         let event_tx = &self.event_tx;
         let stream = self.stream_service().await;
 
-        // Determine verification mode from payload prefix
-        let mode = get_verification_mode_from_payload(&packet.ciphertext)
-            .unwrap_or(VerificationMode::Full);
-
-        // Verify and decrypt
-        let plaintext = verify_and_decrypt_packet_with_mode(packet, topic_id, mode)
+        // Verify and decrypt - try Full mode first, fall back to MacOnly for TopicJoin
+        // We can't know the packet type until after decryption (harbor stores opaque bytes)
+        let plaintext = verify_and_decrypt_packet_with_mode(packet, topic_id, VerificationMode::Full)
+            .or_else(|_| {
+                // Fall back to MacOnly for packets from unknown senders (TopicJoin)
+                verify_and_decrypt_packet_with_mode(packet, topic_id, VerificationMode::MacOnly)
+            })
             .map_err(|e| ProcessError::VerificationFailed(e.to_string()))?;
 
         info!(plaintext_len = plaintext.len(), "packet decrypted successfully");
@@ -1038,7 +996,7 @@ impl SendService {
         // Parse topic message
         let topic_msg = match TopicMessage::decode(&plaintext) {
             Ok(msg) => {
-                info!(msg_type = ?msg.message_type(), "decoded TopicMessage");
+                info!(msg_type = ?msg.packet_type(), "decoded TopicMessage");
                 Some(msg)
             }
             Err(e) => {
@@ -1109,59 +1067,6 @@ impl SendService {
         if let Some(ref msg) = topic_msg {
             let db_lock = db.lock().await;
             match msg {
-                TopicMessage::Join(join) => {
-                    if join.joiner != sender_id {
-                        warn!(
-                            joiner = %hex::encode(join.joiner),
-                            sender = %hex::encode(sender_id),
-                            "join message joiner doesn't match packet sender - ignoring"
-                        );
-                    } else {
-                        trace!(
-                            joiner = %hex::encode(join.joiner),
-                            relay = ?join.relay_url,
-                            topic = %hex::encode(topic_id),
-                            "received join message"
-                        );
-
-                        if let Err(e) = add_topic_member(
-                            &db_lock,
-                            topic_id,
-                            &join.joiner,
-                        ) {
-                            warn!(error = %e, "failed to add member");
-                        }
-
-                        if let Some(ref relay_url) = join.relay_url {
-                            let _ = crate::data::update_peer_relay_url(
-                                &db_lock,
-                                &join.joiner,
-                                relay_url,
-                                crate::data::current_timestamp(),
-                            );
-                        }
-
-                        debug!(
-                            joiner = hex::encode(join.joiner),
-                            relay = ?join.relay_url,
-                            "member joined"
-                        );
-                    }
-                }
-                TopicMessage::Leave(leave) => {
-                    if leave.leaver != sender_id {
-                        warn!(
-                            leaver = %hex::encode(leave.leaver),
-                            sender = %hex::encode(sender_id),
-                            "leave message leaver doesn't match packet sender - ignoring"
-                        );
-                    } else {
-                        if let Err(e) = remove_topic_member(&db_lock, topic_id, &leave.leaver) {
-                            warn!(error = %e, "failed to remove member");
-                        }
-                        debug!(leaver = hex::encode(leave.leaver), "member left");
-                    }
-                }
                 TopicMessage::FileAnnouncement(ann) => {
                     if ann.source_id != sender_id {
                         warn!(
@@ -1319,7 +1224,9 @@ impl SendService {
         &self,
         packet: &SendPacket,
     ) -> Result<ProcessResult, ProcessError> {
-        use crate::network::send::dm_messages::DmMessage;
+        use crate::network::packet::{
+            DmMessage, StreamSignalingMessage, is_dm_message_type, is_stream_signaling_type
+        };
 
         let our_id = self.endpoint_id();
 
@@ -1328,6 +1235,32 @@ impl SendService {
             .map_err(|e| ProcessError::VerificationFailed(e.to_string()))?;
 
         info!(plaintext_len = plaintext.len(), "DM packet decrypted");
+
+        if plaintext.is_empty() {
+            return Err(ProcessError::VerificationFailed("empty plaintext".to_string()));
+        }
+
+        let type_byte = plaintext[0];
+
+        // Check if this is a stream signaling message (0x50-0x5F)
+        if is_stream_signaling_type(type_byte) {
+            let stream_msg = StreamSignalingMessage::decode(&plaintext)
+                .map_err(|e| ProcessError::VerificationFailed(format!("Stream signaling decode: {}", e)))?;
+
+            if let Some(stream_svc) = self.stream_service().await {
+                stream_svc.handle_stream_signaling_msg(&stream_msg, packet.endpoint_id).await;
+            }
+
+            return Ok(ProcessResult {
+                receipt: super::protocol::Receipt::new(packet.packet_id, our_id),
+                content_payload: None,
+            });
+        }
+
+        // Check if this is a DM message (0x40-0x4F)
+        if !is_dm_message_type(type_byte) {
+            return Err(ProcessError::VerificationFailed(format!("unknown type byte: 0x{:02x}", type_byte)));
+        }
 
         // Decode DmMessage
         let dm_msg = DmMessage::decode(&plaintext)
@@ -1344,11 +1277,11 @@ impl SendService {
                 );
                 let _ = self.event_tx.send(event).await;
             }
-            DmMessage::SyncUpdate(data) => {
+            DmMessage::SyncUpdate(msg) => {
                 let event = crate::protocol::ProtocolEvent::DmSyncUpdate(
                     crate::protocol::DmSyncUpdateEvent {
                         sender_id: packet.endpoint_id,
-                        data,
+                        data: msg.data,
                     },
                 );
                 let _ = self.event_tx.send(event).await;
@@ -1375,13 +1308,8 @@ impl SendService {
                 );
                 let _ = self.event_tx.send(event).await;
             }
-            // DM stream signaling — route to StreamService
-            DmMessage::StreamAccept(_)
-            | DmMessage::StreamReject(_)
-            | DmMessage::StreamQuery(_)
-            | DmMessage::StreamActive(_)
-            | DmMessage::StreamEnded(_)
-            | DmMessage::StreamRequest(_) => {
+            // DM stream request — route to StreamService
+            DmMessage::StreamRequest(_) => {
                 if let Some(stream_svc) = self.stream_service().await {
                     stream_svc.handle_dm_signaling(&dm_msg, packet.endpoint_id).await;
                 }

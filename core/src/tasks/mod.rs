@@ -51,17 +51,15 @@ impl Protocol {
         // 3. Harbor pull loop (periodically pull missed packets from Harbor Nodes)
         let harbor_service = self.harbor_service.clone();
         let running = self.running.clone();
-        let event_tx = self.event_tx.clone();
         let our_id = self.identity.public_key;
         let pull_interval = Duration::from_secs(self.config.harbor_pull_interval_secs);
         let pull_max_nodes = self.config.harbor_pull_max_nodes;
         let pull_early_stop = self.config.harbor_pull_early_stop;
-
         let stream_service = self.stream_service.clone();
+
         let pull_task = tokio::spawn(async move {
             Self::run_harbor_pull_loop(
                 harbor_service,
-                event_tx,
                 our_id,
                 running,
                 pull_interval,

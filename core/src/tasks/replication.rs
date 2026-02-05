@@ -19,7 +19,6 @@ use crate::data::send::{
     get_packets_needing_replication, delete_outgoing_packet,
 };
 use crate::network::harbor::HarborService;
-use crate::network::harbor::protocol::HarborPacketType;
 use crate::security::send::{seal_topic_packet_with_epoch, seal_dm_packet, EpochKeys};
 
 use crate::protocol::Protocol;
@@ -89,13 +88,6 @@ impl Protocol {
                     let _ = delete_outgoing_packet(&db_lock, &packet.packet_id);
                     continue;
                 }
-
-                // Get packet type from stored value
-                let packet_type = match packet.packet_type {
-                    1 => HarborPacketType::Join,
-                    2 => HarborPacketType::Leave,
-                    _ => HarborPacketType::Content,
-                };
 
                 // Get identity for sealing
                 let identity = harbor_service.identity();
@@ -219,7 +211,6 @@ impl Protocol {
                     harbor_id: packet.harbor_id,
                     sender_id: our_id,
                     recipients: unacked_recipients,
-                    packet_type,
                 };
 
                 // Send to Harbor Nodes (best effort, try up to max_replication_attempts)

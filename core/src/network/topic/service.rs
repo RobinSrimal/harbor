@@ -20,8 +20,9 @@ use crate::data::{
     subscribe_topic_with_admin, unsubscribe_topic,
     LocalIdentity, WILDCARD_RECIPIENT,
 };
-use crate::network::harbor::protocol::HarborPacketType;
-use crate::network::send::topic_messages::{JoinMessage, LeaveMessage, TopicMessage};
+use crate::network::control::protocol::{ControlPacketType, TopicJoin, TopicLeave};
+use crate::network::membership::create_membership_proof;
+use crate::security::harbor_id_from_topic;
 use crate::network::send::{SendService, SendOptions};
 use super::types::{MemberInfo, TopicInvite};
 
@@ -154,14 +155,30 @@ impl TopicService {
             }
         }
 
-        // Send join announcement
+        // Send join announcement (Control protocol TopicJoin)
         let our_relay = self.relay_url();
-        let join_msg = if let Some(ref relay) = our_relay {
-            JoinMessage::with_relay(our_id, relay.clone())
-        } else {
-            JoinMessage::new(our_id)
+        let message_id = {
+            use rand::RngCore;
+            let mut id = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut id);
+            id
         };
-        let payload = TopicMessage::Join(join_msg).encode();
+        let harbor_id = harbor_id_from_topic(&invite.topic_id);
+        let membership_proof = create_membership_proof(&invite.topic_id, &harbor_id, &our_id);
+
+        let join_msg = TopicJoin {
+            message_id,
+            harbor_id,
+            sender_id: our_id,
+            epoch: 0, // Initial join is always epoch 0
+            relay_url: our_relay.clone(),
+            membership_proof,
+        };
+        // Encode as Control packet: [type_byte][serialized_data]
+        let serialized = postcard::to_allocvec(&join_msg).expect("serialization should succeed");
+        let mut payload = Vec::with_capacity(1 + serialized.len());
+        payload.push(ControlPacketType::TopicJoin as u8);
+        payload.extend_from_slice(&serialized);
 
         trace!(
             our_id = %hex::encode(our_id),
@@ -183,7 +200,7 @@ impl TopicService {
                 &invite.topic_id,
                 &payload,
                 &members_with_wildcard,
-                SendOptions::default().with_packet_type(HarborPacketType::Join),
+                SendOptions::default(),
             )
             .await
             .map_err(|e| TopicError::Network(e.to_string()));
@@ -205,9 +222,28 @@ impl TopicService {
                 .map_err(|e| TopicError::Database(e.to_string()))?
         };
 
-        // Send leave announcement
-        let leave_msg = LeaveMessage::new(our_id);
-        let payload = TopicMessage::Leave(leave_msg).encode();
+        // Send leave announcement (Control protocol TopicLeave)
+        let message_id = {
+            use rand::RngCore;
+            let mut id = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut id);
+            id
+        };
+        let harbor_id = harbor_id_from_topic(topic_id);
+        let membership_proof = create_membership_proof(topic_id, &harbor_id, &our_id);
+
+        let leave_msg = TopicLeave {
+            message_id,
+            harbor_id,
+            sender_id: our_id,
+            epoch: 0, // TODO: use current epoch
+            membership_proof,
+        };
+        // Encode as Control packet: [type_byte][serialized_data]
+        let serialized = postcard::to_allocvec(&leave_msg).expect("serialization should succeed");
+        let mut payload = Vec::with_capacity(1 + serialized.len());
+        payload.push(ControlPacketType::TopicLeave as u8);
+        payload.extend_from_slice(&serialized);
 
         let mut remaining_members: Vec<MemberInfo> = members
             .into_iter()
@@ -221,7 +257,7 @@ impl TopicService {
 
         let send_result = self
             .send_service
-            .send_to_topic(topic_id, &payload, &remaining_members, SendOptions::default().with_packet_type(HarborPacketType::Leave))
+            .send_to_topic(topic_id, &payload, &remaining_members, SendOptions::default())
             .await
             .map_err(|e| TopicError::Network(e.to_string()));
         if let Err(e) = send_result {

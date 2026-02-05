@@ -11,6 +11,8 @@ use irpc::channel::oneshot;
 use irpc::rpc_requests;
 use serde::{Deserialize, Serialize};
 
+pub use crate::network::membership::{create_membership_proof, verify_membership_proof};
+
 /// Send protocol ALPN
 pub const SEND_ALPN: &[u8] = b"harbor/send/0";
 
@@ -52,34 +54,8 @@ pub struct DeliverTopic {
     pub payload: Vec<u8>,
 }
 
-/// Create a membership proof for DeliverTopic
-///
-/// The proof is BLAKE3(topic_id || harbor_id || sender_id).
-/// Verifying this proves the sender knows the topic_id (the shared secret).
-pub fn create_membership_proof(
-    topic_id: &[u8; 32],
-    harbor_id: &[u8; 32],
-    sender_id: &[u8; 32],
-) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(topic_id);
-    hasher.update(harbor_id);
-    hasher.update(sender_id);
-    *hasher.finalize().as_bytes()
-}
-
-/// Verify a membership proof for DeliverTopic
-///
-/// Returns true if the proof matches, proving sender knows topic_id.
-pub fn verify_membership_proof(
-    topic_id: &[u8; 32],
-    harbor_id: &[u8; 32],
-    sender_id: &[u8; 32],
-    proof: &[u8; 32],
-) -> bool {
-    let expected = create_membership_proof(topic_id, harbor_id, sender_id);
-    expected == *proof
-}
+// Membership proof helpers are defined in network::membership and re-exported here
+// for backward compatibility.
 
 /// Direct delivery of a DM (raw payload over QUIC TLS)
 ///

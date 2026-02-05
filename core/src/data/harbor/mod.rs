@@ -14,7 +14,7 @@ pub use cache::{
     get_harbor_cache_stats, get_packets_for_recipient, get_packets_for_sync,
     get_undelivered_recipients, mark_delivered, mark_pulled, was_pulled,
     cleanup_old_pulled_packets, cleanup_pulled_for_topic, get_pulled_packet_ids,
-    CachedPacket, PacketType, PACKET_LIFETIME_SECS, WILDCARD_RECIPIENT,
+    CachedPacket, PACKET_LIFETIME_SECS, WILDCARD_RECIPIENT,
 };
 pub use dedup::{
     check_and_mark as dedup_check_and_mark, get_total_tracked_count, get_tracked_count,

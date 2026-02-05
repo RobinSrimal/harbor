@@ -10,6 +10,8 @@ use crate::data::{
     store_epoch_key, store_pending_invite, token_exists, update_connection_state,
     upsert_connection, ConnectionState,
 };
+use crate::data::membership::get_topic_by_harbor_id;
+use crate::network::membership::verify_membership_proof;
 use crate::protocol::{
     ConnectionAcceptedEvent, ConnectionDeclinedEvent, ConnectionRequestEvent,
     PeerSuggestedEvent, ProtocolEvent, TopicInviteReceivedEvent, TopicMemberJoinedEvent,
@@ -299,10 +301,32 @@ pub async fn handle_topic_join(
         return ControlAck::failure(join.message_id, "sender mismatch");
     }
 
+    // Resolve topic_id from harbor_id
+    let topic_id = {
+        let db = service.db().lock().await;
+        match get_topic_by_harbor_id(&db, &join.harbor_id) {
+            Ok(Some(topic)) => topic.topic_id,
+            Ok(None) => {
+                warn!(harbor_id = %hex::encode(&join.harbor_id[..8]), "unknown topic for join");
+                return ControlAck::failure(join.message_id, "unknown topic");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to resolve topic from harbor_id");
+                return ControlAck::failure(join.message_id, "internal error");
+            }
+        }
+    };
+
+    // Verify membership proof
+    if !verify_membership_proof(&topic_id, &join.harbor_id, &sender_id, &join.membership_proof) {
+        warn!("topic join invalid membership proof");
+        return ControlAck::failure(join.message_id, "invalid membership proof");
+    }
+
     // Add member to topic (the data layer handles this)
     {
         let db = service.db().lock().await;
-        if let Err(e) = crate::data::add_topic_member(&db, &join.topic_id, &sender_id) {
+        if let Err(e) = crate::data::add_topic_member(&db, &topic_id, &sender_id) {
             warn!(error = %e, "failed to add topic member");
             // Don't fail the ack - member might already exist
         }
@@ -310,14 +334,14 @@ pub async fn handle_topic_join(
 
     info!(
         member = %hex::encode(&sender_id[..8]),
-        topic = %hex::encode(&join.topic_id[..8]),
+        topic = %hex::encode(&topic_id[..8]),
         epoch = join.epoch,
         "topic member joined"
     );
 
     // Emit event
     let event = ProtocolEvent::TopicMemberJoined(TopicMemberJoinedEvent {
-        topic_id: join.topic_id,
+        topic_id,
         member_id: sender_id,
         relay_url: join.relay_url.clone(),
     });
@@ -337,24 +361,46 @@ pub async fn handle_topic_leave(
         return ControlAck::failure(leave.message_id, "sender mismatch");
     }
 
+    // Resolve topic_id from harbor_id
+    let topic_id = {
+        let db = service.db().lock().await;
+        match get_topic_by_harbor_id(&db, &leave.harbor_id) {
+            Ok(Some(topic)) => topic.topic_id,
+            Ok(None) => {
+                warn!(harbor_id = %hex::encode(&leave.harbor_id[..8]), "unknown topic for leave");
+                return ControlAck::failure(leave.message_id, "unknown topic");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to resolve topic from harbor_id");
+                return ControlAck::failure(leave.message_id, "internal error");
+            }
+        }
+    };
+
+    // Verify membership proof
+    if !verify_membership_proof(&topic_id, &leave.harbor_id, &sender_id, &leave.membership_proof) {
+        warn!("topic leave invalid membership proof");
+        return ControlAck::failure(leave.message_id, "invalid membership proof");
+    }
+
     // Remove member from topic
     {
         let db = service.db().lock().await;
-        if let Err(e) = crate::data::remove_topic_member(&db, &leave.topic_id, &sender_id) {
+        if let Err(e) = crate::data::remove_topic_member(&db, &topic_id, &sender_id) {
             warn!(error = %e, "failed to remove topic member");
         }
     }
 
     info!(
         member = %hex::encode(&sender_id[..8]),
-        topic = %hex::encode(&leave.topic_id[..8]),
+        topic = %hex::encode(&topic_id[..8]),
         epoch = leave.epoch,
         "topic member left"
     );
 
     // Emit event
     let event = ProtocolEvent::TopicMemberLeft(TopicMemberLeftEvent {
-        topic_id: leave.topic_id,
+        topic_id,
         member_id: sender_id,
     });
     let _ = service.event_tx().send(event).await;
@@ -373,15 +419,37 @@ pub async fn handle_remove_member(
         return ControlAck::failure(remove.message_id, "sender mismatch");
     }
 
+    // Resolve topic_id from harbor_id
+    let topic_id = {
+        let db = service.db().lock().await;
+        match get_topic_by_harbor_id(&db, &remove.harbor_id) {
+            Ok(Some(topic)) => topic.topic_id,
+            Ok(None) => {
+                warn!(harbor_id = %hex::encode(&remove.harbor_id[..8]), "unknown topic for remove member");
+                return ControlAck::failure(remove.message_id, "unknown topic");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to resolve topic from harbor_id");
+                return ControlAck::failure(remove.message_id, "internal error");
+            }
+        }
+    };
+
+    // Verify membership proof
+    if !verify_membership_proof(&topic_id, &remove.harbor_id, &sender_id, &remove.membership_proof) {
+        warn!("remove member invalid membership proof");
+        return ControlAck::failure(remove.message_id, "invalid membership proof");
+    }
+
     // Verify sender is admin of the topic
     {
         let db = service.db().lock().await;
-        match is_topic_admin(&db, &remove.topic_id, &sender_id) {
+        match is_topic_admin(&db, &topic_id, &sender_id) {
             Ok(true) => {}
             Ok(false) => {
                 warn!(
                     sender = %hex::encode(&sender_id[..8]),
-                    topic = %hex::encode(&remove.topic_id[..8]),
+                    topic = %hex::encode(&topic_id[..8]),
                     "remove member rejected: sender is not admin"
                 );
                 return ControlAck::failure(remove.message_id, "not authorized");
@@ -396,7 +464,7 @@ pub async fn handle_remove_member(
     // Remove the member from our local membership
     {
         let db = service.db().lock().await;
-        if let Err(e) = crate::data::remove_topic_member(&db, &remove.topic_id, &remove.removed_member) {
+        if let Err(e) = crate::data::remove_topic_member(&db, &topic_id, &remove.removed_member) {
             warn!(error = %e, "failed to remove topic member");
         }
     }
@@ -404,14 +472,14 @@ pub async fn handle_remove_member(
     // Store the new epoch key
     {
         let db = service.db().lock().await;
-        if let Err(e) = store_epoch_key(&db, &remove.topic_id, remove.new_epoch, &remove.new_epoch_key) {
+        if let Err(e) = store_epoch_key(&db, &topic_id, remove.new_epoch, &remove.new_epoch_key) {
             warn!(error = %e, "failed to store new epoch key");
         }
     }
 
     info!(
         admin = %hex::encode(&sender_id[..8]),
-        topic = %hex::encode(&remove.topic_id[..8]),
+        topic = %hex::encode(&topic_id[..8]),
         removed = %hex::encode(&remove.removed_member[..8]),
         new_epoch = remove.new_epoch,
         "received new epoch key after member removal"
@@ -419,7 +487,7 @@ pub async fn handle_remove_member(
 
     // Emit event
     let event = ProtocolEvent::TopicEpochRotated(TopicEpochRotatedEvent {
-        topic_id: remove.topic_id,
+        topic_id,
         new_epoch: remove.new_epoch,
         removed_member: remove.removed_member,
     });

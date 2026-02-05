@@ -21,16 +21,12 @@
 //! - `incoming.rs` - Receiving packets (process_incoming_packet, ProcessResult, ProcessError)
 //! - `protocol.rs` - irpc wire protocol (SendRpcProtocol, DeliverTopic, DeliverDm, Receipt)
 //! - `pool.rs` - Connection pooling
-//! - `topic_messages.rs` - TopicMessage format
-//! - `dm_messages.rs` - DmMessage format
 
-pub mod dm_messages;
 pub mod incoming;
 pub mod outgoing;
 pub mod pool;
 pub mod protocol;
 pub mod service;
-pub mod topic_messages;
 
 pub use pool::{SendPool, SendPoolConfig, SendPoolError, SendConnectionRef, SendPoolStats, SEND_ALPN as SEND_ALPN_FROM_POOL};
 pub use protocol::{SEND_ALPN, Receipt};
@@ -44,13 +40,16 @@ pub use incoming::{
     ProcessResult, ProcessError, PacketSource, ReceiveError,
 };
 
-// DM message types
-pub use dm_messages::{DmMessage, DmMessageType, DmDecodeError, is_dm_message_type};
-
-// Topic message types (payload format for Send packets)
-pub use topic_messages::{
-    get_verification_mode_from_payload, DecodeError as TopicMessageDecodeError,
-    JoinMessage, LeaveMessage, MessageType as TopicMessageType, TopicMessage,
-    FileAnnouncementMessage, CanSeedMessage, SyncUpdateMessage,
-    StreamRequestMessage,
+// Re-export message types from network/packet for backwards compatibility
+pub use crate::network::packet::{
+    // Payload structs
+    FileAnnouncementMessage, CanSeedMessage, SyncUpdateMessage, StreamRequestMessage,
+    DmStreamRequestMessage, StreamAcceptMessage, StreamRejectMessage,
+    StreamQueryMessage, StreamActiveMessage, StreamEndedMessage,
+    // Wrapper enums
+    TopicMessage, DmMessage, StreamSignalingMessage,
+    // Decode error
+    DecodeError as TopicMessageDecodeError,
+    // Helper functions
+    is_dm_message_type, is_stream_signaling_type,
 };

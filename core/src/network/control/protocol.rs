@@ -17,22 +17,23 @@ use serde::{Deserialize, Serialize};
 /// Control protocol ALPN
 pub const CONTROL_ALPN: &[u8] = b"harbor/control/0";
 
-/// Packet type prefixes for Harbor storage
+/// Control packet type prefixes (0x80-0x87)
 ///
-/// These determine verification mode:
-/// - TopicJoin uses MacOnly (sender unknown to recipient initially)
+/// These match the PacketType byte values for control messages.
+/// Verification mode:
+/// - TopicJoin uses MacOnly (sender may be unknown to some recipients)
 /// - All others use Full verification (MAC + signature)
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlPacketType {
-    ConnectRequest = 0x01,
-    ConnectAccept = 0x02,
-    ConnectDecline = 0x03,
-    TopicInvite = 0x10,
-    TopicJoin = 0x11,
-    TopicLeave = 0x12,
-    RemoveMember = 0x20,
-    Suggest = 0x30,
+    ConnectRequest = 0x80,
+    ConnectAccept = 0x81,
+    ConnectDecline = 0x82,
+    TopicInvite = 0x83,
+    TopicJoin = 0x84,
+    TopicLeave = 0x85,
+    RemoveMember = 0x86,
+    Suggest = 0x87,
 }
 
 impl ControlPacketType {
@@ -45,14 +46,14 @@ impl ControlPacketType {
     /// Convert from byte
     pub fn from_byte(b: u8) -> Option<Self> {
         match b {
-            0x01 => Some(Self::ConnectRequest),
-            0x02 => Some(Self::ConnectAccept),
-            0x03 => Some(Self::ConnectDecline),
-            0x10 => Some(Self::TopicInvite),
-            0x11 => Some(Self::TopicJoin),
-            0x12 => Some(Self::TopicLeave),
-            0x20 => Some(Self::RemoveMember),
-            0x30 => Some(Self::Suggest),
+            0x80 => Some(Self::ConnectRequest),
+            0x81 => Some(Self::ConnectAccept),
+            0x82 => Some(Self::ConnectDecline),
+            0x83 => Some(Self::TopicInvite),
+            0x84 => Some(Self::TopicJoin),
+            0x85 => Some(Self::TopicLeave),
+            0x86 => Some(Self::RemoveMember),
+            0x87 => Some(Self::Suggest),
             _ => None,
         }
     }
@@ -187,14 +188,16 @@ pub struct TopicInvite {
 pub struct TopicJoin {
     /// Unique message ID
     pub message_id: [u8; 32],
-    /// The topic being joined (hashed for harbor_id)
-    pub topic_id: [u8; 32],
+    /// Harbor ID for this topic (hash of topic_id)
+    pub harbor_id: [u8; 32],
     /// Joiner's endpoint ID
     pub sender_id: [u8; 32],
     /// Epoch the join is valid for
     pub epoch: u64,
     /// Joiner's relay URL
     pub relay_url: Option<String>,
+    /// Membership proof (BLAKE3(topic_id || harbor_id || sender_id))
+    pub membership_proof: [u8; 32],
 }
 
 /// Leave a topic
@@ -206,12 +209,14 @@ pub struct TopicJoin {
 pub struct TopicLeave {
     /// Unique message ID
     pub message_id: [u8; 32],
-    /// The topic being left
-    pub topic_id: [u8; 32],
+    /// Harbor ID for this topic (hash of topic_id)
+    pub harbor_id: [u8; 32],
     /// Leaver's endpoint ID
     pub sender_id: [u8; 32],
     /// Current epoch
     pub epoch: u64,
+    /// Membership proof (BLAKE3(topic_id || harbor_id || sender_id))
+    pub membership_proof: [u8; 32],
 }
 
 /// Remove a member from a topic (admin only)
@@ -223,8 +228,8 @@ pub struct TopicLeave {
 pub struct RemoveMember {
     /// Unique message ID
     pub message_id: [u8; 32],
-    /// The topic
-    pub topic_id: [u8; 32],
+    /// Harbor ID for this topic (hash of topic_id)
+    pub harbor_id: [u8; 32],
     /// Admin's endpoint ID
     pub sender_id: [u8; 32],
     /// Removed member's endpoint ID
@@ -233,6 +238,8 @@ pub struct RemoveMember {
     pub new_epoch: u64,
     /// New epoch key (32 bytes)
     pub new_epoch_key: [u8; 32],
+    /// Membership proof (BLAKE3(topic_id || harbor_id || sender_id))
+    pub membership_proof: [u8; 32],
 }
 
 // =============================================================================
@@ -306,11 +313,11 @@ mod tests {
     #[test]
     fn test_control_packet_type_byte_conversion() {
         assert_eq!(
-            ControlPacketType::from_byte(0x01),
+            ControlPacketType::from_byte(0x80),
             Some(ControlPacketType::ConnectRequest)
         );
         assert_eq!(
-            ControlPacketType::from_byte(0x11),
+            ControlPacketType::from_byte(0x84),
             Some(ControlPacketType::TopicJoin)
         );
         assert_eq!(ControlPacketType::from_byte(0xFF), None);
@@ -390,28 +397,44 @@ mod tests {
 
     #[test]
     fn test_topic_join_serialization() {
+        use crate::network::membership::create_membership_proof;
+        use crate::security::harbor_id_from_topic;
+
         let join = TopicJoin {
             message_id: [1u8; 32],
-            topic_id: [2u8; 32],
+            harbor_id: harbor_id_from_topic(&[2u8; 32]),
             sender_id: [3u8; 32],
             epoch: 5,
             relay_url: Some("https://relay.test".to_string()),
+            membership_proof: create_membership_proof(
+                &[2u8; 32],
+                &harbor_id_from_topic(&[2u8; 32]),
+                &[3u8; 32],
+            ),
         };
         let bytes = postcard::to_allocvec(&join).unwrap();
         let decoded: TopicJoin = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.topic_id, join.topic_id);
+        assert_eq!(decoded.harbor_id, join.harbor_id);
         assert_eq!(decoded.epoch, 5);
     }
 
     #[test]
     fn test_remove_member_serialization() {
+        use crate::network::membership::create_membership_proof;
+        use crate::security::harbor_id_from_topic;
+
+        let topic_id = [2u8; 32];
+        let harbor_id = harbor_id_from_topic(&topic_id);
+        let admin_id = [3u8; 32];
+
         let remove = RemoveMember {
             message_id: [1u8; 32],
-            topic_id: [2u8; 32],
-            sender_id: [3u8; 32],
+            harbor_id,
+            sender_id: admin_id,
             removed_member: [4u8; 32],
             new_epoch: 6,
             new_epoch_key: [5u8; 32],
+            membership_proof: create_membership_proof(&topic_id, &harbor_id, &admin_id),
         };
         let bytes = postcard::to_allocvec(&remove).unwrap();
         let decoded: RemoveMember = postcard::from_bytes(&bytes).unwrap();

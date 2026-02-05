@@ -12,6 +12,7 @@ use crate::data::{
     update_connection_state, upsert_connection, ConnectionState,
 };
 use crate::security::harbor_id_from_topic;
+use crate::network::membership::create_membership_proof;
 
 use super::protocol::{
     ConnectAccept, ConnectDecline, ConnectRequest, ControlPacketType, RemoveMember, Suggest,
@@ -382,12 +383,20 @@ pub async fn accept_topic_invite(
     let join_message_id = generate_id();
     let our_relay = service.endpoint().addr().relay_urls().next().map(|u| u.to_string());
 
+    let harbor_id = harbor_id_from_topic(&invite.topic_id);
+    let membership_proof = create_membership_proof(
+        &invite.topic_id,
+        &harbor_id,
+        &service.local_id(),
+    );
+
     let join = TopicJoin {
         message_id: join_message_id,
-        topic_id: invite.topic_id,
+        harbor_id,
         sender_id: service.local_id(),
         epoch: invite.epoch,
         relay_url: our_relay,
+        membership_proof,
     };
 
     // Try direct delivery to all members
@@ -401,7 +410,6 @@ pub async fn accept_topic_invite(
     }
 
     // Store for harbor replication (topic-scoped: harbor_id = hash(topic_id))
-    let harbor_id = harbor_id_from_topic(&invite.topic_id);
     store_control_packet(
         service,
         &join_message_id,
@@ -455,11 +463,15 @@ pub async fn leave_topic(service: &ControlService, topic_id: &[u8; 32]) -> Contr
         (members, epoch)
     };
 
+    let harbor_id = harbor_id_from_topic(topic_id);
+    let membership_proof = create_membership_proof(topic_id, &harbor_id, &service.local_id());
+
     let leave = TopicLeave {
         message_id,
-        topic_id: *topic_id,
+        harbor_id,
         sender_id: service.local_id(),
         epoch,
+        membership_proof,
     };
 
     // Try direct delivery to all members
@@ -473,7 +485,6 @@ pub async fn leave_topic(service: &ControlService, topic_id: &[u8; 32]) -> Contr
     }
 
     // Store for harbor replication (topic-scoped)
-    let harbor_id = harbor_id_from_topic(topic_id);
     store_control_packet(
         service,
         &message_id,
@@ -539,13 +550,18 @@ pub async fn remove_topic_member(
         }
 
         let message_id = generate_id();
+        let harbor_id = harbor_id_from_topic(topic_id);
+        let membership_proof =
+            create_membership_proof(topic_id, &harbor_id, &service.local_id());
+
         let remove = RemoveMember {
             message_id,
-            topic_id: *topic_id,
+            harbor_id,
             sender_id: service.local_id(),
             removed_member: *member_id,
             new_epoch,
             new_epoch_key,
+            membership_proof,
         };
 
         // Try direct delivery

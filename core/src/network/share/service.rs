@@ -960,8 +960,7 @@ impl ShareService {
         recipient_id: &[u8; 32],
         file_path: &Path,
     ) -> Result<[u8; 32], ShareError> {
-        use crate::network::send::dm_messages::DmMessage;
-        use crate::network::send::topic_messages::FileAnnouncementMessage;
+        use crate::network::packet::{DmMessage, FileAnnouncementMessage};
 
         // 1. Import file (use recipient_id as scope)
         let (hash, total_size, total_chunks, num_sections, display_name) =
@@ -1267,7 +1266,7 @@ impl ShareService {
         hash: &[u8; 32],
         recipients: &[crate::protocol::MemberInfo],
     ) -> Result<(), ShareError> {
-        use crate::network::send::topic_messages::{TopicMessage, CanSeedMessage};
+        use crate::network::packet::{TopicMessage, CanSeedMessage};
 
         let send_service = self.send_service.as_ref()
             .ok_or_else(|| ShareError::Protocol("send service not available".to_string()))?;
@@ -1514,7 +1513,7 @@ impl ShareService {
         num_sections: u8,
         display_name: &str,
     ) -> Result<AnnouncementPlan, ShareError> {
-        use crate::network::send::topic_messages::{FileAnnouncementMessage, TopicMessage};
+        use crate::network::packet::{FileAnnouncementMessage, TopicMessage};
         use crate::protocol::MemberInfo;
 
         // Get topic members
