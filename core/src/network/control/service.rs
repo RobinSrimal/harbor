@@ -68,6 +68,7 @@ pub type ControlResult<T> = Result<T, ControlError>;
 /// Handles:
 /// - Peer connection requests (connect/accept/decline)
 /// - Topic invitations and membership
+/// - Topic lifecycle (create, join, leave, list)
 /// - Key rotation (member removal)
 /// - Peer introductions (suggest)
 pub struct ControlService {
@@ -303,6 +304,39 @@ impl ControlService {
     /// Leave a topic
     pub async fn leave_topic(&self, topic_id: &[u8; 32]) -> ControlResult<()> {
         super::outgoing::leave_topic(self, topic_id).await
+    }
+
+    // =========================================================================
+    // Topic lifecycle operations (implemented in outgoing.rs)
+    // =========================================================================
+
+    /// Create a new topic
+    ///
+    /// Creates a new topic with this node as the only member.
+    /// Returns an invite that can be shared with others.
+    pub async fn create_topic(&self) -> ControlResult<super::types::TopicInvite> {
+        super::outgoing::create_topic(self).await
+    }
+
+    /// Join an existing topic
+    ///
+    /// Joins a topic using an invite received from another member.
+    /// The invite contains all current topic members.
+    /// Announces our presence to other members.
+    pub async fn join_topic(&self, invite: super::types::TopicInvite) -> ControlResult<()> {
+        super::outgoing::join_topic(self, invite).await
+    }
+
+    /// List all topics we're subscribed to
+    pub async fn list_topics(&self) -> ControlResult<Vec<[u8; 32]>> {
+        super::outgoing::list_topics(self).await
+    }
+
+    /// Get an invite for an existing topic
+    ///
+    /// Returns a fresh invite containing ALL current topic members.
+    pub async fn get_invite(&self, topic_id: &[u8; 32]) -> ControlResult<super::types::TopicInvite> {
+        super::outgoing::get_invite(self, topic_id).await
     }
 
     /// Remove a member from a topic (admin only)

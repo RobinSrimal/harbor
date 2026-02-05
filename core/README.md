@@ -49,10 +49,9 @@ harbor-core/
 ├── data/           # SQLCipher-encrypted storage + blob storage
 ├── handlers/       # Incoming/outgoing message handlers
 ├── network/
-│   ├── control/    # Peer lifecycle and relationship management
+│   ├── control/    # Peer lifecycle, topic management, and relationships
 │   ├── dht/        # Kademlia DHT implementation
 │   ├── harbor/     # Harbor Node protocol (store, pull, harbor sync)
-│   ├── membership/ # Topic join/leave messages
 │   ├── send/       # Message sending (includes CRDT sync messages)
 │   ├── share/      # P2P file sharing protocol
 │   ├── stream/     # Real-time streaming transport
@@ -65,9 +64,9 @@ harbor-core/
 
 ## Core Concepts
 
-### Control Protocol (Peer Relationships)
+### Control Protocol (Peer & Topic Lifecycle)
 
-The Control protocol (`harbor/control/0`) manages peer lifecycle and relationships:
+The Control protocol (`harbor/control/0`) manages peer lifecycle, topic management, and relationships:
 
 ```rust
 // Generate a connect token (for QR codes/invite links)
@@ -85,6 +84,12 @@ protocol.block_peer(&peer_id).await?;
 
 // Suggest a peer to another peer
 protocol.suggest_peer(&target_id, &suggested_id, Some("Bob")).await?;
+
+// Topic lifecycle (also via Control protocol)
+let invite = protocol.create_topic().await?;
+protocol.join_topic(invite).await?;
+protocol.leave_topic(&topic_id).await?;
+protocol.invite_to_topic(&peer_id, &topic_id).await?;
 ```
 
 **Message types:**
@@ -285,6 +290,8 @@ The protocol uses **SQLCipher** (encrypted SQLite) for persistence.
 | `dht_routing` | DHT routing table entries |
 | `topics` | Subscribed topics with HarborID |
 | `topic_members` | EndpointID + relay URL per topic |
+| `epoch_keys` | Epoch keys per topic for decryption |
+| `pending_decryption` | Packets awaiting epoch keys |
 | `connection_list` | Peer relationships (connected, blocked, pending) |
 | `connect_tokens` | One-time tokens for invite strings |
 | `pending_topic_invites` | Temporary storage for pending topic invites |
@@ -292,6 +299,7 @@ The protocol uses **SQLCipher** (encrypted SQLite) for persistence.
 | `outgoing_recipients` | Per-recipient delivery status |
 | `harbor_cache` | Packets stored as Harbor Node |
 | `harbor_recipients` | Per-recipient Harbor delivery status |
+| `harbor_nodes_cache` | Cached DHT lookup results for harbor nodes |
 | `pulled_packets` | Tracking pulled packets (deduplication) |
 | `blobs` | File metadata (hash, size, state) |
 | `blob_recipients` | Per-recipient file transfer status |

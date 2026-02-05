@@ -29,7 +29,6 @@ use crate::network::stream::StreamService;
 use crate::network::send::SendService;
 use crate::network::share::{ShareConfig, ShareService};
 use crate::network::sync::SyncService;
-use crate::network::topic::TopicService;
 
 use super::config::ProtocolConfig;
 use super::error::ProtocolError;
@@ -38,16 +37,6 @@ use super::stats::StatsService;
 
 /// Maximum message size (512 KB)
 pub const MAX_MESSAGE_SIZE: usize = 512 * 1024;
-
-/// Retention period for Harbor packets (90 days)
-///
-/// How long packets are stored on Harbor Nodes before expiration.
-#[allow(dead_code)]
-pub const RETENTION_PERIOD: Duration = Duration::from_secs(90 * 24 * 60 * 60);
-
-/// Retention period in seconds (for database queries)
-#[allow(dead_code)]
-pub const RETENTION_PERIOD_SECS: i64 = 90 * 24 * 60 * 60;
 
 /// The Harbor Protocol
 ///
@@ -73,9 +62,7 @@ pub struct Protocol {
     pub(crate) sync_service: Arc<SyncService>,
     /// Stream service
     pub(crate) stream_service: Arc<StreamService>,
-    /// Topic service for topic lifecycle
-    pub(crate) topic_service: Arc<TopicService>,
-    /// Control service for lifecycle management
+    /// Control service for lifecycle management (includes topic lifecycle)
     pub(crate) control_service: Arc<ControlService>,
     /// Stats service for monitoring
     pub(crate) stats_service: Arc<StatsService>,
@@ -238,14 +225,6 @@ impl Protocol {
         // Give SendService access to StreamService (for routing stream signaling)
         send_service.set_stream_service(stream_service.clone()).await;
 
-        // Initialize Topic service
-        let topic_service = Arc::new(TopicService::new(
-            endpoint.clone(),
-            identity.clone(),
-            db.clone(),
-            send_service.clone(),
-        ));
-
         // Initialize Stats service
         let stats_service = Arc::new(StatsService::new(
             endpoint.clone(),
@@ -286,7 +265,6 @@ impl Protocol {
             share_service,
             sync_service,
             stream_service,
-            topic_service,
             control_service,
             stats_service,
             event_tx,

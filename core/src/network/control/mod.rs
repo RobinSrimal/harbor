@@ -33,17 +33,20 @@ pub mod incoming;
 pub mod outgoing;
 pub mod protocol;
 pub mod service;
+pub mod types;
 
 // Re-export protocol types
 pub use protocol::{
     ControlAck, ControlPacketType, ControlRpcMessage, ControlRpcProtocol, CONTROL_ALPN,
 };
 
-// Re-export message types
+// Re-export wire message types (TopicInvite here is the wire format, not the shareable one)
 pub use protocol::{
-    ConnectAccept, ConnectDecline, ConnectRequest, RemoveMember, Suggest, TopicInvite, TopicJoin,
-    TopicLeave,
+    ConnectAccept, ConnectDecline, ConnectRequest, RemoveMember, Suggest, TopicJoin, TopicLeave,
 };
 
 // Re-export service types
 pub use service::{ConnectInvite, ControlError, ControlResult, ControlService};
+
+// Re-export public topic types (shareable invite format)
+pub use types::{MemberInfo, TopicInvite};

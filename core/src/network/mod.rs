@@ -23,7 +23,6 @@ pub mod send;
 pub mod share;
 pub mod stream;
 pub mod sync;
-pub mod topic;
 pub mod wire;
 
 // Re-export packet type system (application-level messages, may be Harbor-routed)
@@ -47,7 +46,6 @@ pub use send::{Receipt, SendConfig, SendService, SEND_ALPN};
 pub use share::{
     FileAnnouncement, CanSeed, ShareConfig, ShareError, ShareMessage, ShareService, SHARE_ALPN,
 };
-pub use topic::{TopicError, TopicService};
 pub use sync::{
     SyncMessage, SyncMessageType, SyncUpdate, InitialSyncRequest, InitialSyncResponse,
     DecodeError as SyncDecodeError, SYNC_ALPN, SyncService,
@@ -59,6 +57,7 @@ pub use control::{
     ControlAck, ControlPacketType, ControlRpcMessage, ControlRpcProtocol, CONTROL_ALPN,
     ConnectAccept, ConnectDecline, ConnectRequest, RemoveMember, Suggest, TopicInvite,
     TopicJoin, TopicLeave, ControlService, ControlError, ControlResult, ConnectInvite,
+    MemberInfo,
 };
 
 // Sample files are kept for reference but not compiled

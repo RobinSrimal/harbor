@@ -253,7 +253,7 @@ async fn process_topic_file_announce(
 
     // Check if we already have this blob
     let existing = get_blob(&db_lock, &ann.hash);
-    if existing.is_ok() && existing.as_ref().unwrap().is_none() {
+    if matches!(existing, Ok(None)) {
         // Store blob metadata
         if let Err(e) = insert_blob(
             &db_lock,
@@ -784,10 +784,9 @@ mod tests {
         let topic_id = [1u8; 32];
         let scope = ProcessScope::Topic { topic_id };
 
-        if let ProcessScope::Topic { topic_id: tid } = scope {
-            assert_eq!(tid, [1u8; 32]);
-        } else {
-            panic!("expected Topic scope");
-        }
+        assert!(
+            matches!(scope, ProcessScope::Topic { topic_id: tid } if tid == [1u8; 32]),
+            "expected Topic scope with correct id"
+        );
     }
 }

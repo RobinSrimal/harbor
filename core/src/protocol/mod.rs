@@ -61,8 +61,8 @@ pub use events::{
     TopicEpochRotatedEvent, PeerSuggestedEvent,
 };
 
-// Domain types (from TopicService)
-pub use crate::network::topic::{MemberInfo, TopicInvite};
+// Domain types (from ControlService)
+pub use crate::network::control::{MemberInfo, TopicInvite};
 
 // Stats types
 pub use stats::{

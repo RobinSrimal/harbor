@@ -10,7 +10,7 @@ use crate::data::BlobMetadata;
 use super::core::{Protocol, MAX_MESSAGE_SIZE};
 use super::error::ProtocolError;
 use super::stats::{DhtBucketInfo, ProtocolStats, TopicDetails, TopicSummary};
-use crate::network::topic::TopicInvite;
+use crate::network::control::TopicInvite;
 
 // Re-export ShareStatus from service for public API
 pub use crate::network::share::service::ShareStatus;
@@ -24,7 +24,7 @@ impl Protocol {
     /// Returns an invite that can be shared with others.
     pub async fn create_topic(&self) -> Result<TopicInvite, ProtocolError> {
         self.check_running().await?;
-        self.topic_service
+        self.control_service
             .create_topic()
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
@@ -37,7 +37,7 @@ impl Protocol {
     /// Announces our presence to other members.
     pub async fn join_topic(&self, invite: TopicInvite) -> Result<(), ProtocolError> {
         self.check_running().await?;
-        self.topic_service
+        self.control_service
             .join_topic(invite)
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
@@ -46,7 +46,7 @@ impl Protocol {
     /// Leave a topic
     pub async fn leave_topic(&self, topic_id: &[u8; 32]) -> Result<(), ProtocolError> {
         self.check_running().await?;
-        self.topic_service
+        self.control_service
             .leave_topic(topic_id)
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
@@ -55,7 +55,7 @@ impl Protocol {
     /// List all topics we're subscribed to
     pub async fn list_topics(&self) -> Result<Vec<[u8; 32]>, ProtocolError> {
         self.check_running().await?;
-        self.topic_service
+        self.control_service
             .list_topics()
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
@@ -66,7 +66,7 @@ impl Protocol {
     /// Returns a fresh invite containing ALL current topic members.
     pub async fn get_invite(&self, topic_id: &[u8; 32]) -> Result<TopicInvite, ProtocolError> {
         self.check_running().await?;
-        self.topic_service
+        self.control_service
             .get_invite(topic_id)
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
@@ -531,17 +531,6 @@ impl Protocol {
         self.check_running().await?;
         self.control_service
             .decline_topic_invite(message_id)
-            .await
-            .map_err(|e| ProtocolError::Network(e.to_string()))
-    }
-
-    /// Leave a topic (via Control protocol)
-    ///
-    /// Announces departure to all topic members and unsubscribes locally.
-    pub async fn control_leave_topic(&self, topic_id: &[u8; 32]) -> Result<(), ProtocolError> {
-        self.check_running().await?;
-        self.control_service
-            .leave_topic(topic_id)
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
     }

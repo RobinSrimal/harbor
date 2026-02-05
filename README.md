@@ -93,6 +93,7 @@ RUST_LOG=harbor_core::network::harbor=debug cargo run -p harbor-core
 | `harbor_core::network::dht` | DHT routing, lookups, candidate verification |
 | `harbor_core::network::send` | Direct message sending |
 | `harbor_core::network::control` | Connection requests, topic invites, membership |
+| `harbor_core::network::share` | File sharing operations |
 | `harbor_core::network::stream` | Streaming sessions |
 | `harbor_core::protocol` | Protocol API operations |
 
