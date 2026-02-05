@@ -16,10 +16,14 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::info;
 
-use crate::data::{ensure_self_in_peers, get_or_create_identity, start_db, LocalIdentity};
+use crate::data::{
+    add_topic_member, ensure_self_in_peers, get_or_create_identity, start_db,
+    subscribe_dm_topic, LocalIdentity,
+};
 use crate::network::control::ControlService;
 use crate::network::dht::DhtService;
 use crate::data::BlobStore;
+use crate::network::gate::ConnectionGate;
 use crate::network::harbor::HarborService;
 use crate::network::stream::StreamService;
 use crate::network::send::SendService;
@@ -127,6 +131,12 @@ impl Protocol {
         ensure_self_in_peers(&db, &identity.public_key)
             .map_err(|e| ProtocolError::Database(e.to_string()))?;
 
+        // Register our endpoint_id as a "DM topic" for unified harbor node discovery
+        // This allows the pull loop to handle DMs and regular topics identically
+        // Uses raw endpoint_id as harbor_id (NOT hashed) to match how DM packets are stored
+        let _ = subscribe_dm_topic(&db, &identity.public_key);
+        let _ = add_topic_member(&db, &identity.public_key, &identity.public_key);
+
         // Create Iroh endpoint with our identity's secret key
         let secret_key = iroh::SecretKey::from_bytes(&identity.private_key);
         let endpoint = Endpoint::builder()
@@ -139,6 +149,9 @@ impl Protocol {
 
         // Wrap db in Arc<Mutex<>> for sharing with services
         let db = Arc::new(Mutex::new(db));
+
+        // Initialize connection gate (loads DM connections and topic membership from DB)
+        let connection_gate = Arc::new(ConnectionGate::new(db.clone(), identity.public_key).await);
 
         // Initialize DHT
         let dht_service = DhtService::start(
@@ -160,6 +173,7 @@ impl Protocol {
             identity.clone(),
             db.clone(),
             event_tx.clone(),
+            Some(connection_gate.clone()),
         ));
 
         // Initialize Harbor service
@@ -198,6 +212,7 @@ impl Protocol {
             blob_store,
             ShareConfig::default(),
             Some(send_service.clone()),
+            Some(connection_gate.clone()),
         ));
 
         // Initialize Sync service
@@ -207,6 +222,7 @@ impl Protocol {
             db.clone(),
             event_tx.clone(),
             send_service.clone(),
+            Some(connection_gate.clone()),
         ));
 
         // Initialize Stream service
@@ -216,6 +232,7 @@ impl Protocol {
             db.clone(),
             event_tx.clone(),
             send_service.clone(),
+            Some(connection_gate.clone()),
         );
 
         // Give SendService access to StreamService (for routing stream signaling)
@@ -243,6 +260,7 @@ impl Protocol {
             identity.clone(),
             db.clone(),
             event_tx.clone(),
+            Some(connection_gate.clone()),
         );
 
         // Build the iroh Router for ALPN-based connection dispatch

@@ -19,6 +19,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::data::dht::peer::{get_peer_relay_info, update_peer_relay_url, current_timestamp};
 use crate::network::connect;
+use crate::network::gate::ConnectionGate;
 use crate::network::send::SendService;
 
 use crate::data::{
@@ -236,6 +237,8 @@ pub struct ShareService {
     config: ShareConfig,
     /// Send service for broadcasting announcements
     send_service: Option<Arc<SendService>>,
+    /// Connection gate for peer authorization
+    connection_gate: Option<Arc<ConnectionGate>>,
     /// Active outgoing transfers
     outgoing_transfers: Arc<RwLock<HashMap<[u8; 32], Vec<ActiveTransfer>>>>,
     /// Active incoming transfers
@@ -251,6 +254,7 @@ impl ShareService {
         blob_store: Arc<BlobStore>,
         config: ShareConfig,
         send_service: Option<Arc<SendService>>,
+        connection_gate: Option<Arc<ConnectionGate>>,
     ) -> Self {
         Self {
             endpoint,
@@ -259,9 +263,15 @@ impl ShareService {
             blob_store,
             config,
             send_service,
+            connection_gate,
             outgoing_transfers: Arc::new(RwLock::new(HashMap::new())),
             incoming_transfers: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Get the connection gate (for handler to check peer authorization)
+    pub fn connection_gate(&self) -> Option<&Arc<ConnectionGate>> {
+        self.connection_gate.as_ref()
     }
 
     /// Get our endpoint ID (public key)

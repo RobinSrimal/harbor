@@ -10,7 +10,7 @@
 //! - Responding to SyncRequest events via Protocol::respond_sync()
 
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::network::sync::service::SyncService;
 use crate::protocol::ProtocolError;
@@ -18,6 +18,15 @@ use crate::protocol::ProtocolError;
 impl ProtocolHandler for SyncService {
     async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
         let sender_id = *conn.remote_id().as_bytes();
+
+        // Connection gate check - must be a connected peer or share a topic
+        if let Some(gate) = self.connection_gate() {
+            if !gate.is_allowed(&sender_id).await {
+                trace!(sender = %hex::encode(sender_id), "SYNC: rejected connection from non-connected peer");
+                return Ok(()); // Silent drop
+            }
+        }
+
         if let Err(e) = self.handle_sync_connection(conn, sender_id).await {
             debug!(error = %e, sender = %hex::encode(sender_id), "Sync connection handler error");
         }

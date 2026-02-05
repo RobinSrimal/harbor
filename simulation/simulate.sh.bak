@@ -152,7 +152,7 @@ source "$SCRIPT_DIR/scenarios/suites.sh"
 find_harbor_binary
 
 # Set up cleanup trap
-# trap cleanup EXIT  # disabled for debugging
+trap cleanup EXIT
 
 # Default scenario
 SCENARIO="full"

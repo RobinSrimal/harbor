@@ -14,6 +14,8 @@ use irpc::channel::oneshot;
 use irpc::rpc_requests;
 use serde::{Deserialize, Serialize};
 
+use crate::resilience::ProofOfWork;
+
 /// Control protocol ALPN
 pub const CONTROL_ALPN: &[u8] = b"harbor/control/0";
 
@@ -112,6 +114,8 @@ pub struct ConnectRequest {
     pub relay_url: Option<String>,
     /// Optional one-time token (for QR code / invite string flow)
     pub token: Option<[u8; 32]>,
+    /// Proof of Work (context: sender_id || message_type_byte)
+    pub pow: ProofOfWork,
 }
 
 /// Accept a connection request
@@ -128,6 +132,8 @@ pub struct ConnectAccept {
     pub display_name: Option<String>,
     /// Acceptor's relay URL for NAT traversal
     pub relay_url: Option<String>,
+    /// Proof of Work (context: sender_id || message_type_byte)
+    pub pow: ProofOfWork,
 }
 
 /// Decline a connection request
@@ -142,6 +148,8 @@ pub struct ConnectDecline {
     pub sender_id: [u8; 32],
     /// Optional reason for declining
     pub reason: Option<String>,
+    /// Proof of Work (context: sender_id || message_type_byte)
+    pub pow: ProofOfWork,
 }
 
 // =============================================================================
@@ -176,6 +184,8 @@ pub struct TopicInvite {
     pub admin_id: [u8; 32],
     /// Current member list (endpoint IDs)
     pub members: Vec<[u8; 32]>,
+    /// Proof of Work (context: sender_id || message_type_byte)
+    pub pow: ProofOfWork,
 }
 
 /// Join a topic (after accepting an invite)
@@ -198,6 +208,8 @@ pub struct TopicJoin {
     pub relay_url: Option<String>,
     /// Membership proof (BLAKE3(topic_id || harbor_id || sender_id))
     pub membership_proof: [u8; 32],
+    /// Proof of Work (context: sender_id || message_type_byte)
+    pub pow: ProofOfWork,
 }
 
 /// Leave a topic
@@ -217,6 +229,8 @@ pub struct TopicLeave {
     pub epoch: u64,
     /// Membership proof (BLAKE3(topic_id || harbor_id || sender_id))
     pub membership_proof: [u8; 32],
+    /// Proof of Work (context: sender_id || message_type_byte)
+    pub pow: ProofOfWork,
 }
 
 /// Remove a member from a topic (admin only)
@@ -240,6 +254,8 @@ pub struct RemoveMember {
     pub new_epoch_key: [u8; 32],
     /// Membership proof (BLAKE3(topic_id || harbor_id || sender_id))
     pub membership_proof: [u8; 32],
+    /// Proof of Work (context: sender_id || message_type_byte)
+    pub pow: ProofOfWork,
 }
 
 // =============================================================================
@@ -263,6 +279,8 @@ pub struct Suggest {
     pub relay_url: Option<String>,
     /// Optional note about the suggested peer
     pub note: Option<String>,
+    /// Proof of Work (context: sender_id || message_type_byte)
+    pub pow: ProofOfWork,
 }
 
 // =============================================================================
@@ -310,6 +328,15 @@ pub enum ControlRpcProtocol {
 mod tests {
     use super::*;
 
+    /// Create a dummy PoW for tests (difficulty 0 = always passes)
+    fn test_pow() -> ProofOfWork {
+        ProofOfWork {
+            timestamp: 0,
+            nonce: 0,
+            difficulty_bits: 0,
+        }
+    }
+
     #[test]
     fn test_control_packet_type_byte_conversion() {
         assert_eq!(
@@ -353,6 +380,7 @@ mod tests {
             display_name: Some("Alice".to_string()),
             relay_url: Some("https://relay.example.com".to_string()),
             token: None,
+            pow: test_pow(),
         };
         let bytes = postcard::to_allocvec(&req).unwrap();
         let decoded: ConnectRequest = postcard::from_bytes(&bytes).unwrap();
@@ -369,6 +397,7 @@ mod tests {
             display_name: None,
             relay_url: None,
             token: Some([42u8; 32]),
+            pow: test_pow(),
         };
         let bytes = postcard::to_allocvec(&req).unwrap();
         let decoded: ConnectRequest = postcard::from_bytes(&bytes).unwrap();
@@ -386,6 +415,7 @@ mod tests {
             epoch_key: [4u8; 32],
             admin_id: [5u8; 32],
             members: vec![[2u8; 32], [6u8; 32]],
+            pow: test_pow(),
         };
         let bytes = postcard::to_allocvec(&invite).unwrap();
         let decoded: TopicInvite = postcard::from_bytes(&bytes).unwrap();
@@ -411,6 +441,7 @@ mod tests {
                 &harbor_id_from_topic(&[2u8; 32]),
                 &[3u8; 32],
             ),
+            pow: test_pow(),
         };
         let bytes = postcard::to_allocvec(&join).unwrap();
         let decoded: TopicJoin = postcard::from_bytes(&bytes).unwrap();
@@ -435,6 +466,7 @@ mod tests {
             new_epoch: 6,
             new_epoch_key: [5u8; 32],
             membership_proof: create_membership_proof(&topic_id, &harbor_id, &admin_id),
+            pow: test_pow(),
         };
         let bytes = postcard::to_allocvec(&remove).unwrap();
         let decoded: RemoveMember = postcard::from_bytes(&bytes).unwrap();
@@ -451,6 +483,7 @@ mod tests {
             suggested_peer: [3u8; 32],
             relay_url: Some("https://peer.relay".to_string()),
             note: Some("Great developer!".to_string()),
+            pow: test_pow(),
         };
         let bytes = postcard::to_allocvec(&suggest).unwrap();
         let decoded: Suggest = postcard::from_bytes(&bytes).unwrap();

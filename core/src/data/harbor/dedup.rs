@@ -74,8 +74,10 @@ pub fn check_and_mark(
     // Rule 1: Never process our own packets
     if sender_id == our_id {
         trace!(
-            packet = %hex::encode(packet_id),
-            "skipping own packet"
+            topic_id = %hex::encode(&topic_id[..8]),
+            packet_id = %hex::encode(&packet_id[..8]),
+            result = "OwnPacket",
+            "DEDUP: skipping own packet"
         );
         return Ok(DedupResult::OwnPacket);
     }
@@ -83,8 +85,10 @@ pub fn check_and_mark(
     // Rule 2: Skip if already seen
     if was_pulled(conn, topic_id, packet_id).map_err(|e| DedupError::Database(e.to_string()))? {
         trace!(
-            packet = %hex::encode(packet_id),
-            "packet already seen"
+            topic_id = %hex::encode(&topic_id[..8]),
+            packet_id = %hex::encode(&packet_id[..8]),
+            result = "AlreadySeen",
+            "DEDUP: packet already seen"
         );
         return Ok(DedupResult::AlreadySeen);
     }
@@ -93,8 +97,10 @@ pub fn check_and_mark(
     mark_pulled(conn, topic_id, packet_id).map_err(|e| DedupError::Database(e.to_string()))?;
 
     trace!(
-        packet = %hex::encode(packet_id),
-        "new packet, marked as seen"
+        topic_id = %hex::encode(&topic_id[..8]),
+        packet_id = %hex::encode(&packet_id[..8]),
+        result = "Process",
+        "DEDUP: new packet, marked as seen"
     );
 
     Ok(DedupResult::Process)

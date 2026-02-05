@@ -4,7 +4,7 @@
 //! One-off exchanges: open connection, send message, get response, close.
 //! Does not maintain a connection pool.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointId};
@@ -15,9 +15,11 @@ use tracing::debug;
 use crate::data::dht::peer::get_peer_relay_info;
 use crate::data::LocalIdentity;
 use crate::network::connect;
+use crate::network::gate::ConnectionGate;
 use crate::protocol::ProtocolEvent;
+use crate::resilience::{PoWConfig, PoWResult, PoWVerifier, ProofOfWork, build_context};
 
-use super::protocol::{ControlRpcProtocol, CONTROL_ALPN};
+use super::protocol::{ControlPacketType, ControlRpcProtocol, CONTROL_ALPN};
 
 /// Error type for control operations
 #[derive(Debug)]
@@ -31,6 +33,10 @@ pub enum ControlError {
     RequestNotFound,
     InvalidState(String),
     TopicNotFound,
+    InsufficientPoW {
+        /// Required difficulty bits
+        required: u8,
+    },
 }
 
 impl std::fmt::Display for ControlError {
@@ -45,6 +51,9 @@ impl std::fmt::Display for ControlError {
             ControlError::RequestNotFound => write!(f, "request not found"),
             ControlError::InvalidState(e) => write!(f, "invalid state: {}", e),
             ControlError::TopicNotFound => write!(f, "topic not found"),
+            ControlError::InsufficientPoW { required } => {
+                write!(f, "insufficient proof of work: {} bits required", required)
+            }
         }
     }
 }
@@ -70,6 +79,10 @@ pub struct ControlService {
     db: Arc<Mutex<DbConnection>>,
     /// Event sender for protocol events
     event_tx: mpsc::Sender<ProtocolEvent>,
+    /// Connection gate for notifying state changes (NOT for gating Control connections)
+    connection_gate: Option<Arc<ConnectionGate>>,
+    /// Proof of Work verifier for abuse prevention
+    pow_verifier: StdMutex<PoWVerifier>,
 }
 
 impl std::fmt::Debug for ControlService {
@@ -85,13 +98,21 @@ impl ControlService {
         identity: Arc<LocalIdentity>,
         db: Arc<Mutex<DbConnection>>,
         event_tx: mpsc::Sender<ProtocolEvent>,
+        connection_gate: Option<Arc<ConnectionGate>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             endpoint,
             identity,
             db,
             event_tx,
+            connection_gate,
+            pow_verifier: StdMutex::new(PoWVerifier::new(PoWConfig::control())),
         })
+    }
+
+    /// Get the connection gate (for notifying state changes)
+    pub fn connection_gate(&self) -> Option<&Arc<ConnectionGate>> {
+        self.connection_gate.as_ref()
     }
 
     /// Get our local endpoint ID
@@ -117,6 +138,37 @@ impl ControlService {
     /// Get a reference to the endpoint
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    // === PoW Verification ===
+
+    /// Verify Proof of Work for a control message
+    ///
+    /// Context for Control PoW: `sender_id || message_type_byte`
+    /// Uses RequestBased scaling.
+    pub fn verify_pow(
+        &self,
+        pow: &ProofOfWork,
+        sender_id: &[u8; 32],
+        message_type: ControlPacketType,
+    ) -> Result<(), ControlError> {
+        let context = build_context(&[sender_id, &[message_type as u8]]);
+        let verifier = self.pow_verifier.lock().unwrap();
+
+        match verifier.verify(pow, &context, sender_id, None) {
+            PoWResult::Allowed => Ok(()),
+            PoWResult::InsufficientDifficulty { required, .. } => {
+                Err(ControlError::InsufficientPoW { required })
+            }
+            PoWResult::Expired { .. } => {
+                let required = verifier.effective_difficulty(sender_id, None);
+                Err(ControlError::InsufficientPoW { required })
+            }
+            PoWResult::InvalidContext => {
+                let required = verifier.effective_difficulty(sender_id, None);
+                Err(ControlError::InsufficientPoW { required })
+            }
+        }
     }
 
     /// Dial a peer on the control ALPN

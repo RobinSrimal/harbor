@@ -53,6 +53,18 @@ scenario_dm_offline() {
     info "Node-1 endpoint: ${NODE1_ID:0:16}..."
     info "Node-2 endpoint: ${NODE2_ID:0:16}..."
 
+    # Establish DM connection via Control protocol (required before sending DMs)
+    log "Phase 3b: Establishing DM connection..."
+    local INVITE=$(api_control_generate_invite 1)
+    local INVITE_STRING=$(extract_invite_string "$INVITE")
+    if [ -n "$INVITE_STRING" ]; then
+        api_control_connect_with_invite 2 "$INVITE_STRING" > /dev/null
+        info "  Node-1 ↔ Node-2: connection established"
+    else
+        warn "  Failed to establish connection"
+    fi
+    sleep 2
+
     # First, send a DM while node-2 is online (baseline test)
     log "Phase 4: Baseline - DM while online..."
     local baseline_msg="${DM_MSG_PREFIX}-baseline"

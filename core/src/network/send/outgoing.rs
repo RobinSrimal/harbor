@@ -8,7 +8,7 @@
 //! - Incoming connection handling (via handle_send_connection)
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -26,6 +26,7 @@ use crate::data::{
     get_blob, insert_blob, init_blob_sections, record_peer_can_seed, CHUNK_SIZE,
 };
 use crate::network::connect;
+use crate::network::gate::ConnectionGate;
 use crate::network::packet::TopicMessage;
 use crate::security::{
     SendPacket, PacketError, verify_and_decrypt_packet, verify_and_decrypt_packet_with_mode,
@@ -73,6 +74,7 @@ impl SendOptions {
 }
 use crate::network::rpc::ExistingConnection;
 use crate::protocol::{MemberInfo, ProtocolEvent};
+use crate::resilience::{ProofOfWork, PoWConfig, PoWResult, PoWVerifier, build_context};
 use crate::security::harbor_id_from_topic;
 use super::protocol::{SEND_ALPN, Receipt, DeliverTopic, DeliverDm, SendRpcProtocol};
 
@@ -161,6 +163,10 @@ pub struct SendService {
     connections: Arc<RwLock<HashMap<EndpointId, Connection>>>,
     /// Stream service for stream signaling routing (set after construction)
     stream_service: RwLock<Option<Arc<crate::network::stream::StreamService>>>,
+    /// Connection gate for peer authorization
+    connection_gate: Option<Arc<ConnectionGate>>,
+    /// Proof of Work verifier for abuse prevention
+    pow_verifier: StdMutex<PoWVerifier>,
 }
 
 impl SendService {
@@ -170,6 +176,7 @@ impl SendService {
         identity: Arc<LocalIdentity>,
         db: Arc<Mutex<DbConnection>>,
         event_tx: mpsc::Sender<ProtocolEvent>,
+        connection_gate: Option<Arc<ConnectionGate>>,
     ) -> Self {
         Self {
             endpoint,
@@ -179,7 +186,14 @@ impl SendService {
             send_timeout: Duration::from_secs(5),
             connections: Arc::new(RwLock::new(HashMap::new())),
             stream_service: RwLock::new(None),
+            connection_gate,
+            pow_verifier: StdMutex::new(PoWVerifier::new(PoWConfig::send())),
         }
+    }
+
+    /// Get the connection gate (for handler to check peer authorization)
+    pub fn connection_gate(&self) -> Option<&Arc<ConnectionGate>> {
+        self.connection_gate.as_ref()
     }
 
     /// Set the StreamService reference (called after both services are constructed)
@@ -210,6 +224,48 @@ impl SendService {
     /// Get the database connection
     pub fn db(&self) -> &Arc<Mutex<DbConnection>> {
         &self.db
+    }
+
+    // ========== PoW Verification ==========
+
+    /// Verify Proof of Work for a topic delivery
+    ///
+    /// Context for Send PoW (topics): `sender_id || harbor_id`
+    /// Uses ByteBased scaling with gentle progression.
+    pub fn verify_topic_pow(
+        &self,
+        pow: &ProofOfWork,
+        sender_id: &[u8; 32],
+        harbor_id: &[u8; 32],
+        payload_len: usize,
+    ) -> bool {
+        let context = build_context(&[sender_id, harbor_id]);
+        let verifier = self.pow_verifier.lock().unwrap();
+
+        matches!(
+            verifier.verify(pow, &context, sender_id, Some(payload_len as u64)),
+            PoWResult::Allowed
+        )
+    }
+
+    /// Verify Proof of Work for a DM delivery
+    ///
+    /// Context for Send PoW (DMs): `sender_id || recipient_id`
+    /// Uses ByteBased scaling with gentle progression.
+    pub fn verify_dm_pow(
+        &self,
+        pow: &ProofOfWork,
+        sender_id: &[u8; 32],
+        recipient_id: &[u8; 32],
+        payload_len: usize,
+    ) -> bool {
+        let context = build_context(&[sender_id, recipient_id]);
+        let verifier = self.pow_verifier.lock().unwrap();
+
+        matches!(
+            verifier.verify(pow, &context, sender_id, Some(payload_len as u64)),
+            PoWResult::Allowed
+        )
     }
 
     // ========== Outgoing ==========
@@ -319,7 +375,7 @@ impl SendService {
 
         // Try direct delivery via DeliverDm (raw payload over QUIC TLS)
         let member = MemberInfo::new(*recipient_id);
-        match self.deliver_dm_to_member(&member, encoded_payload).await {
+        match self.deliver_dm_to_member(&member, encoded_payload, packet_id).await {
             Ok(receipt) => {
                 trace!(
                     recipient = hex::encode(recipient_id),
@@ -417,8 +473,9 @@ impl SendService {
             let member = (*member).clone();
             let topic_id = *topic_id;
             let payload = encoded_payload.to_vec();
+            let pkt_id = packet_id;
             async move {
-                let result = self.deliver(&member, &topic_id, &payload).await;
+                let result = self.deliver(&member, &topic_id, &payload, pkt_id).await;
                 (member.endpoint_id, result)
             }
         });
@@ -470,11 +527,14 @@ impl SendService {
     ///
     /// The message includes a membership proof (BLAKE3 hash) that proves
     /// we know the topic_id without revealing it on the wire.
+    ///
+    /// The packet_id is included for deduplication - same ID is used for Harbor storage.
     async fn deliver(
         &self,
         member: &MemberInfo,
         topic_id: &[u8; 32],
         payload: &[u8],
+        packet_id: [u8; 32],
     ) -> Result<Receipt, SendError> {
         let node_id = EndpointId::from_bytes(&member.endpoint_id)
             .map_err(|e| SendError::Connection(e.to_string()))?;
@@ -487,15 +547,22 @@ impl SendService {
         let sender_id = self.endpoint_id();
         let membership_proof = super::protocol::create_membership_proof(topic_id, &harbor_id, &sender_id);
 
+        // Compute PoW (context: sender_id || harbor_id)
+        let pow_context = build_context(&[&sender_id, &harbor_id]);
+        let pow = ProofOfWork::compute(&pow_context, PoWConfig::send().base_difficulty)
+            .ok_or_else(|| SendError::Send("failed to compute PoW".to_string()))?;
+
         // Send via irpc RPC - DeliverTopic request, Receipt response
         let client = irpc::Client::<SendRpcProtocol>::boxed(
             ExistingConnection::new(&conn)
         );
         let receipt = client
             .rpc(DeliverTopic {
+                packet_id,
                 harbor_id,
                 membership_proof,
                 payload: payload.to_vec(),
+                pow,
             })
             .await
             .map_err(|e| SendError::Send(e.to_string()))?;
@@ -507,10 +574,13 @@ impl SendService {
     ///
     /// Uses QUIC TLS for encryption - no app-level crypto needed.
     /// This is the fast path for direct delivery to online peers.
+    ///
+    /// The packet_id is included for deduplication - same ID is used for Harbor storage.
     async fn deliver_dm_to_member(
         &self,
         member: &MemberInfo,
         payload: &[u8],
+        packet_id: [u8; 32],
     ) -> Result<Receipt, SendError> {
         let node_id = EndpointId::from_bytes(&member.endpoint_id)
             .map_err(|e| SendError::Connection(e.to_string()))?;
@@ -518,13 +588,21 @@ impl SendService {
         // Get or create connection (relay URL looked up from peers table)
         let conn = self.get_connection(node_id).await?;
 
+        // Compute PoW (context: sender_id || recipient_id)
+        let sender_id = self.endpoint_id();
+        let pow_context = build_context(&[&sender_id, &member.endpoint_id]);
+        let pow = ProofOfWork::compute(&pow_context, PoWConfig::send().base_difficulty)
+            .ok_or_else(|| SendError::Send("failed to compute PoW".to_string()))?;
+
         // Send via irpc RPC - DeliverDm request, Receipt response
         let client = irpc::Client::<SendRpcProtocol>::boxed(
             ExistingConnection::new(&conn)
         );
         let receipt = client
             .rpc(DeliverDm {
+                packet_id,
                 payload: payload.to_vec(),
+                pow,
             })
             .await
             .map_err(|e| SendError::Send(e.to_string()))?;
@@ -601,11 +679,14 @@ impl SendService {
     ///
     /// The payload is already plaintext (QUIC TLS provides encryption).
     /// No decryption or MAC/signature verification needed.
-    pub async fn process_raw_topic_payload(
+    ///
+    /// The packet_id is provided by the sender for deduplication.
+    pub async fn process_raw_topic_payload_with_id(
         &self,
         topic_id: &[u8; 32],
         sender_id: [u8; 32],
         payload: &[u8],
+        packet_id: [u8; 32],
     ) -> Result<ProcessResult, ProcessError> {
         let db = &self.db;
         let event_tx = &self.event_tx;
@@ -631,9 +712,6 @@ impl SendService {
             }
         };
 
-        // Generate a packet_id for the receipt (we don't have one from a sealed packet)
-        let packet_id = generate_packet_id();
-
         // Handle the decoded message (same logic as process_incoming_packet, but no packet)
         self.handle_topic_message(topic_id, sender_id, &topic_msg, &packet_id, db, event_tx, stream.as_ref()).await
     }
@@ -642,10 +720,13 @@ impl SendService {
     ///
     /// The payload is already plaintext (QUIC TLS provides encryption).
     /// No decryption or signature verification needed.
-    pub async fn process_raw_dm_payload(
+    ///
+    /// The packet_id is provided by the sender for deduplication.
+    pub async fn process_raw_dm_payload_with_id(
         &self,
         sender_id: [u8; 32],
         payload: &[u8],
+        packet_id: [u8; 32],
     ) -> Result<ProcessResult, ProcessError> {
         use crate::network::packet::{
             DmMessage, StreamSignalingMessage, is_dm_message_type, is_stream_signaling_type
@@ -657,9 +738,6 @@ impl SendService {
         if payload.is_empty() {
             return Err(ProcessError::VerificationFailed("empty payload".to_string()));
         }
-
-        // Generate a packet_id for the receipt
-        let packet_id = generate_packet_id();
 
         let type_byte = payload[0];
 

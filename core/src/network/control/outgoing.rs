@@ -11,6 +11,7 @@ use crate::data::{
     is_topic_admin, store_epoch_key, store_outgoing_packet, subscribe_topic_with_admin,
     update_connection_state, upsert_connection, ConnectionState,
 };
+use crate::resilience::{ProofOfWork, PoWConfig, build_context};
 use crate::security::harbor_id_from_topic;
 use crate::network::membership::create_membership_proof;
 
@@ -19,6 +20,15 @@ use super::protocol::{
     TopicInvite, TopicJoin, TopicLeave,
 };
 use super::service::{generate_id, ConnectInvite, ControlError, ControlResult, ControlService};
+
+/// Compute PoW for a control message
+/// Context: sender_id || message_type_byte
+fn compute_control_pow(sender_id: &[u8; 32], message_type: ControlPacketType) -> ControlResult<ProofOfWork> {
+    let context = build_context(&[sender_id, &[message_type as u8]]);
+    let difficulty = PoWConfig::control().base_difficulty;
+    ProofOfWork::compute(&context, difficulty)
+        .ok_or_else(|| ControlError::Rpc("failed to compute PoW".to_string()))
+}
 
 // =============================================================================
 // Connection operations
@@ -34,6 +44,7 @@ pub async fn request_connection(
 ) -> ControlResult<[u8; 32]> {
     let request_id = generate_id();
     let our_relay = service.endpoint().addr().relay_urls().next().map(|u| u.to_string());
+    let pow = compute_control_pow(&service.local_id(), ControlPacketType::ConnectRequest)?;
 
     let req = ConnectRequest {
         request_id,
@@ -41,6 +52,7 @@ pub async fn request_connection(
         display_name: display_name.map(|s| s.to_string()),
         relay_url: our_relay.clone(),
         token,
+        pow,
     };
 
     // Store pending outgoing connection
@@ -134,6 +146,11 @@ pub async fn accept_connection(
             .map_err(|e| ControlError::Database(e.to_string()))?;
     }
 
+    // Update connection gate
+    if let Some(gate) = service.connection_gate() {
+        gate.mark_dm_connected(&peer_id).await;
+    }
+
     // Send the accept message
     send_connect_accept(service, &peer_id, relay_url.as_deref(), request_id).await
 }
@@ -149,12 +166,14 @@ pub async fn send_connect_accept(
     request_id: &[u8; 32],
 ) -> ControlResult<()> {
     let our_relay = service.endpoint().addr().relay_urls().next().map(|u| u.to_string());
+    let pow = compute_control_pow(&service.local_id(), ControlPacketType::ConnectAccept)?;
 
     let accept = ConnectAccept {
         request_id: *request_id,
         sender_id: service.local_id(),
         display_name: None, // Could be set from local config
         relay_url: our_relay.clone(),
+        pow,
     };
 
     // Try direct delivery
@@ -203,10 +222,12 @@ pub async fn decline_connection(
         (conn.peer_id, conn.relay_url)
     };
 
+    let pow = compute_control_pow(&service.local_id(), ControlPacketType::ConnectDecline)?;
     let decline = ConnectDecline {
         request_id: *request_id,
         sender_id: service.local_id(),
         reason: reason.map(|s| s.to_string()),
+        pow,
     };
 
     // Update connection state
@@ -261,9 +282,16 @@ pub async fn generate_connect_token(service: &ControlService) -> ControlResult<C
 
 /// Block a peer
 pub async fn block_peer(service: &ControlService, peer_id: &[u8; 32]) -> ControlResult<()> {
-    let db = service.db().lock().await;
-    update_connection_state(&db, peer_id, ConnectionState::Blocked)
-        .map_err(|e| ControlError::Database(e.to_string()))?;
+    {
+        let db = service.db().lock().await;
+        update_connection_state(&db, peer_id, ConnectionState::Blocked)
+            .map_err(|e| ControlError::Database(e.to_string()))?;
+    }
+
+    // Update connection gate
+    if let Some(gate) = service.connection_gate() {
+        gate.mark_dm_blocked(peer_id).await;
+    }
 
     info!(peer = %hex::encode(&peer_id[..8]), "peer blocked");
     Ok(())
@@ -271,14 +299,28 @@ pub async fn block_peer(service: &ControlService, peer_id: &[u8; 32]) -> Control
 
 /// Unblock a peer
 pub async fn unblock_peer(service: &ControlService, peer_id: &[u8; 32]) -> ControlResult<()> {
-    let db = service.db().lock().await;
-    // Unblocking moves back to connected (or pending if was pending)
-    if let Ok(Some(conn)) = get_connection(&db, peer_id) {
-        if conn.state == ConnectionState::Blocked {
-            update_connection_state(&db, peer_id, ConnectionState::Connected)
-                .map_err(|e| ControlError::Database(e.to_string()))?;
-            info!(peer = %hex::encode(&peer_id[..8]), "peer unblocked");
+    let was_blocked = {
+        let db = service.db().lock().await;
+        // Unblocking moves back to connected (or pending if was pending)
+        if let Ok(Some(conn)) = get_connection(&db, peer_id) {
+            if conn.state == ConnectionState::Blocked {
+                update_connection_state(&db, peer_id, ConnectionState::Connected)
+                    .map_err(|e| ControlError::Database(e.to_string()))?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         }
+    };
+
+    if was_blocked {
+        // Update connection gate
+        if let Some(gate) = service.connection_gate() {
+            gate.mark_dm_connected(peer_id).await;
+        }
+        info!(peer = %hex::encode(&peer_id[..8]), "peer unblocked");
     }
     Ok(())
 }
@@ -314,6 +356,7 @@ pub async fn invite_to_topic(
         (current.epoch, current.key_data, admin_id, members)
     };
 
+    let pow = compute_control_pow(&service.local_id(), ControlPacketType::TopicInvite)?;
     let invite = TopicInvite {
         message_id,
         sender_id: service.local_id(),
@@ -323,6 +366,7 @@ pub async fn invite_to_topic(
         epoch_key,
         admin_id,
         members,
+        pow,
     };
 
     // Try direct delivery
@@ -371,12 +415,20 @@ pub async fn accept_topic_invite(
         // Subscribe with the admin from the invite
         subscribe_topic_with_admin(&db, &invite.topic_id, &invite.admin_id)
             .map_err(|e| ControlError::Database(e.to_string()))?;
+        // Add ourselves as a member (required for get_topics_for_member to find this topic)
+        let _ = crate::data::add_topic_member(&db, &invite.topic_id, &service.local_id());
+        // Add other members from the invite
         for member in &invite.members {
             let _ = crate::data::add_topic_member(&db, &invite.topic_id, member);
         }
         // Store the epoch key from the invite
         store_epoch_key(&db, &invite.topic_id, invite.epoch, &invite.epoch_key)
             .map_err(|e| ControlError::Database(e.to_string()))?;
+    }
+
+    // Update connection gate with all topic peers
+    if let Some(gate) = service.connection_gate() {
+        gate.add_topic_peers(&invite.topic_id, &invite.members).await;
     }
 
     // Send TopicJoin to all members
@@ -389,6 +441,7 @@ pub async fn accept_topic_invite(
         &harbor_id,
         &service.local_id(),
     );
+    let pow = compute_control_pow(&service.local_id(), ControlPacketType::TopicJoin)?;
 
     let join = TopicJoin {
         message_id: join_message_id,
@@ -397,6 +450,7 @@ pub async fn accept_topic_invite(
         epoch: invite.epoch,
         relay_url: our_relay,
         membership_proof,
+        pow,
     };
 
     // Try direct delivery to all members
@@ -465,6 +519,7 @@ pub async fn leave_topic(service: &ControlService, topic_id: &[u8; 32]) -> Contr
 
     let harbor_id = harbor_id_from_topic(topic_id);
     let membership_proof = create_membership_proof(topic_id, &harbor_id, &service.local_id());
+    let pow = compute_control_pow(&service.local_id(), ControlPacketType::TopicLeave)?;
 
     let leave = TopicLeave {
         message_id,
@@ -472,6 +527,7 @@ pub async fn leave_topic(service: &ControlService, topic_id: &[u8; 32]) -> Contr
         sender_id: service.local_id(),
         epoch,
         membership_proof,
+        pow,
     };
 
     // Try direct delivery to all members
@@ -500,6 +556,11 @@ pub async fn leave_topic(service: &ControlService, topic_id: &[u8; 32]) -> Contr
         let db = service.db().lock().await;
         crate::data::unsubscribe_topic(&db, topic_id)
             .map_err(|e| ControlError::Database(e.to_string()))?;
+    }
+
+    // Update connection gate - remove this topic
+    if let Some(gate) = service.connection_gate() {
+        gate.remove_topic(topic_id).await;
     }
 
     info!(topic = %hex::encode(&topic_id[..8]), "left topic");
@@ -553,6 +614,7 @@ pub async fn remove_topic_member(
         let harbor_id = harbor_id_from_topic(topic_id);
         let membership_proof =
             create_membership_proof(topic_id, &harbor_id, &service.local_id());
+        let pow = compute_control_pow(&service.local_id(), ControlPacketType::RemoveMember)?;
 
         let remove = RemoveMember {
             message_id,
@@ -562,6 +624,7 @@ pub async fn remove_topic_member(
             new_epoch,
             new_epoch_key,
             membership_proof,
+            pow,
         };
 
         // Try direct delivery
@@ -590,6 +653,11 @@ pub async fn remove_topic_member(
         // Store the new epoch key
         store_epoch_key(&db, topic_id, new_epoch, &new_epoch_key)
             .map_err(|e| ControlError::Database(e.to_string()))?;
+    }
+
+    // Update connection gate
+    if let Some(gate) = service.connection_gate() {
+        gate.remove_topic_peer(member_id, topic_id).await;
     }
 
     info!(
@@ -624,12 +692,14 @@ pub async fn suggest_peer(
             .map(|(url, _)| url)
     };
 
+    let pow = compute_control_pow(&service.local_id(), ControlPacketType::Suggest)?;
     let suggest = Suggest {
         message_id,
         sender_id: service.local_id(),
         suggested_peer: *suggested_peer,
         relay_url,
         note: note.map(|s| s.to_string()),
+        pow,
     };
 
     // Try direct delivery

@@ -7,7 +7,9 @@
 //! - DHT save loop (persists routing table)
 //! - DHT bootstrap/refresh loop (maintains routing table health)
 //! - Cleanup loop (removes expired/acknowledged data)
+//! - Harbor node discovery (refreshes harbor_nodes_cache)
 
+mod find_harbor_nodes;
 mod harbor_pull;
 mod harbor_sync;
 mod maintenance;
@@ -146,6 +148,22 @@ impl Protocol {
             ).await;
         });
         tasks.push(share_pull_task);
+
+        // 9. Harbor node discovery (refreshes harbor_nodes_cache)
+        let db = self.db.clone();
+        let dht_service = self.dht_service.clone();
+        let running = self.running.clone();
+        let harbor_node_refresh_interval = Duration::from_secs(self.config.harbor_node_refresh_interval_secs);
+
+        let harbor_node_discovery_task = tokio::spawn(async move {
+            Self::run_harbor_node_discovery(
+                db,
+                dht_service,
+                running,
+                harbor_node_refresh_interval,
+            ).await;
+        });
+        tasks.push(harbor_node_discovery_task);
 
         info!("Background tasks started");
     }

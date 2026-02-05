@@ -21,11 +21,13 @@ pub mod seal;
 pub use packet::{
     // Core types
     SendPacket, PacketBuilder, PacketError, VerificationMode, EpochKeys,
+    // Packet ID generation
+    generate_packet_id,
     // Epoch key derivation
     derive_epoch_secret_from_topic,
     // Epoch-based functions (preferred for forward secrecy)
     create_packet_with_epoch, verify_and_decrypt_with_epoch,
-    // Legacy functions (backward compatibility with epoch 0)
+    // Create functions
     create_packet, verify_and_decrypt_packet, verify_and_decrypt_packet_with_mode,
     // MAC verification
     verify_mac_only, verify_mac_only_raw,

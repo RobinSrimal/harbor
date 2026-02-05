@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::resilience::ProofOfWork;
+
 /// ALPN for Harbor protocol
 pub const HARBOR_ALPN: &[u8] = b"harbor/store/0";
 
@@ -55,6 +57,8 @@ pub struct StoreRequest {
     pub sender_id: [u8; 32],
     /// Recipients who haven't received the packet
     pub recipients: Vec<[u8; 32]>,
+    /// Proof of Work (context: harbor_id || packet_id)
+    pub pow: ProofOfWork,
 }
 
 /// Response to store request
@@ -66,6 +70,8 @@ pub struct StoreResponse {
     pub success: bool,
     /// Error message if failed
     pub error: Option<String>,
+    /// Required PoW difficulty (hint when rejected for insufficient PoW)
+    pub required_difficulty: Option<u8>,
 }
 
 /// Request packets for a specific recipient
@@ -201,6 +207,15 @@ impl std::error::Error for DecodeError {}
 mod tests {
     use super::*;
 
+    /// Create a dummy PoW for tests (difficulty 0 = always passes)
+    fn test_pow() -> ProofOfWork {
+        ProofOfWork {
+            timestamp: 0,
+            nonce: 0,
+            difficulty_bits: 0,
+        }
+    }
+
     #[test]
     fn test_store_request_roundtrip() {
         let msg = HarborMessage::Store(StoreRequest {
@@ -209,6 +224,7 @@ mod tests {
             harbor_id: [2u8; 32],
             sender_id: [3u8; 32],
             recipients: vec![[10u8; 32], [11u8; 32]],
+            pow: test_pow(),
         });
 
         let encoded = msg.encode();
@@ -229,6 +245,7 @@ mod tests {
             packet_id: [1u8; 32],
             success: true,
             error: None,
+            required_difficulty: None,
         });
 
         let encoded = msg.encode();
@@ -492,6 +509,7 @@ mod tests {
             packet_id: [1u8; 32],
             success: false,
             error: Some("packet too large".to_string()),
+            required_difficulty: None,
         });
 
         let encoded = msg.encode();

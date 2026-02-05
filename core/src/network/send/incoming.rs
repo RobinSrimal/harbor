@@ -77,7 +77,7 @@ impl From<PacketError> for ReceiveError {
 mod tests {
     use super::*;
     use crate::security::create_key_pair::generate_key_pair;
-    use crate::security::send::packet::create_packet;
+    use crate::security::send::packet::{create_packet, generate_packet_id};
     use crate::data::schema::create_all_tables;
     use crate::data::send::store_outgoing_packet;
     use crate::security::harbor_id_from_topic;
@@ -120,6 +120,7 @@ mod tests {
             &sender_keys.private_key,
             &sender_keys.public_key,
             plaintext,
+            generate_packet_id(),
         ).unwrap();
 
         let receiver_keys = generate_key_pair();
@@ -141,6 +142,7 @@ mod tests {
             &sender_keys.private_key,
             &sender_keys.public_key,
             b"Secret",
+            generate_packet_id(),
         ).unwrap();
 
         let result = SendService::receive_packet(&packet, &wrong_topic_id, [0u8; 32]);

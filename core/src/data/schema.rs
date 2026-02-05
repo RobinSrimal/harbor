@@ -37,6 +37,32 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         )?;
     }
 
+    // Migration 2: Add harbor_nodes_cache table
+    let has_harbor_nodes_cache: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='harbor_nodes_cache'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if !has_harbor_nodes_cache {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS harbor_nodes_cache (
+                harbor_id BLOB NOT NULL CHECK (length(harbor_id) = 32),
+                node_id BLOB NOT NULL CHECK (length(node_id) = 32),
+                relay_url TEXT,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                PRIMARY KEY (harbor_id, node_id),
+                FOREIGN KEY (node_id) REFERENCES peers(endpoint_id)
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_harbor_nodes_harbor_id ON harbor_nodes_cache(harbor_id)",
+            [],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -267,8 +293,28 @@ pub fn create_harbor_table(conn: &Connection) -> rusqlite::Result<()> {
 
     // Index for finding undelivered recipients
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_harbor_recipients_undelivered 
+        "CREATE INDEX IF NOT EXISTS idx_harbor_recipients_undelivered
          ON harbor_recipients(delivered) WHERE delivered = 0",
+        [],
+    )?;
+
+    // Harbor nodes cache: caches DHT lookup results for harbor node discovery
+    // Refreshed periodically by background task, no TTL needed
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS harbor_nodes_cache (
+            harbor_id BLOB NOT NULL CHECK (length(harbor_id) = 32),
+            node_id BLOB NOT NULL CHECK (length(node_id) = 32),
+            relay_url TEXT,
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            PRIMARY KEY (harbor_id, node_id),
+            FOREIGN KEY (node_id) REFERENCES peers(endpoint_id)
+        )",
+        [],
+    )?;
+
+    // Index for finding nodes by harbor_id
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_harbor_nodes_harbor_id ON harbor_nodes_cache(harbor_id)",
         [],
     )?;
 

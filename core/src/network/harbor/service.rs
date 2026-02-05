@@ -22,6 +22,7 @@ use crate::network::dht::DhtService;
 use crate::protocol::ProtocolEvent;
 use crate::resilience::{RateLimitConfig, RateLimiter};
 use crate::resilience::{StorageConfig, StorageManager};
+use crate::resilience::{PoWConfig, PoWResult, PoWVerifier, build_context};
 
 /// Harbor Node service
 ///
@@ -61,6 +62,8 @@ pub struct HarborService {
     pub(super) rate_limiter: Mutex<RateLimiter>,
     /// Storage quota manager
     pub(super) storage_manager: StorageManager,
+    /// Proof of Work verifier for abuse prevention
+    pub(super) pow_verifier: Mutex<PoWVerifier>,
 
     // === Timeout configuration ===
     /// Timeout for connecting to Harbor Nodes
@@ -93,6 +96,7 @@ impl HarborService {
             endpoint_id,
             rate_limiter: Mutex::new(RateLimiter::with_config(RateLimitConfig::default())),
             storage_manager: StorageManager::new(storage_config),
+            pow_verifier: Mutex::new(PoWVerifier::new(PoWConfig::harbor())),
             connect_timeout,
             response_timeout,
         }
@@ -113,6 +117,7 @@ impl HarborService {
             endpoint_id,
             rate_limiter: Mutex::new(RateLimiter::with_config(rate_config)),
             storage_manager: StorageManager::new(storage_config),
+            pow_verifier: Mutex::new(PoWVerifier::new(PoWConfig::disabled())),
             connect_timeout: Duration::from_secs(5),
             response_timeout: Duration::from_secs(30),
         }
@@ -181,6 +186,46 @@ impl HarborService {
     pub fn response_timeout(&self) -> Duration {
         self.response_timeout
     }
+
+    // === PoW Verification ===
+
+    /// Verify Proof of Work for a store request
+    ///
+    /// Context for Harbor PoW: `harbor_id || packet_id`
+    /// Uses ByteBased scaling based on packet size.
+    pub(super) fn verify_pow(
+        &self,
+        pow: &crate::resilience::ProofOfWork,
+        harbor_id: &[u8; 32],
+        packet_id: &[u8; 32],
+        sender_id: &[u8; 32],
+        packet_size: u64,
+    ) -> Result<(), HarborError> {
+        let context = build_context(&[harbor_id, packet_id]);
+        let verifier = self.pow_verifier.lock().unwrap();
+
+        match verifier.verify(pow, &context, sender_id, Some(packet_size)) {
+            PoWResult::Allowed => Ok(()),
+            PoWResult::InsufficientDifficulty { required, .. } => {
+                Err(HarborError::InsufficientPoW { required })
+            }
+            PoWResult::Expired { max_age_secs, .. } => {
+                // Treat expired PoW as insufficient - require recomputation
+                // Get current required difficulty for the hint
+                let required = verifier.effective_difficulty(sender_id, Some(packet_size));
+                tracing::warn!(
+                    max_age_secs = max_age_secs,
+                    "Harbor: PoW expired"
+                );
+                Err(HarborError::InsufficientPoW { required })
+            }
+            PoWResult::InvalidContext => {
+                // Context mismatch - PoW was computed for different data
+                let required = verifier.effective_difficulty(sender_id, Some(packet_size));
+                Err(HarborError::InsufficientPoW { required })
+            }
+        }
+    }
 }
 
 /// Harbor service error
@@ -196,6 +241,11 @@ pub enum HarborError {
     RateLimited {
         /// Time to wait before retrying
         retry_after: Duration,
+    },
+    /// Insufficient Proof of Work
+    InsufficientPoW {
+        /// Required difficulty bits
+        required: u8,
     },
     /// Total storage limit exceeded
     StorageFull {
@@ -225,6 +275,9 @@ impl std::fmt::Display for HarborError {
             }
             HarborError::RateLimited { retry_after } => {
                 write!(f, "rate limited: retry after {}ms", retry_after.as_millis())
+            }
+            HarborError::InsufficientPoW { required } => {
+                write!(f, "insufficient proof of work: {} bits required", required)
             }
             HarborError::StorageFull { current, limit } => {
                 write!(
@@ -257,11 +310,12 @@ mod tests {
     use super::*;
     use crate::data::schema::create_harbor_table;
     use crate::security::create_key_pair::generate_key_pair;
-    use crate::security::send::packet::PacketBuilder;
+    use crate::security::send::packet::{PacketBuilder, generate_packet_id};
     use crate::security::topic_keys::harbor_id_from_topic;
     use rusqlite::Connection;
 
     use super::super::protocol::StoreRequest;
+    use crate::resilience::ProofOfWork;
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -272,6 +326,15 @@ mod tests {
 
     fn test_id(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    /// Create a dummy PoW for tests (difficulty 0 = always passes)
+    fn test_pow() -> ProofOfWork {
+        ProofOfWork {
+            timestamp: 0,
+            nonce: 0,
+            difficulty_bits: 0,
+        }
     }
 
     #[test]
@@ -332,7 +395,7 @@ mod tests {
             sender_keypair.private_key,
             sender_keypair.public_key,
         )
-        .build(b"test message")
+        .build(b"test message", generate_packet_id())
         .unwrap();
 
         let packet_bytes = packet.to_bytes().unwrap();
@@ -346,6 +409,7 @@ mod tests {
                 sender_id: sender_keypair.public_key,
                 packet_data: packet_bytes.clone(),
                 recipients: vec![test_id(40)],
+                pow: test_pow(),
             };
             let result = service.handle_store(&mut conn, request);
             assert!(result.is_ok(), "Request {} should succeed", i);
@@ -358,6 +422,7 @@ mod tests {
             sender_id: sender_keypair.public_key,
             packet_data: packet_bytes,
             recipients: vec![test_id(40)],
+            pow: test_pow(),
         };
         let result = service.handle_store(&mut conn, request);
         assert!(matches!(result, Err(HarborError::RateLimited { .. })));
@@ -376,7 +441,7 @@ mod tests {
             sender_keypair.private_key,
             sender_keypair.public_key,
         )
-        .build(b"test message")
+        .build(b"test message", generate_packet_id())
         .unwrap();
 
         let packet_bytes = packet.to_bytes().unwrap();
@@ -390,6 +455,7 @@ mod tests {
                 sender_id: sender_keypair.public_key,
                 packet_data: packet_bytes.clone(),
                 recipients: vec![test_id(40)],
+                pow: test_pow(),
             };
             let result = service.handle_store(&mut conn, request);
             assert!(
@@ -414,7 +480,7 @@ mod tests {
             sender_keypair.private_key,
             sender_keypair.public_key,
         )
-        .build(b"test message")
+        .build(b"test message", generate_packet_id())
         .unwrap();
 
         let packet_bytes = packet.to_bytes().unwrap();
@@ -443,6 +509,7 @@ mod tests {
             sender_id: sender_keypair.public_key,
             packet_data: packet_bytes.clone(),
             recipients: vec![test_id(40)],
+            pow: test_pow(),
         };
         let result = service.handle_store(&mut conn, request1);
         let response = result.expect("First request should not error");
@@ -459,7 +526,7 @@ mod tests {
             sender_keypair.private_key,
             sender_keypair.public_key,
         )
-        .build(b"second message")
+        .build(b"second message", generate_packet_id())
         .unwrap();
         let packet_bytes2 = packet2.to_bytes().unwrap();
 
@@ -469,6 +536,7 @@ mod tests {
             sender_id: sender_keypair.public_key,
             packet_data: packet_bytes2,
             recipients: vec![test_id(40)],
+            pow: test_pow(),
         };
         let result = service.handle_store(&mut conn, request2);
         assert!(
@@ -492,7 +560,7 @@ mod tests {
             sender_keypair.private_key,
             sender_keypair.public_key,
         )
-        .build(b"test message")
+        .build(b"test message", generate_packet_id())
         .unwrap();
 
         let packet_bytes = packet.to_bytes().unwrap();
@@ -521,6 +589,7 @@ mod tests {
             sender_id: sender_keypair.public_key,
             packet_data: packet_bytes.clone(),
             recipients: vec![test_id(40)],
+            pow: test_pow(),
         };
         let result = service.handle_store(&mut conn, request1);
         let response = result.expect("First request should not error");
@@ -536,7 +605,7 @@ mod tests {
             sender_keypair.private_key,
             sender_keypair.public_key,
         )
-        .build(b"second message")
+        .build(b"second message", generate_packet_id())
         .unwrap();
         let packet_bytes2 = packet2.to_bytes().unwrap();
 
@@ -546,6 +615,7 @@ mod tests {
             sender_id: sender_keypair.public_key,
             packet_data: packet_bytes2,
             recipients: vec![test_id(40)],
+            pow: test_pow(),
         };
         let result = service.handle_store(&mut conn, request2);
         assert!(
@@ -561,7 +631,7 @@ mod tests {
             sender_keypair.private_key,
             sender_keypair.public_key,
         )
-        .build(b"third message")
+        .build(b"third message", generate_packet_id())
         .unwrap();
         let packet_bytes3 = packet3.to_bytes().unwrap();
         let harbor_id2 = harbor_id_from_topic(&topic_id2);
@@ -572,6 +642,7 @@ mod tests {
             sender_id: sender_keypair.public_key,
             packet_data: packet_bytes3,
             recipients: vec![test_id(40)],
+            pow: test_pow(),
         };
         let result = service.handle_store(&mut conn, request3);
         let response = result.expect("Third request should not error");
@@ -598,7 +669,7 @@ mod tests {
             sender_keypair.private_key,
             sender_keypair.public_key,
         )
-        .build(b"test message")
+        .build(b"test message", generate_packet_id())
         .unwrap();
 
         let packet_bytes = packet.to_bytes().unwrap();
@@ -612,6 +683,7 @@ mod tests {
                 sender_id: sender_keypair.public_key,
                 packet_data: packet_bytes.clone(),
                 recipients: vec![test_id(40)],
+                pow: test_pow(),
             };
             let result = service.handle_store(&mut conn, request);
             assert!(

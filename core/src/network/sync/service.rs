@@ -18,6 +18,7 @@ use crate::data::dht::peer::{get_peer_relay_info, update_peer_relay_url, current
 use crate::data::{get_topic_members, LocalIdentity};
 use crate::data::membership::get_topic_by_harbor_id;
 use crate::network::connect;
+use crate::network::gate::ConnectionGate;
 use crate::network::send::{SendService, SendOptions};
 use crate::network::packet::{DmMessage, TopicMessage, SyncUpdateMessage};
 use crate::protocol::{MemberInfo, ProtocolError, ProtocolEvent, SyncRequestEvent, SyncResponseEvent, DmSyncResponseEvent};
@@ -109,6 +110,8 @@ pub struct SyncService {
     event_tx: mpsc::Sender<ProtocolEvent>,
     /// Send service (for broadcasting via send protocol)
     send_service: Arc<SendService>,
+    /// Connection gate for peer authorization
+    connection_gate: Option<Arc<ConnectionGate>>,
     /// Configuration
     config: SyncConfig,
 }
@@ -121,6 +124,7 @@ impl SyncService {
         db: Arc<Mutex<DbConnection>>,
         event_tx: mpsc::Sender<ProtocolEvent>,
         send_service: Arc<SendService>,
+        connection_gate: Option<Arc<ConnectionGate>>,
     ) -> Self {
         Self {
             endpoint,
@@ -128,8 +132,14 @@ impl SyncService {
             db,
             event_tx,
             send_service,
+            connection_gate,
             config: SyncConfig::default(),
         }
+    }
+
+    /// Get the connection gate (for handler to check peer authorization)
+    pub fn connection_gate(&self) -> Option<&Arc<ConnectionGate>> {
+        self.connection_gate.as_ref()
     }
 
     // ========== Incoming ==========

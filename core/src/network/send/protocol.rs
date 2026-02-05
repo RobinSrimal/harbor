@@ -12,6 +12,7 @@ use irpc::rpc_requests;
 use serde::{Deserialize, Serialize};
 
 pub use crate::network::membership::{create_membership_proof, verify_membership_proof};
+use crate::resilience::ProofOfWork;
 
 /// Send protocol ALPN
 pub const SEND_ALPN: &[u8] = b"harbor/send/0";
@@ -46,12 +47,16 @@ impl Receipt {
 /// the sender knows the actual topic_id without revealing it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliverTopic {
+    /// Unique packet identifier (same ID used for Harbor storage for deduplication)
+    pub packet_id: [u8; 32],
     /// Hash of topic_id - hides actual topic from wire
     pub harbor_id: [u8; 32],
     /// Cryptographic proof of topic membership: BLAKE3(topic_id || harbor_id || sender_id)
     pub membership_proof: [u8; 32],
     /// Raw encoded TopicMessage payload
     pub payload: Vec<u8>,
+    /// Proof of Work (context: sender_id || harbor_id)
+    pub pow: ProofOfWork,
 }
 
 // Membership proof helpers are defined in network::membership and re-exported here
@@ -63,8 +68,12 @@ pub struct DeliverTopic {
 /// QUIC TLS provides transport encryption - no app-level crypto needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliverDm {
+    /// Unique packet identifier (same ID used for Harbor storage for deduplication)
+    pub packet_id: [u8; 32],
     /// Raw encoded DmMessage payload
     pub payload: Vec<u8>,
+    /// Proof of Work (context: sender_id || recipient_id)
+    pub pow: ProofOfWork,
 }
 
 /// Send RPC protocol definition using irpc
@@ -83,6 +92,15 @@ pub enum SendRpcProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Create a dummy PoW for tests (difficulty 0 = always passes)
+    fn test_pow() -> ProofOfWork {
+        ProofOfWork {
+            timestamp: 0,
+            nonce: 0,
+            difficulty_bits: 0,
+        }
+    }
 
     #[test]
     fn test_receipt_creation() {
@@ -103,16 +121,20 @@ mod tests {
     fn test_deliver_topic_serialization() {
         let topic_id = [42u8; 32];
         let sender_id = [1u8; 32];
+        let packet_id = [99u8; 32];
         let harbor_id = crate::security::harbor_id_from_topic(&topic_id);
         let proof = create_membership_proof(&topic_id, &harbor_id, &sender_id);
 
         let deliver = DeliverTopic {
+            packet_id,
             harbor_id,
             membership_proof: proof,
             payload: b"Hello!".to_vec(),
+            pow: test_pow(),
         };
         let bytes = postcard::to_allocvec(&deliver).unwrap();
         let decoded: DeliverTopic = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.packet_id, deliver.packet_id);
         assert_eq!(decoded.harbor_id, deliver.harbor_id);
         assert_eq!(decoded.membership_proof, deliver.membership_proof);
         assert_eq!(decoded.payload, deliver.payload);
@@ -139,11 +161,15 @@ mod tests {
 
     #[test]
     fn test_deliver_dm_serialization() {
+        let packet_id = [88u8; 32];
         let deliver = DeliverDm {
+            packet_id,
             payload: b"Hello DM!".to_vec(),
+            pow: test_pow(),
         };
         let bytes = postcard::to_allocvec(&deliver).unwrap();
         let decoded: DeliverDm = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.packet_id, deliver.packet_id);
         assert_eq!(decoded.payload, deliver.payload);
     }
 }

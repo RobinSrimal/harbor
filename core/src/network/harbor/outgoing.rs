@@ -27,6 +27,7 @@ use crate::network::dht::DhtService;
 use crate::network::process::{ProcessContext, ProcessScope, ProcessError, process_packet};
 use crate::network::stream::StreamService;
 use crate::protocol::ProtocolError;
+use crate::resilience::ProofOfWork;
 use crate::security::{SendPacket, EpochKeys, VerificationMode, verify_and_decrypt_with_epoch, verify_and_decrypt_dm_packet};
 
 use super::protocol::{
@@ -41,12 +42,14 @@ impl HarborService {
     /// Create a store request for a packet
     ///
     /// Called when we need to replicate a packet to Harbor Nodes.
+    /// The PoW should be computed with context: `harbor_id || packet_id`
     pub fn create_store_request(
         &self,
         packet_id: [u8; 32],
         harbor_id: [u8; 32],
         packet_data: Vec<u8>,
         undelivered_recipients: Vec<[u8; 32]>,
+        pow: ProofOfWork,
     ) -> StoreRequest {
         trace!(
             packet_id = %hex::encode(packet_id),
@@ -62,6 +65,7 @@ impl HarborService {
             harbor_id,
             sender_id: self.endpoint_id,
             recipients: undelivered_recipients,
+            pow,
         }
     }
 
@@ -394,8 +398,22 @@ impl HarborService {
     /// Maximum buffer size for sync responses
     pub const SYNC_RESPONSE_MAX_SIZE: usize = 1024 * 1024; // 1MB
 
+    /// Find Harbor Nodes for a given HarborID from cache
+    ///
+    /// Returns cached nodes from the harbor_nodes_cache table.
+    /// The cache is populated by the background discovery task.
+    pub fn find_harbor_nodes(
+        conn: &rusqlite::Connection,
+        harbor_id: &[u8; 32],
+    ) -> Vec<[u8; 32]> {
+        crate::data::harbor::get_cached_harbor_nodes(conn, harbor_id).unwrap_or_default()
+    }
+
     /// Find Harbor Nodes for a given HarborID using DHT lookup
-    pub async fn find_harbor_nodes(
+    ///
+    /// This performs an actual DHT lookup. Used by the background discovery task
+    /// to refresh the cache. Other code should use `find_harbor_nodes` which reads from cache.
+    pub async fn find_harbor_nodes_dht(
         dht_service: &Option<Arc<DhtService>>,
         harbor_id: &[u8; 32],
     ) -> Vec<[u8; 32]> {
@@ -726,6 +744,7 @@ mod tests {
     use crate::data::dht::current_timestamp;
     use crate::data::harbor::{cache_packet, get_cached_packet, mark_delivered};
     use crate::data::schema::create_harbor_table;
+    use crate::resilience::ProofOfWork;
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -738,6 +757,15 @@ mod tests {
         [seed; 32]
     }
 
+    /// Create a dummy PoW for tests (difficulty 0 = always passes)
+    fn test_pow() -> ProofOfWork {
+        ProofOfWork {
+            timestamp: 0,
+            nonce: 0,
+            difficulty_bits: 0,
+        }
+    }
+
     #[test]
     fn test_create_store_request() {
         let service = HarborService::without_rate_limiting(test_id(1));
@@ -747,6 +775,7 @@ mod tests {
             test_id(20),
             b"packet data".to_vec(),
             vec![test_id(40), test_id(41)],
+            test_pow(),
         );
 
         assert_eq!(request.packet_id, test_id(10));

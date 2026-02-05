@@ -45,6 +45,7 @@ pub use harbor::{
 pub use harbor::{
     dedup_check_and_mark, get_total_tracked_count, get_tracked_count, DedupError, DedupResult,
 };
+pub use harbor::{get_all_active_harbor_ids, get_cached_harbor_nodes, replace_harbor_nodes};
 
 // Re-export commonly used items from identity
 pub use identity::{ensure_self_in_peers, get_or_create_identity, LocalIdentity};
@@ -59,7 +60,7 @@ pub use send::{
 pub use membership::{
     add_topic_member, get_all_topics, get_joined_at, get_topic,
     get_topic_admin, get_topic_members, get_topics_for_member, is_topic_admin,
-    remove_topic_member, subscribe_topic, subscribe_topic_with_admin,
+    remove_topic_member, subscribe_dm_topic, subscribe_topic, subscribe_topic_with_admin,
     unsubscribe_topic, TopicMember, TopicSubscription,
 };
 // Re-export epoch key functions

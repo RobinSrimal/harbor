@@ -75,9 +75,22 @@ impl Protocol {
 
             for (harbor_id, sync_request) in sync_requests {
                 let harbor_id_hex = hex::encode(harbor_id);
-                
-                // Find closest Harbor Nodes for this HarborID
-                let harbor_nodes = HarborService::find_harbor_nodes(&dht_service, &harbor_id).await;
+
+                // Find Harbor Nodes from cache, fallback to DHT if empty
+                let mut harbor_nodes = {
+                    let db_lock = db.lock().await;
+                    HarborService::find_harbor_nodes(&db_lock, &harbor_id)
+                };
+
+                // Fallback to DHT lookup if cache is empty
+                if harbor_nodes.is_empty() {
+                    harbor_nodes = HarborService::find_harbor_nodes_dht(&dht_service, &harbor_id).await;
+                    // Cache the result for next time
+                    if !harbor_nodes.is_empty() {
+                        let db_lock = db.lock().await;
+                        let _ = crate::data::harbor::replace_harbor_nodes(&db_lock, &harbor_id, &harbor_nodes);
+                    }
+                }
 
                 if harbor_nodes.is_empty() {
                     debug!(

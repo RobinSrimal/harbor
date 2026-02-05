@@ -3,6 +3,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::resilience::PoWConfig;
+
 /// Configuration for the Harbor protocol
 #[derive(Clone)]
 pub struct ProtocolConfig {
@@ -89,6 +91,22 @@ pub struct ProtocolConfig {
     /// How often to check for incomplete blobs and retry pulling (seconds)
     /// Default: 30
     pub share_pull_interval_secs: u64,
+
+    /// How often to refresh harbor node cache via DHT lookups (seconds)
+    /// Default: 300 (5 minutes)
+    pub harbor_node_refresh_interval_secs: u64,
+
+    /// Proof of Work configuration for Harbor ALPN
+    pub harbor_pow: PoWConfig,
+
+    /// Proof of Work configuration for Control ALPN
+    pub control_pow: PoWConfig,
+
+    /// Proof of Work configuration for DHT ALPN
+    pub dht_pow: PoWConfig,
+
+    /// Proof of Work configuration for Send ALPN
+    pub send_pow: PoWConfig,
 }
 
 impl fmt::Debug for ProtocolConfig {
@@ -115,6 +133,11 @@ impl fmt::Debug for ProtocolConfig {
             .field("dht_save_interval_secs", &self.dht_save_interval_secs)
             .field("cleanup_interval_secs", &self.cleanup_interval_secs)
             .field("share_pull_interval_secs", &self.share_pull_interval_secs)
+            .field("harbor_node_refresh_interval_secs", &self.harbor_node_refresh_interval_secs)
+            .field("harbor_pow", &self.harbor_pow)
+            .field("control_pow", &self.control_pow)
+            .field("dht_pow", &self.dht_pow)
+            .field("send_pow", &self.send_pow)
             .finish()
     }
 }
@@ -146,6 +169,11 @@ impl Default for ProtocolConfig {
             dht_save_interval_secs: 60,
             cleanup_interval_secs: 3600,
             share_pull_interval_secs: 30,
+            harbor_node_refresh_interval_secs: 300, // 5 minutes
+            harbor_pow: PoWConfig::harbor(),
+            control_pow: PoWConfig::control(),
+            dht_pow: PoWConfig::dht(),
+            send_pow: PoWConfig::send(),
         }
     }
 }
@@ -234,6 +262,11 @@ impl ProtocolConfig {
             dht_save_interval_secs: 60,      // Same as default
             cleanup_interval_secs: 3600,     // Same as default
             share_pull_interval_secs: 10,    // Faster for testing
+            harbor_node_refresh_interval_secs: 30, // Faster for testing
+            harbor_pow: PoWConfig::for_testing(),
+            control_pow: PoWConfig::for_testing(),
+            dht_pow: PoWConfig::for_testing(),
+            send_pow: PoWConfig::for_testing(),
         }
     }
     
@@ -312,6 +345,45 @@ impl ProtocolConfig {
     /// Set share pull retry interval
     pub fn with_share_pull_interval(mut self, secs: u64) -> Self {
         self.share_pull_interval_secs = secs;
+        self
+    }
+
+    /// Set harbor node cache refresh interval
+    pub fn with_harbor_node_refresh_interval(mut self, secs: u64) -> Self {
+        self.harbor_node_refresh_interval_secs = secs;
+        self
+    }
+
+    /// Set Harbor ALPN PoW configuration
+    pub fn with_harbor_pow(mut self, config: PoWConfig) -> Self {
+        self.harbor_pow = config;
+        self
+    }
+
+    /// Set Control ALPN PoW configuration
+    pub fn with_control_pow(mut self, config: PoWConfig) -> Self {
+        self.control_pow = config;
+        self
+    }
+
+    /// Set DHT ALPN PoW configuration
+    pub fn with_dht_pow(mut self, config: PoWConfig) -> Self {
+        self.dht_pow = config;
+        self
+    }
+
+    /// Set Send ALPN PoW configuration
+    pub fn with_send_pow(mut self, config: PoWConfig) -> Self {
+        self.send_pow = config;
+        self
+    }
+
+    /// Disable all PoW (for testing or special cases)
+    pub fn with_pow_disabled(mut self) -> Self {
+        self.harbor_pow = PoWConfig::disabled();
+        self.control_pow = PoWConfig::disabled();
+        self.dht_pow = PoWConfig::disabled();
+        self.send_pow = PoWConfig::disabled();
         self
     }
 }

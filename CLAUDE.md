@@ -169,17 +169,19 @@ See [SIMULATIONS.md](SIMULATIONS.md) for details on running simulations and test
 
 ## Common Gotchas
 
-1. **Don't confuse Send protocol with SYNC_ALPN**: Sync updates/requests use Send, sync responses use SYNC_ALPN
-2. **TopicMessage is only for Send protocol**: Direct SYNC_ALPN uses raw format `[topic_id][type_byte][data]`
-3. **Harbor sync vs CRDT sync**: "Harbor sync" = syncing packets between harbor nodes; "CRDT sync" = application-level state synchronization
-4. **Size limits**: Send protocol has 512KB limit; SYNC_ALPN has no limit (designed for large snapshots)
-5. **The protocol is CRDT-agnostic**: Applications choose their own CRDT library (Loro, Yjs, Automerge, etc.)
-6. **Protocol is just API**: Don't add business logic to Protocol - it delegates to Services
-7. **Services call services**: Services communicate directly, not through Protocol
-8. **Encryption layers**: QUIC provides transport encryption; packet encryption is only needed for Harbor storage
+1. **NO BACKWARDS COMPATIBILITY NEEDED**: This is pre-production. Do NOT use `#[serde(default)]`, `Option<T>` for compat, or mention "backward compatible" in plans. Just change the wire format directly.
+2. **Don't confuse Send protocol with SYNC_ALPN**: Sync updates/requests use Send, sync responses use SYNC_ALPN
+3. **TopicMessage is only for Send protocol**: Direct SYNC_ALPN uses raw format `[topic_id][type_byte][data]`
+4. **Harbor sync vs CRDT sync**: "Harbor sync" = syncing packets between harbor nodes; "CRDT sync" = application-level state synchronization
+5. **Size limits**: Send protocol has 512KB limit; SYNC_ALPN has no limit (designed for large snapshots)
+6. **The protocol is CRDT-agnostic**: Applications choose their own CRDT library (Loro, Yjs, Automerge, etc.)
+7. **Protocol is just API**: Don't add business logic to Protocol - it delegates to Services
+8. **Services call services**: Services communicate directly, not through Protocol
+9. **Encryption layers**: QUIC provides transport encryption; packet encryption is only needed for Harbor storage
 
 ## Development Notes
 
+- **Status: Pre-production development** - Breaking changes are acceptable, no backwards compatibility required
 - The codebase uses async Rust with Tokio
 - QUIC transport via `iroh` library
 - SQLite for local persistence (identity, topics, harbor packets, etc.)

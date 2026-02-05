@@ -636,11 +636,21 @@ mod tests {
     use super::super::internal::config::{DEFAULT_CANDIDATE_VERIFY_INTERVAL, MAX_CANDIDATES_PER_VERIFY};
     use super::super::internal::distance::Distance;
     use super::super::internal::routing::{K, ALPHA};
+    use crate::resilience::ProofOfWork;
     use std::collections::BTreeSet;
     use std::time::Duration;
 
     fn make_id(seed: u8) -> Id {
         Id::new([seed; 32])
+    }
+
+    /// Create a dummy PoW for tests (difficulty 0 = always passes)
+    fn test_pow() -> ProofOfWork {
+        ProofOfWork {
+            timestamp: 0,
+            nonce: 0,
+            difficulty_bits: 0,
+        }
     }
 
     #[test]
@@ -877,14 +887,15 @@ mod tests {
             target: make_id(42),
             requester: Some([1u8; 32]),
             requester_relay_url: Some("https://relay.example.com/".to_string()),
+            pow: test_pow(),
         };
 
         // Serialize
         let bytes = postcard::to_allocvec(&request).unwrap();
-        
+
         // Deserialize
         let decoded: FindNode = postcard::from_bytes(&bytes).unwrap();
-        
+
         assert_eq!(decoded.target, request.target);
         assert_eq!(decoded.requester, request.requester);
         assert_eq!(decoded.requester_relay_url, request.requester_relay_url);
@@ -896,11 +907,12 @@ mod tests {
             target: make_id(42),
             requester: None,
             requester_relay_url: None,
+            pow: test_pow(),
         };
 
         let bytes = postcard::to_allocvec(&request).unwrap();
         let decoded: FindNode = postcard::from_bytes(&bytes).unwrap();
-        
+
         assert!(decoded.requester.is_none());
     }
 

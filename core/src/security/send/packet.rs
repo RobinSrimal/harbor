@@ -292,11 +292,19 @@ impl PacketBuilder {
         }
     }
 
-    /// Build a packet using epoch keys
-    /// 
+    /// Build a packet using epoch keys with a specific packet_id
+    ///
     /// For Tier 1: Use with `EpochKeys::derive_from_topic(topic_id, 0)`
     /// For Tier 2+: Use epoch keys from the current epoch secret
-    pub fn build_with_epoch(&self, plaintext: &[u8], epoch_keys: &EpochKeys) -> Result<SendPacket, PacketError> {
+    ///
+    /// The packet_id must be provided for deduplication - direct delivery
+    /// and Harbor storage use the same packet_id.
+    pub fn build_with_epoch(
+        &self,
+        plaintext: &[u8],
+        epoch_keys: &EpochKeys,
+        packet_id: [u8; 32],
+    ) -> Result<SendPacket, PacketError> {
         // Check payload size
         if plaintext.len() > MAX_PAYLOAD_SIZE {
             return Err(PacketError::PayloadTooLarge {
@@ -305,8 +313,6 @@ impl PacketBuilder {
             });
         }
 
-        // Generate packet ID and nonce
-        let packet_id = generate_packet_id();
         let nonce = generate_nonce();
 
         // Compute HarborID
@@ -348,18 +354,20 @@ impl PacketBuilder {
     }
 
     /// Build a packet from plaintext payload (Tier 1 mode)
-    /// 
+    ///
     /// Uses TopicID-derived keys with epoch 0. This is the standard
     /// method for Tier 1 (Open Topics).
-    pub fn build(&self, plaintext: &[u8]) -> Result<SendPacket, PacketError> {
-        // Use epoch 0 with topic-derived keys for backward compatibility
+    pub fn build(&self, plaintext: &[u8], packet_id: [u8; 32]) -> Result<SendPacket, PacketError> {
         let epoch_keys = EpochKeys::derive_from_topic(&self.topic_id, 0);
-        self.build_with_epoch(plaintext, &epoch_keys)
+        self.build_with_epoch(plaintext, &epoch_keys, packet_id)
     }
 }
 
 /// Generate a random packet ID
-fn generate_packet_id() -> [u8; PACKET_ID_SIZE] {
+///
+/// Use this to generate a packet_id at send time, then pass it to both
+/// direct delivery and seal functions for deduplication.
+pub fn generate_packet_id() -> [u8; PACKET_ID_SIZE] {
     let mut id = [0u8; PACKET_ID_SIZE];
     use rand::RngCore;
     rand::rngs::OsRng.fill_bytes(&mut id);
@@ -376,15 +384,17 @@ fn generate_packet_id() -> [u8; PACKET_ID_SIZE] {
 /// * `sender_public_key` - Sender's EndpointID
 /// * `plaintext` - The message payload
 /// * `epoch_keys` - Epoch-specific encryption keys
+/// * `packet_id` - Unique packet identifier (same ID used for direct delivery and Harbor)
 pub fn create_packet_with_epoch(
     topic_id: &[u8; 32],
     sender_private_key: &[u8; 32],
     sender_public_key: &[u8; 32],
     plaintext: &[u8],
     epoch_keys: &EpochKeys,
+    packet_id: [u8; 32],
 ) -> Result<SendPacket, PacketError> {
     PacketBuilder::new(*topic_id, *sender_private_key, *sender_public_key)
-        .build_with_epoch(plaintext, epoch_keys)
+        .build_with_epoch(plaintext, epoch_keys, packet_id)
 }
 
 /// Create a Send packet (Tier 1 convenience function)
@@ -397,13 +407,15 @@ pub fn create_packet_with_epoch(
 /// * `sender_private_key` - Sender's Ed25519 private key
 /// * `sender_public_key` - Sender's EndpointID
 /// * `plaintext` - The message payload
+/// * `packet_id` - Unique packet identifier (same ID used for direct delivery and Harbor)
 pub fn create_packet(
     topic_id: &[u8; 32],
     sender_private_key: &[u8; 32],
     sender_public_key: &[u8; 32],
     plaintext: &[u8],
+    packet_id: [u8; 32],
 ) -> Result<SendPacket, PacketError> {
-    PacketBuilder::new(*topic_id, *sender_private_key, *sender_public_key).build(plaintext)
+    PacketBuilder::new(*topic_id, *sender_private_key, *sender_public_key).build(plaintext, packet_id)
 }
 
 /// Verification mode for packets
@@ -659,11 +671,13 @@ pub fn verify_for_storage(
 /// * `sender_public_key` - Sender's Ed25519 public key (EndpointID)
 /// * `recipient_public_key` - Recipient's Ed25519 public key (EndpointID)
 /// * `plaintext` - The message payload
+/// * `packet_id` - Unique packet identifier (same ID used for direct delivery and Harbor)
 pub fn create_dm_packet(
     sender_private_key: &[u8; 32],
     sender_public_key: &[u8; 32],
     recipient_public_key: &[u8; 32],
     plaintext: &[u8],
+    packet_id: [u8; 32],
 ) -> Result<SendPacket, PacketError> {
     if plaintext.len() > MAX_PAYLOAD_SIZE {
         return Err(PacketError::PayloadTooLarge {
@@ -672,7 +686,6 @@ pub fn create_dm_packet(
         });
     }
 
-    let packet_id = generate_packet_id();
     let harbor_id = *recipient_public_key;
 
     // ECDH encrypt
@@ -745,7 +758,7 @@ mod tests {
         let plaintext = b"Hello, Harbor!";
 
         // Create packet
-        let packet = create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+        let packet = create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
 
         // Verify fields
         assert_eq!(packet.harbor_id, harbor_id_from_topic(&topic_id));
@@ -767,7 +780,7 @@ mod tests {
         let plaintext = b"Test message";
 
         let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
 
         // Serialize and deserialize
         let bytes = packet.to_bytes().unwrap();
@@ -792,7 +805,7 @@ mod tests {
         let kp = generate_key_pair();
         let huge_payload = vec![0u8; MAX_PAYLOAD_SIZE + 1];
 
-        let result = create_packet(&topic_id, &kp.private_key, &kp.public_key, &huge_payload);
+        let result = create_packet(&topic_id, &kp.private_key, &kp.public_key, &huge_payload, generate_packet_id());
 
         assert!(matches!(result, Err(PacketError::PayloadTooLarge { .. })));
     }
@@ -803,7 +816,7 @@ mod tests {
         let kp = generate_key_pair();
         let max_payload = vec![0u8; MAX_PAYLOAD_SIZE];
 
-        let result = create_packet(&topic_id, &kp.private_key, &kp.public_key, &max_payload);
+        let result = create_packet(&topic_id, &kp.private_key, &kp.public_key, &max_payload, generate_packet_id());
         assert!(result.is_ok());
     }
 
@@ -815,7 +828,7 @@ mod tests {
         let plaintext = b"Secret message";
 
         let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
 
         // Verify with wrong topic should fail at HarborID mismatch
         let result = verify_and_decrypt_packet(&packet, &wrong_topic);
@@ -829,7 +842,7 @@ mod tests {
         let plaintext = b"Secret message";
 
         let mut packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
 
         // Tamper with ciphertext
         packet.ciphertext[0] ^= 0xFF;
@@ -846,7 +859,7 @@ mod tests {
         let plaintext = b"Secret message";
 
         let mut packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
 
         // Tamper with MAC
         packet.mac[0] ^= 0xFF;
@@ -862,7 +875,7 @@ mod tests {
         let plaintext = b"Secret message";
 
         let mut packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
 
         // Tamper with signature
         packet.signature[0] ^= 0xFF;
@@ -879,7 +892,7 @@ mod tests {
         let plaintext = b"Secret message";
 
         let mut packet =
-            create_packet(&topic_id, &kp1.private_key, &kp1.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp1.private_key, &kp1.public_key, plaintext, generate_packet_id()).unwrap();
 
         // Replace endpoint_id with different key
         packet.endpoint_id = kp2.public_key;
@@ -896,7 +909,7 @@ mod tests {
         let plaintext = b"";
 
         let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
         let decrypted = verify_and_decrypt_packet(&packet, &topic_id).unwrap();
 
         assert_eq!(decrypted, plaintext);
@@ -909,7 +922,7 @@ mod tests {
         let plaintext = b"Hello, Harbor!";
 
         let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
 
         // Size should be reasonable
         let size = packet.size();
@@ -926,7 +939,7 @@ mod tests {
         let plaintext = b"Join message";
 
         let mut packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
 
         // Tamper with signature
         packet.signature[0] ^= 0xFF;
@@ -949,7 +962,7 @@ mod tests {
         let plaintext = b"Test message";
 
         let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
 
         // Get epoch keys for epoch 0 (default)
         let epoch_keys = EpochKeys::derive_from_topic(&topic_id, 0);
@@ -981,6 +994,7 @@ mod tests {
             &kp.public_key,
             plaintext,
             &epoch_keys,
+            generate_packet_id(),
         ).unwrap();
 
         assert_eq!(packet.epoch, 5);
@@ -1039,6 +1053,7 @@ mod tests {
             &kp.public_key,
             plaintext,
             &epoch_1_keys,
+            generate_packet_id(),
         ).unwrap();
 
         // Late joiner who only has epoch 5 keys cannot decrypt
@@ -1060,7 +1075,7 @@ mod tests {
         let plaintext = b"Test message";
 
         let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
         let packet_bytes = packet.to_bytes().unwrap();
 
         // Should verify successfully
@@ -1075,7 +1090,7 @@ mod tests {
         let plaintext = b"Test message";
 
         let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
         let packet_bytes = packet.to_bytes().unwrap();
 
         let wrong_harbor_id = [0u8; 32];
@@ -1090,7 +1105,7 @@ mod tests {
         let plaintext = b"Test message";
 
         let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
         let packet_bytes = packet.to_bytes().unwrap();
 
         let wrong_sender = [0u8; 32];
@@ -1105,7 +1120,7 @@ mod tests {
         let plaintext = b"Test message";
 
         let mut packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
 
         // Tamper with signature
         packet.signature[0] ^= 0xFF;
@@ -1150,7 +1165,7 @@ mod tests {
         let plaintext = b"Test message";
 
         let mut packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
 
         // Tamper with harbor_id
         packet.harbor_id = [0u8; 32];
@@ -1203,6 +1218,7 @@ mod tests {
             &alice.public_key,
             secret_message,
             &epoch_1_keys,
+            generate_packet_id(),
         ).unwrap();
 
         // Bob only has epoch 5 keys (joined at epoch 5)
@@ -1240,6 +1256,7 @@ mod tests {
             &charlie.public_key,
             message,
             &epoch_4_keys,
+            generate_packet_id(),
         ).unwrap();
 
         // Alice only has up to epoch 3 keys
@@ -1272,11 +1289,11 @@ mod tests {
         let epoch_2_keys = EpochKeys::derive_from_topic(&topic_id, 2);
 
         let packet_1 = create_packet_with_epoch(
-            &topic_id, &kp.private_key, &kp.public_key, plaintext, &epoch_1_keys
+            &topic_id, &kp.private_key, &kp.public_key, plaintext, &epoch_1_keys, generate_packet_id()
         ).unwrap();
 
         let packet_2 = create_packet_with_epoch(
-            &topic_id, &kp.private_key, &kp.public_key, plaintext, &epoch_2_keys
+            &topic_id, &kp.private_key, &kp.public_key, plaintext, &epoch_2_keys, generate_packet_id()
         ).unwrap();
 
         // Ciphertexts should be different (different keys + different nonces)
@@ -1353,6 +1370,7 @@ mod tests {
                 &sender.public_key,
                 msg.as_bytes(),
                 &keys,
+                generate_packet_id(),
             ).unwrap();
             packets.push((epoch, packet));
         }
@@ -1401,7 +1419,7 @@ mod tests {
 
         let keys = EpochKeys::derive_from_topic(&topic_id, 7);
         let mut packet = create_packet_with_epoch(
-            &topic_id, &kp.private_key, &kp.public_key, plaintext, &keys
+            &topic_id, &kp.private_key, &kp.public_key, plaintext, &keys, generate_packet_id()
         ).unwrap();
 
         // Verify normal decryption works
@@ -1422,12 +1440,13 @@ mod tests {
 
     #[test]
     fn test_backward_compatibility_epoch_zero() {
-        // Legacy create_packet should use epoch 0
+        // create_packet should use epoch 0
         let topic_id = test_topic_id();
         let kp = generate_key_pair();
         let plaintext = b"Legacy message";
+        let packet_id = generate_packet_id();
 
-        let packet = create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext).unwrap();
+        let packet = create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, packet_id).unwrap();
         
         assert_eq!(packet.epoch, 0);
         
@@ -1448,10 +1467,11 @@ mod tests {
         let topic_id = test_topic_id();
         let kp = generate_key_pair();
         let plaintext = b"Serialization test";
+        let packet_id = generate_packet_id();
 
         let keys = EpochKeys::derive_from_topic(&topic_id, 42);
         let packet = create_packet_with_epoch(
-            &topic_id, &kp.private_key, &kp.public_key, plaintext, &keys
+            &topic_id, &kp.private_key, &kp.public_key, plaintext, &keys, packet_id
         ).unwrap();
 
         // Serialize and deserialize

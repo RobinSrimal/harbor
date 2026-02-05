@@ -8,11 +8,12 @@
 //! - Generating invites with current membership
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use iroh::Endpoint;
+use iroh::{Endpoint, EndpointId};
 use rusqlite::Connection as DbConnection;
 use tokio::sync::Mutex;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use crate::data::{
     add_topic_member, cleanup_pulled_for_topic, ensure_peer_exists, get_all_topics,
@@ -20,8 +21,10 @@ use crate::data::{
     subscribe_topic_with_admin, unsubscribe_topic,
     LocalIdentity, WILDCARD_RECIPIENT,
 };
-use crate::network::control::protocol::{ControlPacketType, TopicJoin, TopicLeave};
+use crate::network::control::protocol::{ControlPacketType, ControlRpcProtocol, TopicJoin, TopicLeave, CONTROL_ALPN};
 use crate::network::membership::create_membership_proof;
+use crate::network::connect;
+use crate::resilience::{ProofOfWork, PoWConfig, build_context};
 use crate::security::harbor_id_from_topic;
 use crate::network::send::{SendService, SendOptions};
 use super::types::{MemberInfo, TopicInvite};
@@ -155,7 +158,17 @@ impl TopicService {
             }
         }
 
-        // Send join announcement (Control protocol TopicJoin)
+        // Update our connection gate with all topic members
+        // This allows us to RECEIVE messages from them via SEND ALPN
+        if let Some(gate) = self.send_service.connection_gate() {
+            for member_id in &member_ids {
+                if *member_id != our_id {
+                    gate.add_topic_peer(member_id, &invite.topic_id).await;
+                }
+            }
+        }
+
+        // Send join announcement via CONTROL ALPN (no gate checking)
         let our_relay = self.relay_url();
         let message_id = {
             use rand::RngCore;
@@ -165,6 +178,9 @@ impl TopicService {
         };
         let harbor_id = harbor_id_from_topic(&invite.topic_id);
         let membership_proof = create_membership_proof(&invite.topic_id, &harbor_id, &our_id);
+        let pow_context = build_context(&[&our_id, &[ControlPacketType::TopicJoin as u8]]);
+        let pow = ProofOfWork::compute(&pow_context, PoWConfig::control().base_difficulty)
+            .ok_or_else(|| TopicError::Network("failed to compute PoW".to_string()))?;
 
         let join_msg = TopicJoin {
             message_id,
@@ -173,40 +189,90 @@ impl TopicService {
             epoch: 0, // Initial join is always epoch 0
             relay_url: our_relay.clone(),
             membership_proof,
+            pow,
         };
-        // Encode as Control packet: [type_byte][serialized_data]
-        let serialized = postcard::to_allocvec(&join_msg).expect("serialization should succeed");
-        let mut payload = Vec::with_capacity(1 + serialized.len());
-        payload.push(ControlPacketType::TopicJoin as u8);
-        payload.extend_from_slice(&serialized);
 
         trace!(
             our_id = %hex::encode(our_id),
             our_relay = ?our_relay,
             member_count = invite.get_member_info().len(),
-            "sending join announcement"
+            "sending join announcement via Control ALPN"
         );
 
-        // Build recipient list with WILDCARD for Harbor storage
-        let mut members_with_wildcard = invite.get_member_info().to_vec();
-        members_with_wildcard.push(MemberInfo {
+        // Send TopicJoin to each member via CONTROL ALPN (bypasses gate check)
+        // Use short timeout (3s) since offline members are handled by Harbor replication
+        for member_info in invite.get_member_info() {
+            if member_info.endpoint_id == our_id {
+                continue;
+            }
+
+            // Look up relay URL from invite or database
+            let relay_url = if let Some(ref url) = member_info.relay_url {
+                url.parse::<iroh::RelayUrl>().ok()
+            } else {
+                let db = self.db.lock().await;
+                get_peer_relay_info(&db, &member_info.endpoint_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|(url, _)| url.parse::<iroh::RelayUrl>().ok())
+            };
+
+            let node_id = match EndpointId::from_bytes(&member_info.endpoint_id) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            // Connect via CONTROL ALPN and send TopicJoin
+            match connect::connect(
+                &self.endpoint,
+                node_id,
+                relay_url.as_ref(),
+                None,
+                CONTROL_ALPN,
+                Duration::from_secs(3), // Short timeout - offline members handled by Harbor
+            ).await {
+                Ok(result) => {
+                    let client = irpc::Client::<ControlRpcProtocol>::boxed(
+                        crate::network::rpc::ExistingConnection::new(&result.connection),
+                    );
+                    if let Err(e) = client.rpc(join_msg.clone()).await {
+                        debug!(
+                            member = %hex::encode(&member_info.endpoint_id[..8]),
+                            error = %e,
+                            "failed to send TopicJoin via Control"
+                        );
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        member = %hex::encode(&member_info.endpoint_id[..8]),
+                        error = %e,
+                        "failed to connect to member via Control ALPN"
+                    );
+                }
+            }
+        }
+
+        // Also store for Harbor replication (for offline members)
+        let serialized = postcard::to_allocvec(&join_msg).expect("serialization should succeed");
+        let mut payload = Vec::with_capacity(1 + serialized.len());
+        payload.push(ControlPacketType::TopicJoin as u8);
+        payload.extend_from_slice(&serialized);
+
+        let wildcard_only = vec![MemberInfo {
             endpoint_id: WILDCARD_RECIPIENT,
             relay_url: None,
-        });
+        }];
 
-        let send_result = self
+        let _ = self
             .send_service
             .send_to_topic(
                 &invite.topic_id,
                 &payload,
-                &members_with_wildcard,
+                &wildcard_only,
                 SendOptions::default(),
             )
-            .await
-            .map_err(|e| TopicError::Network(e.to_string()));
-        if let Err(e) = send_result {
-            debug!(error = %e, "failed to send join announcement to some members");
-        }
+            .await;
 
         info!(topic = hex::encode(invite.topic_id), "joined topic");
         Ok(())
@@ -231,6 +297,9 @@ impl TopicService {
         };
         let harbor_id = harbor_id_from_topic(topic_id);
         let membership_proof = create_membership_proof(topic_id, &harbor_id, &our_id);
+        let pow_context = build_context(&[&our_id, &[ControlPacketType::TopicLeave as u8]]);
+        let pow = ProofOfWork::compute(&pow_context, PoWConfig::control().base_difficulty)
+            .ok_or_else(|| TopicError::Network("failed to compute PoW".to_string()))?;
 
         let leave_msg = TopicLeave {
             message_id,
@@ -238,6 +307,7 @@ impl TopicService {
             sender_id: our_id,
             epoch: 0, // TODO: use current epoch
             membership_proof,
+            pow,
         };
         // Encode as Control packet: [type_byte][serialized_data]
         let serialized = postcard::to_allocvec(&leave_msg).expect("serialization should succeed");

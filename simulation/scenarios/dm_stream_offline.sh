@@ -54,6 +54,18 @@ scenario_dm_stream_offline() {
     info "Node-1 endpoint: ${NODE1_ID:0:16}..."
     info "Node-2 endpoint: ${NODE2_ID:0:16}..."
 
+    # Establish DM connection via Control protocol (required for STREAM_ALPN gate)
+    log "Phase 3b: Establishing DM connection..."
+    local INVITE=$(api_control_generate_invite 1)
+    local INVITE_STRING=$(extract_invite_string "$INVITE")
+    if [ -n "$INVITE_STRING" ]; then
+        api_control_connect_with_invite 2 "$INVITE_STRING" > /dev/null
+        info "  Node-1 ↔ Node-2: connection established"
+    else
+        warn "  Failed to establish connection"
+    fi
+    sleep 2
+
     # Stop node-2 (goes offline)
     log "Phase 4: Stopping node-2 (going offline)..."
     stop_node 2

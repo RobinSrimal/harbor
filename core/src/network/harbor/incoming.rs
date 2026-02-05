@@ -100,6 +100,32 @@ impl HarborService {
             "Harbor STORE: received store request"
         );
 
+        // Verify Proof of Work first (before rate limits so we don't waste limiter state)
+        let packet_size = request.packet_data.len() as u64;
+        if let Err(e) = self.verify_pow(
+            &request.pow,
+            &request.harbor_id,
+            &request.packet_id,
+            &request.sender_id,
+            packet_size,
+        ) {
+            if let HarborError::InsufficientPoW { required } = &e {
+                warn!(
+                    packet_id = %packet_id_hex,
+                    required_difficulty = required,
+                    provided_difficulty = request.pow.difficulty_bits,
+                    "Harbor STORE: rejected - insufficient PoW"
+                );
+                return Ok(StoreResponse {
+                    packet_id: request.packet_id,
+                    success: false,
+                    error: Some(format!("insufficient proof of work: {} bits required", required)),
+                    required_difficulty: Some(*required),
+                });
+            }
+            return Err(e);
+        }
+
         // Check rate limits (both connection and harbor limits)
         self.check_store_rate_limit(&request.sender_id, &request.harbor_id)?;
 
@@ -156,6 +182,7 @@ impl HarborService {
                 packet_id: request.packet_id,
                 success: false,
                 error: Some("empty packet data".to_string()),
+                required_difficulty: None,
             });
         }
 
@@ -168,6 +195,7 @@ impl HarborService {
                 packet_id: request.packet_id,
                 success: false,
                 error: Some("no recipients".to_string()),
+                required_difficulty: None,
             });
         }
 
@@ -189,6 +217,7 @@ impl HarborService {
                         packet_id: request.packet_id,
                         success: false,
                         error: Some("packet_id mismatch".to_string()),
+                        required_difficulty: None,
                     });
                 }
                 debug!(
@@ -216,6 +245,7 @@ impl HarborService {
                     packet_id: request.packet_id,
                     success: false,
                     error: Some(error_msg),
+                    required_difficulty: None,
                 });
             }
         }
@@ -253,6 +283,7 @@ impl HarborService {
             packet_id: request.packet_id,
             success: true,
             error: None,
+            required_difficulty: None,
         })
     }
 
@@ -534,8 +565,9 @@ mod tests {
     use super::*;
     use crate::data::harbor::{cache_packet, get_cached_packet, get_undelivered_recipients};
     use crate::data::schema::create_harbor_table;
+    use crate::resilience::ProofOfWork;
     use crate::security::create_key_pair::generate_key_pair;
-    use crate::security::send::packet::PacketBuilder;
+    use crate::security::send::packet::{PacketBuilder, generate_packet_id};
     use crate::security::topic_keys::harbor_id_from_topic;
 
     fn setup_db() -> Connection {
@@ -547,6 +579,15 @@ mod tests {
 
     fn test_id(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    /// Create a dummy PoW for tests (difficulty 0 = always passes)
+    fn test_pow() -> ProofOfWork {
+        ProofOfWork {
+            timestamp: 0,
+            nonce: 0,
+            difficulty_bits: 0,
+        }
     }
 
     #[test]
@@ -564,7 +605,7 @@ mod tests {
             sender_keypair.private_key,
             sender_keypair.public_key,
         )
-        .build(b"test message")
+        .build(b"test message", generate_packet_id())
         .expect("packet build should succeed");
 
         let packet_bytes = packet.to_bytes().expect("serialization should succeed");
@@ -575,6 +616,7 @@ mod tests {
             harbor_id,
             sender_id: sender_keypair.public_key,
             recipients: vec![test_id(40), test_id(41)],
+            pow: test_pow(),
         };
 
         let response = service.handle_store(&mut conn, request).unwrap();
@@ -596,6 +638,7 @@ mod tests {
             harbor_id: test_id(20),
             sender_id: test_id(30),
             recipients: vec![test_id(40)],
+            pow: test_pow(),
         };
 
         let response = service.handle_store(&mut conn, request).unwrap();
@@ -913,6 +956,7 @@ mod tests {
             harbor_id: test_id(20),
             sender_id: test_id(30),
             recipients: vec![test_id(40)],
+            pow: test_pow(),
         });
 
         // Authenticated node ID is test_id(40)

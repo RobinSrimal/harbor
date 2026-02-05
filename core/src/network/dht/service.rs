@@ -4,7 +4,7 @@
 //! incoming and outgoing DHT protocol handling.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use iroh::endpoint::Connection;
 use iroh::Endpoint;
@@ -26,6 +26,7 @@ use super::internal::routing::Buckets;
 use super::protocol::{FindNode, FindNodeResponse, NodeInfo, RpcProtocol};
 use crate::data::dht::{clear_all_entries, current_timestamp, insert_dht_entry, store_peer_relay_url_unverified, update_peer_relay_url, upsert_peer, DhtEntry, PeerInfo};
 use crate::network::rpc::ExistingConnection;
+use crate::resilience::{ProofOfWork, PoWConfig, PoWResult, PoWVerifier, build_context};
 
 /// DHT Service - the single entry point for all DHT operations
 ///
@@ -46,6 +47,8 @@ pub struct DhtService {
     db: Arc<Mutex<DbConnection>>,
     /// Our endpoint ID (for filtering self from DHT)
     our_id: [u8; 32],
+    /// Proof of Work verifier for abuse prevention
+    pow_verifier: StdMutex<PoWVerifier>,
 }
 
 impl DhtService {
@@ -56,6 +59,7 @@ impl DhtService {
             client,
             db,
             our_id,
+            pow_verifier: StdMutex::new(PoWVerifier::new(PoWConfig::dht())),
         })
     }
 
@@ -231,6 +235,27 @@ impl DhtService {
         self.pool.home_relay_url()
     }
 
+    // ========== PoW Verification ==========
+
+    /// Verify Proof of Work for a DHT request
+    ///
+    /// Context for DHT PoW: `sender_id || target_bytes`
+    /// Uses RequestBased scaling.
+    pub fn verify_pow(
+        &self,
+        pow: &ProofOfWork,
+        sender_id: &[u8; 32],
+        target: &Id,
+    ) -> bool {
+        let context = build_context(&[sender_id, target.as_bytes()]);
+        let verifier = self.pow_verifier.lock().unwrap();
+
+        matches!(
+            verifier.verify(pow, &context, sender_id, None),
+            PoWResult::Allowed
+        )
+    }
+
     // ========== Outgoing: Wire Protocol ==========
 
     /// Send a FindNode RPC to a peer over an established connection
@@ -243,11 +268,17 @@ impl DhtService {
         requester: Option<[u8; 32]>,
         requester_relay_url: Option<String>,
     ) -> Result<FindNodeResponse, PoolError> {
+        // Compute PoW (context: sender_id || target_bytes)
+        let sender_id = requester.unwrap_or([0u8; 32]);
+        let pow_context = build_context(&[&sender_id, target.as_bytes()]);
+        let pow = ProofOfWork::compute(&pow_context, PoWConfig::dht().base_difficulty)
+            .ok_or_else(|| PoolError::ConnectionFailed("failed to compute PoW".to_string()))?;
+
         let client = irpc::Client::<RpcProtocol>::boxed(
             ExistingConnection::new(conn)
         );
         client
-            .rpc(FindNode { target, requester, requester_relay_url })
+            .rpc(FindNode { target, requester, requester_relay_url, pow })
             .await
             .map_err(|e| PoolError::ConnectionFailed(e.to_string()))
     }

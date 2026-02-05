@@ -19,7 +19,7 @@ use crate::protocol::{
 };
 
 use super::protocol::{
-    ControlAck,
+    ControlAck, ControlPacketType,
     ConnectAccept, ConnectDecline, ConnectRequest,
     RemoveMember, Suggest, TopicInvite, TopicJoin, TopicLeave,
 };
@@ -39,6 +39,16 @@ pub async fn handle_connect_request(
     req: &ConnectRequest,
     sender_id: [u8; 32],
 ) -> ControlAck {
+    // Verify PoW first
+    if let Err(e) = service.verify_pow(&req.pow, &sender_id, ControlPacketType::ConnectRequest) {
+        warn!(
+            sender = %hex::encode(&sender_id[..8]),
+            error = %e,
+            "connect request rejected: insufficient PoW"
+        );
+        return ControlAck::failure(req.request_id, &e.to_string());
+    }
+
     // Verify sender
     if !verify_sender(&req.sender_id, &sender_id) {
         warn!(
@@ -102,6 +112,11 @@ pub async fn handle_connect_request(
             "connection auto-accepted via token"
         );
 
+        // Update connection gate
+        if let Some(gate) = service.connection_gate() {
+            gate.mark_dm_connected(&sender_id).await;
+        }
+
         // Send ConnectAccept back to the requester
         if let Err(e) = super::outgoing::send_connect_accept(
             service,
@@ -143,6 +158,16 @@ pub async fn handle_connect_accept(
     accept: &ConnectAccept,
     sender_id: [u8; 32],
 ) -> ControlAck {
+    // Verify PoW first
+    if let Err(e) = service.verify_pow(&accept.pow, &sender_id, ControlPacketType::ConnectAccept) {
+        warn!(
+            sender = %hex::encode(&sender_id[..8]),
+            error = %e,
+            "connect accept rejected: insufficient PoW"
+        );
+        return ControlAck::failure(accept.request_id, &e.to_string());
+    }
+
     // Verify sender
     if !verify_sender(&accept.sender_id, &sender_id) {
         warn!("connect accept sender mismatch");
@@ -177,6 +202,11 @@ pub async fn handle_connect_accept(
         }
     }
 
+    // Update connection gate
+    if let Some(gate) = service.connection_gate() {
+        gate.mark_dm_connected(&sender_id).await;
+    }
+
     info!(
         peer = %hex::encode(&sender_id[..8]),
         request_id = %hex::encode(&accept.request_id[..8]),
@@ -198,6 +228,16 @@ pub async fn handle_connect_decline(
     decline: &ConnectDecline,
     sender_id: [u8; 32],
 ) -> ControlAck {
+    // Verify PoW first
+    if let Err(e) = service.verify_pow(&decline.pow, &sender_id, ControlPacketType::ConnectDecline) {
+        warn!(
+            sender = %hex::encode(&sender_id[..8]),
+            error = %e,
+            "connect decline rejected: insufficient PoW"
+        );
+        return ControlAck::failure(decline.request_id, &e.to_string());
+    }
+
     // Verify sender
     if !verify_sender(&decline.sender_id, &sender_id) {
         warn!("connect decline sender mismatch");
@@ -243,6 +283,16 @@ pub async fn handle_topic_invite(
     invite: &TopicInvite,
     sender_id: [u8; 32],
 ) -> ControlAck {
+    // Verify PoW first
+    if let Err(e) = service.verify_pow(&invite.pow, &sender_id, ControlPacketType::TopicInvite) {
+        warn!(
+            sender = %hex::encode(&sender_id[..8]),
+            error = %e,
+            "topic invite rejected: insufficient PoW"
+        );
+        return ControlAck::failure(invite.message_id, &e.to_string());
+    }
+
     // Verify sender
     if !verify_sender(&invite.sender_id, &sender_id) {
         warn!("topic invite sender mismatch");
@@ -295,6 +345,16 @@ pub async fn handle_topic_join(
     join: &TopicJoin,
     sender_id: [u8; 32],
 ) -> ControlAck {
+    // Verify PoW first
+    if let Err(e) = service.verify_pow(&join.pow, &sender_id, ControlPacketType::TopicJoin) {
+        warn!(
+            sender = %hex::encode(&sender_id[..8]),
+            error = %e,
+            "topic join rejected: insufficient PoW"
+        );
+        return ControlAck::failure(join.message_id, &e.to_string());
+    }
+
     // Verify sender
     if !verify_sender(&join.sender_id, &sender_id) {
         warn!("topic join sender mismatch");
@@ -323,13 +383,27 @@ pub async fn handle_topic_join(
         return ControlAck::failure(join.message_id, "invalid membership proof");
     }
 
-    // Add member to topic (the data layer handles this)
+    // Add member to topic and store relay URL
     {
         let db = service.db().lock().await;
         if let Err(e) = crate::data::add_topic_member(&db, &topic_id, &sender_id) {
             warn!(error = %e, "failed to add topic member");
             // Don't fail the ack - member might already exist
         }
+        // Store relay URL if provided (for later connections)
+        if let Some(ref relay_url) = join.relay_url {
+            let _ = crate::data::dht::update_peer_relay_url(
+                &db,
+                &sender_id,
+                relay_url,
+                crate::data::current_timestamp(),
+            );
+        }
+    }
+
+    // Update connection gate with new topic peer
+    if let Some(gate) = service.connection_gate() {
+        gate.add_topic_peer(&sender_id, &topic_id).await;
     }
 
     info!(
@@ -355,6 +429,16 @@ pub async fn handle_topic_leave(
     leave: &TopicLeave,
     sender_id: [u8; 32],
 ) -> ControlAck {
+    // Verify PoW first
+    if let Err(e) = service.verify_pow(&leave.pow, &sender_id, ControlPacketType::TopicLeave) {
+        warn!(
+            sender = %hex::encode(&sender_id[..8]),
+            error = %e,
+            "topic leave rejected: insufficient PoW"
+        );
+        return ControlAck::failure(leave.message_id, &e.to_string());
+    }
+
     // Verify sender
     if !verify_sender(&leave.sender_id, &sender_id) {
         warn!("topic leave sender mismatch");
@@ -391,6 +475,11 @@ pub async fn handle_topic_leave(
         }
     }
 
+    // Update connection gate
+    if let Some(gate) = service.connection_gate() {
+        gate.remove_topic_peer(&sender_id, &topic_id).await;
+    }
+
     info!(
         member = %hex::encode(&sender_id[..8]),
         topic = %hex::encode(&topic_id[..8]),
@@ -413,6 +502,16 @@ pub async fn handle_remove_member(
     remove: &RemoveMember,
     sender_id: [u8; 32],
 ) -> ControlAck {
+    // Verify PoW first
+    if let Err(e) = service.verify_pow(&remove.pow, &sender_id, ControlPacketType::RemoveMember) {
+        warn!(
+            sender = %hex::encode(&sender_id[..8]),
+            error = %e,
+            "remove member rejected: insufficient PoW"
+        );
+        return ControlAck::failure(remove.message_id, &e.to_string());
+    }
+
     // Verify sender
     if !verify_sender(&remove.sender_id, &sender_id) {
         warn!("remove member sender mismatch");
@@ -469,6 +568,11 @@ pub async fn handle_remove_member(
         }
     }
 
+    // Update connection gate
+    if let Some(gate) = service.connection_gate() {
+        gate.remove_topic_peer(&remove.removed_member, &topic_id).await;
+    }
+
     // Store the new epoch key
     {
         let db = service.db().lock().await;
@@ -505,6 +609,16 @@ pub async fn handle_suggest(
     suggest: &Suggest,
     sender_id: [u8; 32],
 ) -> ControlAck {
+    // Verify PoW first
+    if let Err(e) = service.verify_pow(&suggest.pow, &sender_id, ControlPacketType::Suggest) {
+        warn!(
+            sender = %hex::encode(&sender_id[..8]),
+            error = %e,
+            "suggest rejected: insufficient PoW"
+        );
+        return ControlAck::failure(suggest.message_id, &e.to_string());
+    }
+
     // Verify sender
     if !verify_sender(&suggest.sender_id, &sender_id) {
         warn!("suggest sender mismatch");

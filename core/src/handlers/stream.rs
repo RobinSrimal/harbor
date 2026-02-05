@@ -9,7 +9,7 @@
 //! destination app uses to consume the broadcast.
 
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use web_transport_iroh::QuicRequest;
 
 use crate::network::stream::StreamService;
@@ -18,6 +18,15 @@ use crate::network::stream::session::StreamSession;
 impl ProtocolHandler for StreamService {
     async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
         let peer_id = *conn.remote_id().as_bytes();
+
+        // Connection gate check - must be a connected peer or share a topic
+        if let Some(gate) = self.connection_gate() {
+            if !gate.is_allowed(&peer_id).await {
+                trace!(peer = %hex::encode(&peer_id[..8]), "STREAM: rejected connection from non-connected peer");
+                return Ok(()); // Silent drop
+            }
+        }
+
         info!(
             peer = %hex::encode(&peer_id[..8]),
             "incoming Stream (MOQ) connection"

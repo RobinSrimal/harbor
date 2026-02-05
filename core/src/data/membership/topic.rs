@@ -125,6 +125,35 @@ pub fn subscribe_topic_with_admin(
     get_topic(conn, topic_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
+/// Subscribe to a DM "topic" for unified harbor pull handling
+///
+/// DMs use the raw endpoint_id as both topic_id and harbor_id (NOT hashed).
+/// This is different from regular topics which hash the topic_id to create harbor_id.
+///
+/// This allows the harbor pull loop to handle DMs and regular topics identically:
+/// - Both are stored in the topics table
+/// - Both get harbor node discovery via the standard discovery task
+/// - The pull loop detects DMs by checking if topic_id == our_id
+///
+/// Note: DMs don't use epoch keys (they use DM shared keys), so we don't store
+/// an epoch key here.
+pub fn subscribe_dm_topic(
+    conn: &Connection,
+    endpoint_id: &[u8; 32],
+) -> rusqlite::Result<()> {
+    // Ensure endpoint exists in peers table (for FK constraint)
+    ensure_peer_exists(conn, endpoint_id)?;
+
+    // For DMs, harbor_id = endpoint_id (raw, NOT hashed)
+    // This matches how DM packets are stored in Harbor (harbor_id = recipient's endpoint_id)
+    conn.execute(
+        "INSERT OR IGNORE INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+        params![endpoint_id.as_slice(), endpoint_id.as_slice(), endpoint_id.as_slice()],
+    )?;
+
+    Ok(())
+}
+
 /// Unsubscribe from a topic
 ///
 /// Removes the topic and all members (cascade delete).

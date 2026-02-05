@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 use crate::data::dht::peer::get_peer_relay_info;
 use crate::data::{get_topic_members, LocalIdentity};
 use crate::network::connect;
+use crate::network::gate::ConnectionGate;
 use crate::network::send::{SendService, SendOptions};
 use crate::network::packet::{
     TopicMessage, StreamRequestMessage, DmMessage, StreamSignalingMessage,
@@ -95,6 +96,8 @@ pub struct StreamService {
     event_tx: mpsc::Sender<ProtocolEvent>,
     /// Send service for signaling messages
     send_service: Arc<SendService>,
+    /// Connection gate for peer authorization
+    connection_gate: Option<Arc<ConnectionGate>>,
     /// Actor message channel
     actor_tx: mpsc::Sender<StreamActorMessage>,
     /// Pending outgoing requests (source side, awaiting accept/reject)
@@ -123,6 +126,7 @@ impl StreamService {
         db: Arc<Mutex<DbConnection>>,
         event_tx: mpsc::Sender<ProtocolEvent>,
         send_service: Arc<SendService>,
+        connection_gate: Option<Arc<ConnectionGate>>,
     ) -> Arc<Self> {
         let (actor_tx, actor_rx) = mpsc::channel(256);
         let pending_outgoing = Arc::new(RwLock::new(HashMap::new()));
@@ -137,6 +141,7 @@ impl StreamService {
             db,
             event_tx,
             send_service,
+            connection_gate,
             actor_tx,
             pending_outgoing,
             pending_incoming,
@@ -392,6 +397,11 @@ impl StreamService {
     /// Get the event sender
     pub(crate) fn event_tx(&self) -> &mpsc::Sender<ProtocolEvent> {
         &self.event_tx
+    }
+
+    /// Get the connection gate (for handler to check peer authorization)
+    pub fn connection_gate(&self) -> Option<&Arc<ConnectionGate>> {
+        self.connection_gate.as_ref()
     }
 
     /// Establish an outgoing MOQ connection to the destination peer (source side).

@@ -19,6 +19,7 @@ use crate::data::send::{
     get_packets_needing_replication, delete_outgoing_packet,
 };
 use crate::network::harbor::HarborService;
+use crate::resilience::{ProofOfWork, PoWConfig, build_context};
 use crate::security::send::{seal_topic_packet_with_epoch, seal_dm_packet, EpochKeys};
 
 use crate::protocol::Protocol;
@@ -61,10 +62,23 @@ impl Protocol {
 
             debug!(count = packets.len(), "packets needing replication");
 
-            // For each packet, find Harbor Nodes via DHT and replicate
+            // For each packet, find Harbor Nodes and replicate
             for packet in &packets {
-                // Find Harbor Nodes for this topic's HarborID
-                let harbor_nodes = HarborService::find_harbor_nodes(&dht_service, &packet.harbor_id).await;
+                // Find Harbor Nodes from cache, fallback to DHT if empty
+                let mut harbor_nodes = {
+                    let db_lock = db.lock().await;
+                    HarborService::find_harbor_nodes(&db_lock, &packet.harbor_id)
+                };
+
+                // Fallback to DHT lookup if cache is empty (newly subscribed topic)
+                if harbor_nodes.is_empty() {
+                    harbor_nodes = HarborService::find_harbor_nodes_dht(&dht_service, &packet.harbor_id).await;
+                    // Cache the result for next time
+                    if !harbor_nodes.is_empty() {
+                        let db_lock = db.lock().await;
+                        let _ = crate::data::harbor::replace_harbor_nodes(&db_lock, &packet.harbor_id, &harbor_nodes);
+                    }
+                }
 
                 if harbor_nodes.is_empty() {
                     debug!(
@@ -97,6 +111,7 @@ impl Protocol {
                 // Topic check: harbor_id != topic_id (harbor_id is hash of topic_id)
                 let is_dm = packet.harbor_id == packet.topic_id;
 
+                // Use the same packet_id from direct delivery for deduplication
                 let (sealed_bytes, sealed_packet_id) = if is_dm {
                     // DM: seal with recipient's public key (stored as topic_id/harbor_id)
                     match seal_dm_packet(
@@ -104,6 +119,7 @@ impl Protocol {
                         &identity.public_key,
                         &packet.topic_id, // recipient_public_key
                         &packet.packet_data,
+                        packet.packet_id, // Use the same packet_id as direct delivery
                     ) {
                         Ok(send_packet) => {
                             let packet_id = send_packet.packet_id;
@@ -156,6 +172,7 @@ impl Protocol {
                                 &identity.public_key,
                                 &packet.packet_data,
                                 &epoch_keys,
+                                packet.packet_id, // Use the same packet_id as direct delivery
                             )
                         }
                         None => {
@@ -204,6 +221,21 @@ impl Protocol {
                     "sealed packet for Harbor storage"
                 );
 
+                // Compute PoW for Harbor store (context: harbor_id || packet_id)
+                let pow_context = build_context(&[&packet.harbor_id, &sealed_packet_id]);
+                let pow_difficulty = PoWConfig::harbor().base_difficulty;
+                let pow = match ProofOfWork::compute(&pow_context, pow_difficulty) {
+                    Some(p) => p,
+                    None => {
+                        warn!(
+                            packet_id = hex::encode(&sealed_packet_id[..8]),
+                            difficulty = pow_difficulty,
+                            "failed to compute PoW for Harbor store"
+                        );
+                        continue;
+                    }
+                };
+
                 // Create StoreRequest with SEALED packet data and its packet_id
                 let store_req = crate::network::harbor::protocol::StoreRequest {
                     packet_data: sealed_bytes,  // Sealed, not raw
@@ -211,6 +243,7 @@ impl Protocol {
                     harbor_id: packet.harbor_id,
                     sender_id: our_id,
                     recipients: unacked_recipients,
+                    pow,
                 };
 
                 // Send to Harbor Nodes (best effort, try up to max_replication_attempts)

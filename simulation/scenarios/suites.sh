@@ -185,6 +185,39 @@ run_control_suite() {
     log "=========================================="
 }
 
+# Run connection gating suite
+run_gate_suite() {
+    log "=========================================="
+    log "CONNECTION GATING TEST SUITE"
+    log "=========================================="
+
+    scenario_gate_dm_allowed
+    echo ""
+    sleep 5
+    clear_data
+
+    scenario_gate_topic_allowed
+    echo ""
+    sleep 5
+    clear_data
+
+    scenario_gate_blocked
+    echo ""
+    sleep 5
+    clear_data
+
+    scenario_gate_stranger
+    echo ""
+    sleep 5
+    clear_data
+
+    scenario_gate_open_protocols
+
+    log "=========================================="
+    log "CONNECTION GATING TEST SUITE COMPLETE"
+    log "=========================================="
+}
+
 # Run full basic suite
 run_full_suite() {
     scenario_basic
