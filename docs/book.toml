@@ -1,0 +1,14 @@
+[book]
+title = "Harbor Protocol"
+authors = ["Harbor Contributors"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/RobinSrimal/harbor"
+edit-url-template = "https://github.com/RobinSrimal/harbor/edit/main/docs/{path}"

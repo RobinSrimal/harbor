@@ -55,6 +55,7 @@ fn print_usage() {
     println!("  --db-path <PATH>            Database path (default: harbor.db)");
     println!("  --blob-path <PATH>          Blob storage path (default: .harbor_blobs/ next to db)");
     println!("  --api-port <PORT>           Enable HTTP API on this port");
+    println!("  --max-storage <SIZE>        Max harbor storage (default: 10GB, e.g., 50GB, 100MB)");
     println!("  --bootstrap <ID:RELAY>      Use this bootstrap node (replaces defaults)");
     println!("  --no-default-bootstrap      Don't use any bootstrap (for first node)");
     println!("  --testing                   Use shorter intervals (5-10s) for testing, enables sync");
@@ -113,6 +114,28 @@ fn print_usage() {
     println!("Environment:");
     println!("  HARBOR_DB_KEY               Database encryption key (64 hex chars, required)");
     println!("  RUST_LOG                    Set log level (e.g., info, debug)");
+}
+
+/// Parse a human-readable size string into bytes (e.g., "50GB", "100MB", "1TB")
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim().to_uppercase();
+
+    // Find where the number ends and unit begins
+    let num_end = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
+    let (num_str, unit) = s.split_at(num_end);
+
+    let num: f64 = num_str.parse().ok()?;
+
+    let multiplier: u64 = match unit.trim() {
+        "" | "B" => 1,
+        "KB" | "K" => 1024,
+        "MB" | "M" => 1024 * 1024,
+        "GB" | "G" => 1024 * 1024 * 1024,
+        "TB" | "T" => 1024 * 1024 * 1024 * 1024,
+        _ => return None,
+    };
+
+    Some((num * multiplier as f64) as u64)
 }
 
 /// Parse bootstrap argument: "endpoint_id:relay_url" or just "endpoint_id"
@@ -179,6 +202,17 @@ async fn main() {
         .filter_map(|w| parse_bootstrap_arg(&w[1]))
         .collect();
 
+    // Parse --max-storage
+    let max_storage: Option<u64> = args.windows(2)
+        .find(|w| w[0] == "--max-storage")
+        .and_then(|w| {
+            parse_size(&w[1]).or_else(|| {
+                eprintln!("⚠️  Invalid --max-storage value: {}", w[1]);
+                eprintln!("   Expected format: 50GB, 100MB, 1TB, etc.");
+                None
+            })
+        });
+
     if show_help {
         print_usage();
         return;
@@ -216,6 +250,21 @@ async fn main() {
             .with_db_path(db_path.clone())
             .with_blob_path(blob_path.clone())
     };
+
+    // Apply max storage if specified
+    if let Some(bytes) = max_storage {
+        config = config.with_max_storage(bytes);
+        let display = if bytes >= 1024 * 1024 * 1024 * 1024 {
+            format!("{:.1} TB", bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0))
+        } else if bytes >= 1024 * 1024 * 1024 {
+            format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else if bytes >= 1024 * 1024 {
+            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        } else {
+            format!("{} bytes", bytes)
+        };
+        println!("Max storage: {}", display);
+    }
 
     // Handle bootstrap configuration
     if !custom_bootstraps.is_empty() {

@@ -5,7 +5,11 @@
 # Sets up N bootstrap nodes as systemd services with persistent data.
 # The nodes spun up here ARE your production bootstrap nodes.
 #
-# Usage: sudo ./bootstrap_setup.sh [num_nodes] [start_port]
+# Usage: sudo ./setup.sh [num_nodes] [start_port] [max_storage]
+#
+# Examples:
+#   sudo ./setup.sh              # 20 nodes, port 3001, default storage (10GB)
+#   sudo ./setup.sh 10 4001 50GB # 10 nodes, port 4001, 50GB storage each
 #
 # Prerequisites:
 #   - Harbor binary built and copied to /usr/local/bin/harbor
@@ -18,6 +22,7 @@ set -e
 # Configuration
 NUM_NODES=${1:-20}
 START_PORT=${2:-3001}
+MAX_STORAGE=${3:-""}  # Empty = use default (10GB)
 HARBOR_BINARY="/usr/local/bin/harbor"
 DATA_BASE_DIR="/var/lib/harbor"
 SERVICE_USER="harbor"
@@ -76,13 +81,10 @@ create_service_file() {
     local service_name="harbor-bootstrap-$node_num"
     local service_file="/etc/systemd/system/${service_name}.service"
 
-    # First node starts without bootstrap, others bootstrap from first
-    local bootstrap_flag=""
-    if [ "$node_num" -eq 1 ]; then
-        bootstrap_flag="--no-default-bootstrap"
-    else
-        # Will be updated after first node is running
-        bootstrap_flag="--no-default-bootstrap"
+    # Build optional flags
+    local storage_flag=""
+    if [ -n "$MAX_STORAGE" ]; then
+        storage_flag="--max-storage $MAX_STORAGE"
     fi
 
     cat > "$service_file" << EOF
@@ -94,7 +96,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$SERVICE_USER
-ExecStart=$HARBOR_BINARY --port $port --data-dir $data_dir $bootstrap_flag
+ExecStart=$HARBOR_BINARY --port $port --data-dir $data_dir --no-default-bootstrap $storage_flag
 Restart=always
 RestartSec=5
 
@@ -121,6 +123,12 @@ update_service_with_bootstrap() {
     local port=$((START_PORT + node_num - 1))
     local data_dir="$DATA_BASE_DIR/bootstrap-$node_num"
 
+    # Build optional flags
+    local storage_flag=""
+    if [ -n "$MAX_STORAGE" ]; then
+        storage_flag="--max-storage $MAX_STORAGE"
+    fi
+
     cat > "$service_file" << EOF
 [Unit]
 Description=Harbor Bootstrap Node $node_num
@@ -130,7 +138,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$SERVICE_USER
-ExecStart=$HARBOR_BINARY --port $port --data-dir $data_dir --bootstrap $bootstrap_arg
+ExecStart=$HARBOR_BINARY --port $port --data-dir $data_dir --bootstrap $bootstrap_arg $storage_flag
 Restart=always
 RestartSec=5
 
@@ -173,6 +181,11 @@ main() {
     log_info "Port range: $START_PORT - $((START_PORT + NUM_NODES - 1))"
     log_info "Data directory: $DATA_BASE_DIR"
     log_info "Binary: $HARBOR_BINARY"
+    if [ -n "$MAX_STORAGE" ]; then
+        log_info "Max storage: $MAX_STORAGE per node"
+    else
+        log_info "Max storage: default (10GB)"
+    fi
     log_info ""
 
     check_prerequisites

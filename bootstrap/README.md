@@ -39,11 +39,15 @@ cd harbor
 # Run setup (requires root for systemd)
 sudo ./bootstrap/setup.sh
 
-# Or customize number of nodes and starting port:
-sudo ./bootstrap/setup.sh 20 3001
+# Customize: [num_nodes] [start_port] [max_storage]
+sudo ./bootstrap/setup.sh 20 3001        # 20 nodes, default storage (10GB)
+sudo ./bootstrap/setup.sh 20 3001 50GB   # 20 nodes, 50GB storage each
+sudo ./bootstrap/setup.sh 10 4001 100GB  # 10 nodes, 100GB storage each
 ```
 
 The script will prompt for your operator name (e.g., `harbor`, `alice`).
+
+**Storage sizing:** Bootstrap nodes also act as harbor storage nodes. Set `max_storage` based on your VPS disk space. For 20 nodes with 50GB each, you need ~1TB disk.
 
 ### Output
 
