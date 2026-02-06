@@ -6,8 +6,6 @@ A peer-to-peer messaging protocol with offline delivery, built on [Iroh](https:/
 >
 > This project is in active development and **not ready for production use**.
 >
-> - **Security Warning:** The database encryption key is currently hardcoded. Do not use for sensitive data.
-> - **Stability:** APIs may change. Expect bugs. More testing is needed.
 > - **Try it out:** Run the [simulations](simulation/) or use the invite feature in the [test app](test-app/) to create group chats.
 > - **Bootstrap Nodes:** If you'd like to volunteer to run a bootstrap node, please open an issue or reach out!
 
@@ -54,7 +52,13 @@ harbor/
 
 ## Test App
 
-A Tauri desktop app for testing Harbor with real-time collaborative text editing via [Loro CRDT](https://loro.dev).
+A desktop application for testing and demonstrating Harbor Protocol, built with [Tauri](https://tauri.app/) + React + TypeScript.
+
+**Features:**
+- **Chat Interface** — Create topics, share invite codes, and send end-to-end encrypted messages
+- **Collaborative Editing** — Real-time text collaboration powered by [Loro CRDT](https://loro.dev)
+- **Dashboard** — Monitor protocol stats, DHT routing table, topic membership, and Harbor Node activity
+- **Persistent Identity** — Same node identity across app restarts (SQLCipher encrypted database)
 
 ```bash
 cd test-app
@@ -62,7 +66,7 @@ npm install
 npm run tauri dev
 ```
 
-Requires [Node.js](https://nodejs.org/) v18+.
+Requires [Node.js](https://nodejs.org/) v18+ and [Rust](https://rustup.rs/). See [test-app/README.md](test-app/README.md) for detailed usage instructions.
 
 ## Testing
 
@@ -94,6 +98,7 @@ RUST_LOG=harbor_core::network::harbor=debug cargo run -p harbor-core
 | `harbor_core::network::send` | Direct message sending |
 | `harbor_core::network::control` | Connection requests, topic invites, membership |
 | `harbor_core::network::share` | File sharing operations |
+| `harbor_core::network::sync` | Large sync responses (point-to-point) |
 | `harbor_core::network::stream` | Streaming sessions |
 | `harbor_core::protocol` | Protocol API operations |
 
