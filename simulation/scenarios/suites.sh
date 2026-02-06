@@ -152,6 +152,72 @@ run_sync_suite() {
     log "=========================================="
 }
 
+# Run control protocol suite
+run_control_suite() {
+    log "=========================================="
+    log "CONTROL PROTOCOL TEST SUITE"
+    log "=========================================="
+
+    scenario_control_connect
+    echo ""
+    sleep 5
+    clear_data
+
+    scenario_control_topic_invite
+    echo ""
+    sleep 5
+    clear_data
+
+    scenario_control_suggest
+    echo ""
+    sleep 5
+    clear_data
+
+    scenario_control_offline
+    echo ""
+    sleep 5
+    clear_data
+
+    scenario_control_remove_member
+
+    log "=========================================="
+    log "CONTROL PROTOCOL TEST SUITE COMPLETE"
+    log "=========================================="
+}
+
+# Run connection gating suite
+run_gate_suite() {
+    log "=========================================="
+    log "CONNECTION GATING TEST SUITE"
+    log "=========================================="
+
+    scenario_gate_dm_allowed
+    echo ""
+    sleep 5
+    clear_data
+
+    scenario_gate_topic_allowed
+    echo ""
+    sleep 5
+    clear_data
+
+    scenario_gate_blocked
+    echo ""
+    sleep 5
+    clear_data
+
+    scenario_gate_stranger
+    echo ""
+    sleep 5
+    clear_data
+
+    scenario_gate_open_protocols
+
+    log "=========================================="
+    log "CONNECTION GATING TEST SUITE COMPLETE"
+    log "=========================================="
+}
+
 # Run full basic suite
 run_full_suite() {
     scenario_basic

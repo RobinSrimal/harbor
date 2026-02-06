@@ -71,7 +71,7 @@ pub fn get_bucket_entries(conn: &Connection, bucket_index: u8) -> rusqlite::Resu
     )?;
 
     let entries = stmt
-        .query_map([bucket_index as i32], |row| parse_dht_row(row))?
+        .query_map([bucket_index as i32], parse_dht_row)?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(entries)
@@ -86,7 +86,7 @@ pub fn get_all_entries(conn: &Connection) -> rusqlite::Result<Vec<DhtEntry>> {
     )?;
 
     let entries = stmt
-        .query_map([], |row| parse_dht_row(row))?
+        .query_map([], parse_dht_row)?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(entries)

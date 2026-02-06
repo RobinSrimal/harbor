@@ -42,6 +42,9 @@ impl MemberInfo {
 pub struct TopicInvite {
     /// The topic identifier
     pub topic_id: [u8; 32],
+    /// The topic admin (creator) - owns topic lifecycle
+    #[serde(default)]
+    pub admin_id: Option<[u8; 32]>,
     /// Current members with their connection info
     pub member_info: Vec<MemberInfo>,
     /// Legacy: EndpointIDs only (for backwards compatibility)
@@ -51,23 +54,30 @@ pub struct TopicInvite {
 
 impl TopicInvite {
     /// Create a new topic invite with member info (includes relay URLs)
-    pub fn new_with_info(topic_id: [u8; 32], member_info: Vec<MemberInfo>) -> Self {
+    pub fn new_with_info(topic_id: [u8; 32], admin_id: [u8; 32], member_info: Vec<MemberInfo>) -> Self {
         let members = member_info.iter().map(|m| m.endpoint_id).collect();
         Self {
             topic_id,
+            admin_id: Some(admin_id),
             member_info,
             members,
         }
     }
 
     /// Create a new topic invite (legacy, no relay info)
-    pub fn new(topic_id: [u8; 32], members: Vec<[u8; 32]>) -> Self {
+    pub fn new(topic_id: [u8; 32], admin_id: [u8; 32], members: Vec<[u8; 32]>) -> Self {
         let member_info = members.iter().map(|id| MemberInfo::new(*id)).collect();
         Self {
             topic_id,
+            admin_id: Some(admin_id),
             member_info,
             members,
         }
+    }
+
+    /// Get the admin ID (falls back to first member for legacy invites)
+    pub fn admin_id(&self) -> Option<[u8; 32]> {
+        self.admin_id.or_else(|| self.member_ids().first().copied())
     }
 
     /// Get all member endpoint IDs
@@ -133,41 +143,46 @@ mod tests {
     #[test]
     fn test_topic_invite_new() {
         let topic_id = test_id(1);
+        let admin_id = test_id(10);
         let members = vec![test_id(10), test_id(11)];
-        let invite = TopicInvite::new(topic_id, members.clone());
+        let invite = TopicInvite::new(topic_id, admin_id, members.clone());
 
         assert_eq!(invite.topic_id, topic_id);
+        assert_eq!(invite.admin_id, Some(admin_id));
         assert_eq!(invite.members, members);
     }
 
     #[test]
     fn test_topic_invite_new_with_info() {
         let topic_id = test_id(1);
+        let admin_id = test_id(10);
         let member_info = vec![
             MemberInfo::new(test_id(10)),
             MemberInfo::with_relay(test_id(11), "https://relay.example.com".to_string()),
         ];
-        let invite = TopicInvite::new_with_info(topic_id, member_info);
+        let invite = TopicInvite::new_with_info(topic_id, admin_id, member_info);
 
         assert_eq!(invite.topic_id, topic_id);
+        assert_eq!(invite.admin_id, Some(admin_id));
         assert_eq!(invite.member_info.len(), 2);
         assert_eq!(invite.members.len(), 2);
     }
 
     #[test]
     fn test_topic_invite_serialization() {
-        let invite = TopicInvite::new(test_id(1), vec![test_id(10), test_id(11), test_id(12)]);
+        let invite = TopicInvite::new(test_id(1), test_id(10), vec![test_id(10), test_id(11), test_id(12)]);
 
         // Test bytes serialization
         let bytes = invite.to_bytes().unwrap();
         let restored = TopicInvite::from_bytes(&bytes).unwrap();
         assert_eq!(restored.topic_id, invite.topic_id);
+        assert_eq!(restored.admin_id, invite.admin_id);
         assert_eq!(restored.members.len(), 3);
     }
 
     #[test]
     fn test_topic_invite_empty_members() {
-        let invite = TopicInvite::new(test_id(1), vec![]);
+        let invite = TopicInvite::new(test_id(1), test_id(1), vec![]);
 
         let bytes = invite.to_bytes().unwrap();
         let restored = TopicInvite::from_bytes(&bytes).unwrap();
@@ -178,7 +193,7 @@ mod tests {
     #[test]
     fn test_topic_invite_many_members() {
         let members: Vec<[u8; 32]> = (0..100).map(|i| test_id(i)).collect();
-        let invite = TopicInvite::new(test_id(255), members.clone());
+        let invite = TopicInvite::new(test_id(255), test_id(0), members.clone());
 
         let bytes = invite.to_bytes().unwrap();
         let restored = TopicInvite::from_bytes(&bytes).unwrap();
@@ -187,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_topic_invite_hex() {
-        let invite = TopicInvite::new(test_id(1), vec![test_id(10), test_id(11)]);
+        let invite = TopicInvite::new(test_id(1), test_id(10), vec![test_id(10), test_id(11)]);
 
         // Test hex serialization
         let hex_str = invite.to_hex().unwrap();
@@ -198,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_topic_invite_hex_roundtrip() {
-        let invite = TopicInvite::new(test_id(42), vec![test_id(1), test_id(2), test_id(3)]);
+        let invite = TopicInvite::new(test_id(42), test_id(1), vec![test_id(1), test_id(2), test_id(3)]);
 
         let hex1 = invite.to_hex().unwrap();
         let restored1 = TopicInvite::from_hex(&hex1).unwrap();
@@ -234,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_member_ids() {
-        let invite = TopicInvite::new(test_id(1), vec![test_id(10), test_id(11)]);
+        let invite = TopicInvite::new(test_id(1), test_id(10), vec![test_id(10), test_id(11)]);
         let ids = invite.member_ids();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&test_id(10)));
@@ -247,11 +262,27 @@ mod tests {
             MemberInfo::new(test_id(10)),
             MemberInfo::with_relay(test_id(11), "https://relay.example.com".to_string()),
         ];
-        let invite = TopicInvite::new_with_info(test_id(1), member_info);
+        let invite = TopicInvite::new_with_info(test_id(1), test_id(10), member_info);
 
         let info = invite.get_member_info();
         assert_eq!(info.len(), 2);
         assert!(info[0].relay_url.is_none());
         assert!(info[1].relay_url.is_some());
+    }
+
+    #[test]
+    fn test_admin_id() {
+        // New invite with explicit admin
+        let invite = TopicInvite::new(test_id(1), test_id(99), vec![test_id(10), test_id(11)]);
+        assert_eq!(invite.admin_id(), Some(test_id(99)));
+
+        // Legacy invite without admin falls back to first member
+        let legacy = TopicInvite {
+            topic_id: test_id(1),
+            admin_id: None,
+            member_info: vec![MemberInfo::new(test_id(10))],
+            members: vec![test_id(10)],
+        };
+        assert_eq!(legacy.admin_id(), Some(test_id(10)));
     }
 }

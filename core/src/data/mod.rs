@@ -10,6 +10,7 @@
 //! - Packet deduplication
 //! - File sharing (blobs)
 //! - CRDT sync documents
+//! - Peer connections and invites (control)
 //!
 //! Organized by protocol domain (mirrors network/ structure):
 //! - `dht/` - Peer information and DHT routing
@@ -17,8 +18,9 @@
 //! - `harbor/` - Harbor cache and deduplication
 //! - `membership/` - Topic subscriptions and members
 //! - `share/` - File sharing metadata and blob storage
-//! - `sync/` - CRDT document persistence (WAL + snapshots)
+//! - `control/` - Peer connections, tokens, pending invites
 
+pub mod control;
 pub mod dht;
 pub mod harbor;
 pub mod identity;
@@ -30,8 +32,8 @@ pub mod start;
 
 // Re-export commonly used items from dht/
 pub use dht::{
-    cleanup_stale_peers, current_timestamp, get_peer_relay_info, update_peer_relay_url, PeerInfo,
-    PEER_RETENTION_SECS,
+    cleanup_stale_peers, current_timestamp, ensure_peer_exists, get_peer_relay_info,
+    update_peer_relay_url, PeerInfo, PEER_RETENTION_SECS,
 };
 
 // Re-export commonly used items from harbor/
@@ -43,9 +45,10 @@ pub use harbor::{
 pub use harbor::{
     dedup_check_and_mark, get_total_tracked_count, get_tracked_count, DedupError, DedupResult,
 };
+pub use harbor::{get_all_active_harbor_ids, get_cached_harbor_nodes, replace_harbor_nodes};
 
 // Re-export commonly used items from identity
-pub use identity::{get_or_create_identity, LocalIdentity};
+pub use identity::{ensure_self_in_peers, get_or_create_identity, LocalIdentity};
 
 // Re-export commonly used items from send/
 pub use send::{
@@ -56,8 +59,15 @@ pub use send::{
 // Re-export commonly used items from membership/
 pub use membership::{
     add_topic_member, get_all_topics, get_joined_at, get_topic,
-    get_topic_members, get_topics_for_member, remove_topic_member,
-    subscribe_topic, unsubscribe_topic, TopicMember, TopicSubscription,
+    get_topic_admin, get_topic_members, get_topics_for_member, is_topic_admin,
+    remove_topic_member, subscribe_dm_topic, subscribe_topic, subscribe_topic_with_admin,
+    unsubscribe_topic, TopicMember, TopicSubscription,
+};
+// Re-export epoch key functions
+pub use membership::{
+    cleanup_expired_epoch_keys, delete_epoch_keys_for_topic, get_all_epoch_keys,
+    get_current_epoch, get_current_epoch_key, get_epoch_key, store_epoch_key,
+    EpochKey, EPOCH_KEY_LIFETIME_SECS,
 };
 
 // Re-export commonly used items from schema
@@ -74,3 +84,12 @@ pub use share::{
     BlobMetadata, BlobState, SectionTrace, CHUNK_SIZE,
 };
 pub use share::{default_blob_path, BlobStore};
+
+// Re-export commonly used items from control/
+pub use control::{
+    consume_token, create_connect_token, delete_connection, delete_pending_invite,
+    get_connection, get_pending_invite, is_peer_blocked, is_peer_connected,
+    list_all_connections, list_connections_by_state, list_pending_invites,
+    store_pending_invite, token_exists, update_connection_state, upsert_connection,
+    ConnectionInfo, ConnectionState, PendingTopicInvite,
+};

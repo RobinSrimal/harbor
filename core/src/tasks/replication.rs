@@ -1,19 +1,26 @@
 //! Packet replication handler
 //!
 //! Replicates unacknowledged packets to Harbor Nodes for offline delivery.
+//!
+//! # Crypto Optimization
+//!
+//! The outgoing_packets table stores RAW payloads (not encrypted).
+//! This task seals packets on-the-fly before sending to Harbor:
+//! - Direct delivery uses QUIC TLS only (no app-level crypto)
+//! - Harbor storage requires full crypto (seal: encrypt + MAC + sign)
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::data::send::{
     get_packets_needing_replication, delete_outgoing_packet,
 };
 use crate::network::harbor::HarborService;
-use crate::network::harbor::protocol::HarborPacketType;
-use crate::resilience::{PoWChallenge, PoWConfig, compute_pow};
+use crate::resilience::{ProofOfWork, PoWConfig, build_context};
+use crate::security::send::{seal_topic_packet_with_epoch, seal_dm_packet, EpochKeys};
 
 use crate::protocol::Protocol;
 
@@ -55,10 +62,23 @@ impl Protocol {
 
             debug!(count = packets.len(), "packets needing replication");
 
-            // For each packet, find Harbor Nodes via DHT and replicate
+            // For each packet, find Harbor Nodes and replicate
             for packet in &packets {
-                // Find Harbor Nodes for this topic's HarborID
-                let harbor_nodes = HarborService::find_harbor_nodes(&dht_service, &packet.harbor_id).await;
+                // Find Harbor Nodes from cache, fallback to DHT if empty
+                let mut harbor_nodes = {
+                    let db_lock = db.lock().await;
+                    HarborService::find_harbor_nodes(&db_lock, &packet.harbor_id)
+                };
+
+                // Fallback to DHT lookup if cache is empty (newly subscribed topic)
+                if harbor_nodes.is_empty() {
+                    harbor_nodes = HarborService::find_harbor_nodes_dht(&dht_service, &packet.harbor_id).await;
+                    // Cache the result for next time
+                    if !harbor_nodes.is_empty() {
+                        let db_lock = db.lock().await;
+                        let _ = crate::data::harbor::replace_harbor_nodes(&db_lock, &packet.harbor_id, &harbor_nodes);
+                    }
+                }
 
                 if harbor_nodes.is_empty() {
                     debug!(
@@ -83,32 +103,147 @@ impl Protocol {
                     continue;
                 }
 
-                // Get packet type from stored value
-                let packet_type = match packet.packet_type {
-                    1 => HarborPacketType::Join,
-                    2 => HarborPacketType::Leave,
-                    _ => HarborPacketType::Content,
+                // Get identity for sealing
+                let identity = harbor_service.identity();
+
+                // Seal the raw payload for Harbor storage
+                // DM check: harbor_id == topic_id means it's a DM (recipient_id used for both)
+                // Topic check: harbor_id != topic_id (harbor_id is hash of topic_id)
+                let is_dm = packet.harbor_id == packet.topic_id;
+
+                // Use the same packet_id from direct delivery for deduplication
+                let (sealed_bytes, sealed_packet_id) = if is_dm {
+                    // DM: seal with recipient's public key (stored as topic_id/harbor_id)
+                    match seal_dm_packet(
+                        &identity.private_key,
+                        &identity.public_key,
+                        &packet.topic_id, // recipient_public_key
+                        &packet.packet_data,
+                        packet.packet_id, // Use the same packet_id as direct delivery
+                    ) {
+                        Ok(send_packet) => {
+                            let packet_id = send_packet.packet_id;
+                            let bytes = match send_packet.to_bytes() {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    warn!(
+                                        packet_id = hex::encode(packet.packet_id),
+                                        error = %e,
+                                        "failed to serialize DM packet for Harbor"
+                                    );
+                                    continue;
+                                }
+                            };
+                            (bytes, packet_id)
+                        }
+                        Err(e) => {
+                            warn!(
+                                packet_id = hex::encode(packet.packet_id),
+                                error = %e,
+                                "failed to seal DM packet for Harbor"
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    // Topic: seal with stored epoch key
+                    // All topics have at least epoch 0 key stored at creation time
+                    let current_epoch_key = {
+                        let db_lock = db.lock().await;
+                        crate::data::get_current_epoch_key(&db_lock, &packet.topic_id)
+                            .ok()
+                            .flatten()
+                    };
+
+                    let seal_result = match current_epoch_key {
+                        Some(stored_key) => {
+                            let epoch_keys = EpochKeys::derive_from_secret(
+                                stored_key.epoch,
+                                &stored_key.key_data,
+                            );
+                            trace!(
+                                topic = hex::encode(&packet.topic_id[..8]),
+                                epoch = stored_key.epoch,
+                                "sealing topic packet with epoch key"
+                            );
+                            seal_topic_packet_with_epoch(
+                                &packet.topic_id,
+                                &identity.private_key,
+                                &identity.public_key,
+                                &packet.packet_data,
+                                &epoch_keys,
+                                packet.packet_id, // Use the same packet_id as direct delivery
+                            )
+                        }
+                        None => {
+                            // Should never happen - all topics have epoch 0 key
+                            warn!(
+                                topic = hex::encode(&packet.topic_id[..8]),
+                                "no epoch key found for topic (should never happen)"
+                            );
+                            continue;
+                        }
+                    };
+
+                    match seal_result {
+                        Ok(send_packet) => {
+                            let packet_id = send_packet.packet_id;
+                            let bytes = match send_packet.to_bytes() {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    warn!(
+                                        packet_id = hex::encode(packet.packet_id),
+                                        error = %e,
+                                        "failed to serialize topic packet for Harbor"
+                                    );
+                                    continue;
+                                }
+                            };
+                            (bytes, packet_id)
+                        }
+                        Err(e) => {
+                            warn!(
+                                packet_id = hex::encode(packet.packet_id),
+                                error = %e,
+                                "failed to seal topic packet for Harbor"
+                            );
+                            continue;
+                        }
+                    }
                 };
 
-                // Compute Proof of Work for this store request
-                // Uses default difficulty - Harbor Nodes may reject if they require higher
-                let pow_config = PoWConfig::default();
-                let challenge = PoWChallenge::new(
-                    packet.harbor_id,
-                    packet.packet_id,
-                    pow_config.difficulty_bits,
+                trace!(
+                    original_id = hex::encode(&packet.packet_id[..8]),
+                    sealed_id = hex::encode(&sealed_packet_id[..8]),
+                    is_dm = is_dm,
+                    raw_size = packet.packet_data.len(),
+                    sealed_size = sealed_bytes.len(),
+                    "sealed packet for Harbor storage"
                 );
-                let proof_of_work = compute_pow(&challenge);
 
-                // Create StoreRequest
+                // Compute PoW for Harbor store (context: harbor_id || packet_id)
+                let pow_context = build_context(&[&packet.harbor_id, &sealed_packet_id]);
+                let pow_difficulty = PoWConfig::harbor().base_difficulty;
+                let pow = match ProofOfWork::compute(&pow_context, pow_difficulty) {
+                    Some(p) => p,
+                    None => {
+                        warn!(
+                            packet_id = hex::encode(&sealed_packet_id[..8]),
+                            difficulty = pow_difficulty,
+                            "failed to compute PoW for Harbor store"
+                        );
+                        continue;
+                    }
+                };
+
+                // Create StoreRequest with SEALED packet data and its packet_id
                 let store_req = crate::network::harbor::protocol::StoreRequest {
-                    packet_data: packet.packet_data.clone(),
-                    packet_id: packet.packet_id,
+                    packet_data: sealed_bytes,  // Sealed, not raw
+                    packet_id: sealed_packet_id,  // Use the packet_id from the sealed packet
                     harbor_id: packet.harbor_id,
                     sender_id: our_id,
                     recipients: unacked_recipients,
-                    packet_type,
-                    proof_of_work: Some(proof_of_work),
+                    pow,
                 };
 
                 // Send to Harbor Nodes (best effort, try up to max_replication_attempts)

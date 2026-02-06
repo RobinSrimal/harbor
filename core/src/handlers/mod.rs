@@ -3,6 +3,7 @@
 //! Each service implements `iroh::protocol::ProtocolHandler` for ALPN-based routing.
 //! The iroh Router dispatches incoming connections to the correct handler.
 
+mod control;
 mod dht;
 mod harbor;
 mod stream;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use iroh::Endpoint;
 use iroh::protocol::Router;
 
+use crate::network::control::{ControlService, CONTROL_ALPN};
 use crate::network::dht::{DhtService, DHT_ALPN};
 use crate::network::harbor::HarborService;
 use crate::network::harbor::protocol::HARBOR_ALPN;
@@ -32,13 +34,15 @@ pub(crate) fn build_router(
     share_service: Arc<ShareService>,
     sync_service: Arc<SyncService>,
     stream_service: Arc<StreamService>,
+    control_service: Arc<ControlService>,
 ) -> Router {
     let mut builder = iroh::protocol::Router::builder(endpoint)
         .accept(SEND_ALPN, send_service)
         .accept(HARBOR_ALPN, harbor_service)
         .accept(SHARE_ALPN, share_service)
         .accept(SYNC_ALPN, sync_service)
-        .accept(STREAM_ALPN, stream_service);
+        .accept(STREAM_ALPN, stream_service)
+        .accept(CONTROL_ALPN, control_service);
 
     if let Some(dht) = dht_service {
         builder = builder.accept(DHT_ALPN, dht);

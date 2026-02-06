@@ -8,6 +8,7 @@
 //! - PeerSuggestion: "I'm busy, try peer X"
 //! - Bitfield: Exchange what chunks each peer has
 
+use crate::network::wire;
 use serde::{Deserialize, Serialize};
 
 /// Share protocol ALPN
@@ -237,38 +238,39 @@ pub enum ShareMessage {
 }
 
 impl ShareMessage {
-    /// Encode message for transmission
+    /// Encode message for transmission using shared wire framing
     pub fn encode(&self) -> Vec<u8> {
-        match self {
-            ShareMessage::ChunkMapRequest(msg) => {
-                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
-                encode_with_type(ShareMessageType::ChunkMapRequest, &payload)
-            }
-            ShareMessage::ChunkMapResponse(msg) => {
-                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
-                encode_with_type(ShareMessageType::ChunkMapResponse, &payload)
-            }
-            ShareMessage::ChunkRequest(msg) => {
-                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
-                encode_with_type(ShareMessageType::ChunkRequest, &payload)
-            }
-            ShareMessage::ChunkResponse(msg) => {
-                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
-                encode_with_type(ShareMessageType::ChunkResponse, &payload)
-            }
-            ShareMessage::Bitfield(msg) => {
-                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
-                encode_with_type(ShareMessageType::Bitfield, &payload)
-            }
-            ShareMessage::PeerSuggestion(msg) => {
-                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
-                encode_with_type(ShareMessageType::PeerSuggestion, &payload)
-            }
-            ShareMessage::ChunkAck(msg) => {
-                let payload = postcard::to_allocvec(msg).expect("serialization should not fail");
-                encode_with_type(ShareMessageType::ChunkAck, &payload)
-            }
-        }
+        let (msg_type, payload) = match self {
+            ShareMessage::ChunkMapRequest(msg) => (
+                ShareMessageType::ChunkMapRequest,
+                postcard::to_allocvec(msg).expect("serialization should not fail"),
+            ),
+            ShareMessage::ChunkMapResponse(msg) => (
+                ShareMessageType::ChunkMapResponse,
+                postcard::to_allocvec(msg).expect("serialization should not fail"),
+            ),
+            ShareMessage::ChunkRequest(msg) => (
+                ShareMessageType::ChunkRequest,
+                postcard::to_allocvec(msg).expect("serialization should not fail"),
+            ),
+            ShareMessage::ChunkResponse(msg) => (
+                ShareMessageType::ChunkResponse,
+                postcard::to_allocvec(msg).expect("serialization should not fail"),
+            ),
+            ShareMessage::Bitfield(msg) => (
+                ShareMessageType::Bitfield,
+                postcard::to_allocvec(msg).expect("serialization should not fail"),
+            ),
+            ShareMessage::PeerSuggestion(msg) => (
+                ShareMessageType::PeerSuggestion,
+                postcard::to_allocvec(msg).expect("serialization should not fail"),
+            ),
+            ShareMessage::ChunkAck(msg) => (
+                ShareMessageType::ChunkAck,
+                postcard::to_allocvec(msg).expect("serialization should not fail"),
+            ),
+        };
+        wire::encode_frame(msg_type as u8, &payload)
     }
 
     /// Decode message from bytes
@@ -279,69 +281,54 @@ impl ShareMessage {
     /// Decode message from bytes, returning both the message and bytes consumed
     /// This is useful for parsing multiple concatenated messages
     pub fn decode_with_size(bytes: &[u8]) -> Result<(Self, usize), DecodeError> {
-        if bytes.len() < 5 {
-            return Err(DecodeError::TooShort);
-        }
+        let frame = wire::decode_frame(bytes).map_err(|e| match e {
+            wire::FrameError::TooShort => DecodeError::TooShort,
+            wire::FrameError::TrailingBytes => DecodeError::TooShort, // Trailing bytes OK for streaming
+        })?;
 
-        let msg_type = ShareMessageType::try_from(bytes[0])
-            .map_err(|_| DecodeError::UnknownType(bytes[0]))?;
-
-        let len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
-        let total_size = 5 + len;
-        if bytes.len() < total_size {
-            return Err(DecodeError::TooShort);
-        }
-
-        let payload = &bytes[5..total_size];
+        let msg_type = ShareMessageType::try_from(frame.msg_type)
+            .map_err(|_| DecodeError::UnknownType(frame.msg_type))?;
 
         let msg = match msg_type {
             ShareMessageType::ChunkMapRequest => {
-                let msg: ChunkMapRequest = postcard::from_bytes(payload)
+                let msg: ChunkMapRequest = postcard::from_bytes(frame.payload)
                     .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
                 ShareMessage::ChunkMapRequest(msg)
             }
             ShareMessageType::ChunkMapResponse => {
-                let msg: ChunkMapResponse = postcard::from_bytes(payload)
+                let msg: ChunkMapResponse = postcard::from_bytes(frame.payload)
                     .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
                 ShareMessage::ChunkMapResponse(msg)
             }
             ShareMessageType::ChunkRequest => {
-                let msg: ChunkRequest = postcard::from_bytes(payload)
+                let msg: ChunkRequest = postcard::from_bytes(frame.payload)
                     .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
                 ShareMessage::ChunkRequest(msg)
             }
             ShareMessageType::ChunkResponse => {
-                let msg: ChunkResponse = postcard::from_bytes(payload)
+                let msg: ChunkResponse = postcard::from_bytes(frame.payload)
                     .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
                 ShareMessage::ChunkResponse(msg)
             }
             ShareMessageType::Bitfield => {
-                let msg: BitfieldMessage = postcard::from_bytes(payload)
+                let msg: BitfieldMessage = postcard::from_bytes(frame.payload)
                     .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
                 ShareMessage::Bitfield(msg)
             }
             ShareMessageType::PeerSuggestion => {
-                let msg: PeerSuggestion = postcard::from_bytes(payload)
+                let msg: PeerSuggestion = postcard::from_bytes(frame.payload)
                     .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
                 ShareMessage::PeerSuggestion(msg)
             }
             ShareMessageType::ChunkAck => {
-                let msg: ChunkAck = postcard::from_bytes(payload)
+                let msg: ChunkAck = postcard::from_bytes(frame.payload)
                     .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
                 ShareMessage::ChunkAck(msg)
             }
         };
 
-        Ok((msg, total_size))
+        Ok((msg, frame.total_size))
     }
-}
-
-fn encode_with_type(msg_type: ShareMessageType, payload: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(5 + payload.len());
-    bytes.push(msg_type as u8);
-    bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(payload);
-    bytes
 }
 
 /// Error decoding a message

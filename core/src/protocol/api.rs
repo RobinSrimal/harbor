@@ -10,7 +10,7 @@ use crate::data::BlobMetadata;
 use super::core::{Protocol, MAX_MESSAGE_SIZE};
 use super::error::ProtocolError;
 use super::stats::{DhtBucketInfo, ProtocolStats, TopicDetails, TopicSummary};
-use crate::network::topic::TopicInvite;
+use crate::network::control::TopicInvite;
 
 // Re-export ShareStatus from service for public API
 pub use crate::network::share::service::ShareStatus;
@@ -24,7 +24,7 @@ impl Protocol {
     /// Returns an invite that can be shared with others.
     pub async fn create_topic(&self) -> Result<TopicInvite, ProtocolError> {
         self.check_running().await?;
-        self.topic_service
+        self.control_service
             .create_topic()
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
@@ -37,7 +37,7 @@ impl Protocol {
     /// Announces our presence to other members.
     pub async fn join_topic(&self, invite: TopicInvite) -> Result<(), ProtocolError> {
         self.check_running().await?;
-        self.topic_service
+        self.control_service
             .join_topic(invite)
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
@@ -46,7 +46,7 @@ impl Protocol {
     /// Leave a topic
     pub async fn leave_topic(&self, topic_id: &[u8; 32]) -> Result<(), ProtocolError> {
         self.check_running().await?;
-        self.topic_service
+        self.control_service
             .leave_topic(topic_id)
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
@@ -55,7 +55,7 @@ impl Protocol {
     /// List all topics we're subscribed to
     pub async fn list_topics(&self) -> Result<Vec<[u8; 32]>, ProtocolError> {
         self.check_running().await?;
-        self.topic_service
+        self.control_service
             .list_topics()
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
@@ -66,7 +66,7 @@ impl Protocol {
     /// Returns a fresh invite containing ALL current topic members.
     pub async fn get_invite(&self, topic_id: &[u8; 32]) -> Result<TopicInvite, ProtocolError> {
         self.check_running().await?;
-        self.topic_service
+        self.control_service
             .get_invite(topic_id)
             .await
             .map_err(|e| ProtocolError::Network(e.to_string()))
@@ -399,6 +399,180 @@ impl Protocol {
         session
             .consume_broadcast(broadcast_name)
             .ok_or_else(|| ProtocolError::Network("broadcast not available".into()))
+    }
+
+    // ========== Control API ==========
+
+    /// Request a connection to a peer
+    ///
+    /// Sends a ConnectRequest to the peer. If a token is provided, it's for the
+    /// QR code / invite string flow where the recipient auto-accepts valid tokens.
+    /// Returns the request ID for tracking.
+    pub async fn request_connection(
+        &self,
+        peer_id: &[u8; 32],
+        relay_url: Option<&str>,
+        display_name: Option<&str>,
+        token: Option<[u8; 32]>,
+    ) -> Result<[u8; 32], ProtocolError> {
+        self.check_running().await?;
+        self.control_service
+            .request_connection(peer_id, relay_url, display_name, token)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Accept a pending connection request
+    pub async fn accept_connection(&self, request_id: &[u8; 32]) -> Result<(), ProtocolError> {
+        self.check_running().await?;
+        self.control_service
+            .accept_connection(request_id)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Decline a pending connection request
+    pub async fn decline_connection(
+        &self,
+        request_id: &[u8; 32],
+        reason: Option<&str>,
+    ) -> Result<(), ProtocolError> {
+        self.check_running().await?;
+        self.control_service
+            .decline_connection(request_id, reason)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Generate a connect invite (for QR code / invite string)
+    ///
+    /// Returns a ConnectInvite that can be encoded to a string and shared.
+    pub async fn generate_connect_invite(
+        &self,
+    ) -> Result<crate::network::control::ConnectInvite, ProtocolError> {
+        self.check_running().await?;
+        self.control_service
+            .generate_connect_token()
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Connect using an invite string (decode and request connection)
+    ///
+    /// Decodes the invite and requests connection with the embedded token.
+    pub async fn connect_with_invite(&self, invite: &str) -> Result<[u8; 32], ProtocolError> {
+        self.check_running().await?;
+        let decoded = crate::network::control::ConnectInvite::decode(invite)
+            .ok_or_else(|| ProtocolError::InvalidInput("invalid invite string".into()))?;
+        self.control_service
+            .request_connection(
+                &decoded.endpoint_id,
+                decoded.relay_url.as_deref(),
+                None,
+                Some(decoded.token),
+            )
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Block a peer
+    pub async fn block_peer(&self, peer_id: &[u8; 32]) -> Result<(), ProtocolError> {
+        self.check_running().await?;
+        self.control_service
+            .block_peer(peer_id)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Unblock a peer
+    pub async fn unblock_peer(&self, peer_id: &[u8; 32]) -> Result<(), ProtocolError> {
+        self.check_running().await?;
+        self.control_service
+            .unblock_peer(peer_id)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// List all connections
+    pub async fn list_connections(
+        &self,
+    ) -> Result<Vec<crate::data::ConnectionInfo>, ProtocolError> {
+        self.check_running().await?;
+        let db = self.db.lock().await;
+        crate::data::list_all_connections(&db).map_err(|e| ProtocolError::Database(e.to_string()))
+    }
+
+    /// Invite a peer to a topic
+    ///
+    /// Returns the message ID for tracking.
+    pub async fn invite_to_topic(
+        &self,
+        peer_id: &[u8; 32],
+        topic_id: &[u8; 32],
+    ) -> Result<[u8; 32], ProtocolError> {
+        self.check_running().await?;
+        self.control_service
+            .invite_to_topic(peer_id, topic_id)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Accept a topic invitation
+    pub async fn accept_topic_invite(&self, message_id: &[u8; 32]) -> Result<(), ProtocolError> {
+        self.check_running().await?;
+        self.control_service
+            .accept_topic_invite(message_id)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Decline a topic invitation
+    pub async fn decline_topic_invite(&self, message_id: &[u8; 32]) -> Result<(), ProtocolError> {
+        self.check_running().await?;
+        self.control_service
+            .decline_topic_invite(message_id)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Remove a member from a topic (admin only)
+    ///
+    /// Generates a new epoch key and sends it to all remaining members.
+    pub async fn remove_topic_member(
+        &self,
+        topic_id: &[u8; 32],
+        member_id: &[u8; 32],
+    ) -> Result<(), ProtocolError> {
+        self.check_running().await?;
+        self.control_service
+            .remove_topic_member(topic_id, member_id)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// Suggest a peer to another peer (introduction)
+    ///
+    /// Returns the message ID for tracking.
+    pub async fn suggest_peer(
+        &self,
+        to_peer: &[u8; 32],
+        suggested_peer: &[u8; 32],
+        note: Option<&str>,
+    ) -> Result<[u8; 32], ProtocolError> {
+        self.check_running().await?;
+        self.control_service
+            .suggest_peer(to_peer, suggested_peer, note)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
+    }
+
+    /// List pending topic invites
+    pub async fn list_pending_invites(
+        &self,
+    ) -> Result<Vec<crate::data::PendingTopicInvite>, ProtocolError> {
+        self.check_running().await?;
+        let db = self.db.lock().await;
+        crate::data::list_pending_invites(&db).map_err(|e| ProtocolError::Database(e.to_string()))
     }
 }
 

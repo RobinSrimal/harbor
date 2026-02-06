@@ -34,6 +34,9 @@ echo ""
 mkdir -p "$NODE_DIR"
 cd "$NODE_DIR"
 
+# Database encryption key (same default as simulation nodes)
+export HARBOR_DB_KEY="${HARBOR_DB_KEY:-486172626f724e6f64654b6579323032355f76315f7365727665725f6b657921}"
+
 # Run in foreground with full output
 RUST_LOG=info exec "$HARBOR_BIN" --serve --db-path "./harbor.db"
 

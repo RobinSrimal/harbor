@@ -15,12 +15,12 @@ use tracing::{debug, info, warn};
 use crate::data::dht::peer::get_peer_relay_info;
 use crate::data::{get_topic_members, LocalIdentity};
 use crate::network::connect;
-use crate::network::send::{SendService, SendOptions, TopicMessage};
-use crate::network::send::topic_messages::StreamRequestMessage;
-use crate::network::send::dm_messages::{
-    DmMessage, DmStreamAcceptMessage, DmStreamRejectMessage,
-    DmStreamQueryMessage, DmStreamActiveMessage, DmStreamEndedMessage,
-    DmStreamRequestMessage,
+use crate::network::gate::ConnectionGate;
+use crate::network::send::{SendService, SendOptions};
+use crate::network::packet::{
+    TopicMessage, StreamRequestMessage, DmMessage, StreamSignalingMessage,
+    StreamAcceptMessage, StreamRejectMessage, StreamQueryMessage,
+    StreamActiveMessage, StreamEndedMessage, DmStreamRequestMessage,
 };
 use super::{ZERO_TOPIC_ID, optional_topic_id};
 use crate::protocol::{MemberInfo, ProtocolEvent, StreamConnectedEvent};
@@ -96,6 +96,8 @@ pub struct StreamService {
     event_tx: mpsc::Sender<ProtocolEvent>,
     /// Send service for signaling messages
     send_service: Arc<SendService>,
+    /// Connection gate for peer authorization
+    connection_gate: Option<Arc<ConnectionGate>>,
     /// Actor message channel
     actor_tx: mpsc::Sender<StreamActorMessage>,
     /// Pending outgoing requests (source side, awaiting accept/reject)
@@ -124,6 +126,7 @@ impl StreamService {
         db: Arc<Mutex<DbConnection>>,
         event_tx: mpsc::Sender<ProtocolEvent>,
         send_service: Arc<SendService>,
+        connection_gate: Option<Arc<ConnectionGate>>,
     ) -> Arc<Self> {
         let (actor_tx, actor_rx) = mpsc::channel(256);
         let pending_outgoing = Arc::new(RwLock::new(HashMap::new()));
@@ -138,6 +141,7 @@ impl StreamService {
             db,
             event_tx,
             send_service,
+            connection_gate,
             actor_tx,
             pending_outgoing,
             pending_incoming,
@@ -194,6 +198,20 @@ impl StreamService {
         dm_msg: DmMessage,
     ) -> Result<(), StreamError> {
         let encoded = dm_msg.encode();
+        self.send_service
+            .send_to_dm(target_peer, &encoded)
+            .await
+            .map_err(|e| StreamError::Signaling(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Send a stream signaling message to a specific peer
+    async fn send_stream_signaling(
+        &self,
+        target_peer: &[u8; 32],
+        msg: StreamSignalingMessage,
+    ) -> Result<(), StreamError> {
+        let encoded = msg.encode();
         self.send_service
             .send_to_dm(target_peer, &encoded)
             .await
@@ -288,11 +306,10 @@ impl StreamService {
         // Move to accepted_incoming so the MOQ handler can find it
         self.accepted_incoming.write().await.insert(*request_id, pending.clone());
 
-        let dm_msg = DmMessage::StreamAccept(DmStreamAcceptMessage {
-            topic_id: pending.topic_id,
+        let msg = StreamSignalingMessage::Accept(StreamAcceptMessage {
             request_id: *request_id,
         });
-        self.send_dm_signaling(&pending.peer_id, dm_msg).await?;
+        self.send_stream_signaling(&pending.peer_id, msg).await?;
 
         // Spawn timeout cleanup — if source never connects within 30s, remove stale entry
         let svc = self.clone();
@@ -317,12 +334,11 @@ impl StreamService {
         let pending = self.pending_incoming.write().await.remove(request_id)
             .ok_or(StreamError::RequestNotFound)?;
 
-        let dm_msg = DmMessage::StreamReject(DmStreamRejectMessage {
-            topic_id: pending.topic_id,
+        let msg = StreamSignalingMessage::Reject(StreamRejectMessage {
             request_id: *request_id,
             reason: reason.clone(),
         });
-        self.send_dm_signaling(&pending.peer_id, dm_msg).await?;
+        self.send_stream_signaling(&pending.peer_id, msg).await?;
 
         info!(request_id = %hex::encode(&request_id[..8]), reason = ?reason, "stream request rejected");
         Ok(())
@@ -336,11 +352,10 @@ impl StreamService {
         let active = self.active_streams.write().await.remove(request_id)
             .ok_or(StreamError::RequestNotFound)?;
 
-        let dm_msg = DmMessage::StreamEnded(DmStreamEndedMessage {
-            topic_id: active.topic_id,
+        let msg = StreamSignalingMessage::Ended(StreamEndedMessage {
             request_id: *request_id,
         });
-        self.send_dm_signaling(&active.peer_id, dm_msg).await?;
+        self.send_stream_signaling(&active.peer_id, msg).await?;
 
         info!(request_id = %hex::encode(&request_id[..8]), "stream ended");
         Ok(())
@@ -382,6 +397,11 @@ impl StreamService {
     /// Get the event sender
     pub(crate) fn event_tx(&self) -> &mpsc::Sender<ProtocolEvent> {
         &self.event_tx
+    }
+
+    /// Get the connection gate (for handler to check peer authorization)
+    pub fn connection_gate(&self) -> Option<&Arc<ConnectionGate>> {
+        self.connection_gate.as_ref()
     }
 
     /// Establish an outgoing MOQ connection to the destination peer (source side).
@@ -476,14 +496,11 @@ impl StreamService {
         sender_id: [u8; 32],
         source: crate::network::send::PacketSource,
     ) {
-        match msg {
-            TopicMessage::StreamRequest(req) => {
-                self.handle_incoming_stream_request(
-                    &req.request_id, topic_id, sender_id,
-                    &req.name, &req.catalog, source,
-                ).await;
-            }
-            _ => {}
+        if let TopicMessage::StreamRequest(req) = msg {
+            self.handle_incoming_stream_request(
+                &req.request_id, topic_id, sender_id,
+                &req.name, &req.catalog, source,
+            ).await;
         }
     }
 
@@ -494,32 +511,6 @@ impl StreamService {
         sender_id: [u8; 32],
     ) {
         match dm_msg {
-            DmMessage::StreamAccept(accept) => {
-                let _ = self.actor_tx.send(StreamActorMessage::StreamAccepted {
-                    request_id: accept.request_id,
-                }).await;
-            }
-            DmMessage::StreamReject(reject) => {
-                let _ = self.actor_tx.send(StreamActorMessage::StreamRejected {
-                    request_id: reject.request_id,
-                    reason: reject.reason.clone(),
-                }).await;
-            }
-            DmMessage::StreamQuery(query) => {
-                let _ = self.actor_tx.send(StreamActorMessage::StreamQuery {
-                    request_id: query.request_id,
-                    topic_id: query.topic_id,
-                    querier_id: sender_id,
-                }).await;
-            }
-            DmMessage::StreamActive(active) => {
-                self.emit_deferred_stream_request(&active.request_id).await;
-            }
-            DmMessage::StreamEnded(ended) => {
-                let _ = self.actor_tx.send(StreamActorMessage::StreamEnded {
-                    request_id: ended.request_id,
-                }).await;
-            }
             DmMessage::StreamRequest(req) => {
                 self.handle_incoming_stream_request(
                     &req.request_id,
@@ -531,6 +522,42 @@ impl StreamService {
                 ).await;
             }
             _ => {}
+        }
+    }
+
+    /// Handle an incoming stream signaling message (Accept/Reject/Query/Active/Ended)
+    pub async fn handle_stream_signaling_msg(
+        &self,
+        msg: &StreamSignalingMessage,
+        sender_id: [u8; 32],
+    ) {
+        match msg {
+            StreamSignalingMessage::Accept(accept) => {
+                let _ = self.actor_tx.send(StreamActorMessage::StreamAccepted {
+                    request_id: accept.request_id,
+                }).await;
+            }
+            StreamSignalingMessage::Reject(reject) => {
+                let _ = self.actor_tx.send(StreamActorMessage::StreamRejected {
+                    request_id: reject.request_id,
+                    reason: reject.reason.clone(),
+                }).await;
+            }
+            StreamSignalingMessage::Query(query) => {
+                let _ = self.actor_tx.send(StreamActorMessage::StreamQuery {
+                    request_id: query.request_id,
+                    topic_id: [0u8; 32], // Stream signaling is peer-to-peer, no topic context
+                    querier_id: sender_id,
+                }).await;
+            }
+            StreamSignalingMessage::Active(active) => {
+                self.emit_deferred_stream_request(&active.request_id).await;
+            }
+            StreamSignalingMessage::Ended(ended) => {
+                let _ = self.actor_tx.send(StreamActorMessage::StreamEnded {
+                    request_id: ended.request_id,
+                }).await;
+            }
         }
     }
 
@@ -560,11 +587,10 @@ impl StreamService {
             crate::network::send::PacketSource::HarborPull => {
                 self.pending_incoming.write().await.insert(*request_id, pending);
 
-                let dm_msg = DmMessage::StreamQuery(DmStreamQueryMessage {
-                    topic_id: *topic_id,
+                let msg = StreamSignalingMessage::Query(StreamQueryMessage {
                     request_id: *request_id,
                 });
-                if let Err(e) = self.send_dm_signaling(&sender_id, dm_msg).await {
+                if let Err(e) = self.send_stream_signaling(&sender_id, msg).await {
                     warn!(
                         request_id = %hex::encode(&request_id[..8]),
                         error = %e,
@@ -660,23 +686,21 @@ impl StreamService {
         }
     }
 
-    async fn handle_stream_query(&self, request_id: &[u8; 32], topic_id: &[u8; 32], querier_id: [u8; 32]) {
+    async fn handle_stream_query(&self, request_id: &[u8; 32], _topic_id: &[u8; 32], querier_id: [u8; 32]) {
         let is_active = self.active_streams.read().await.contains_key(request_id)
             || self.pending_outgoing.read().await.contains_key(request_id);
 
-        let dm_msg = if is_active {
-            DmMessage::StreamActive(DmStreamActiveMessage {
-                topic_id: *topic_id,
+        let msg = if is_active {
+            StreamSignalingMessage::Active(StreamActiveMessage {
                 request_id: *request_id,
             })
         } else {
-            DmMessage::StreamEnded(DmStreamEndedMessage {
-                topic_id: *topic_id,
+            StreamSignalingMessage::Ended(StreamEndedMessage {
                 request_id: *request_id,
             })
         };
 
-        if let Err(e) = self.send_dm_signaling(&querier_id, dm_msg).await {
+        if let Err(e) = self.send_stream_signaling(&querier_id, msg).await {
             warn!(
                 request_id = %hex::encode(&request_id[..8]),
                 error = %e,

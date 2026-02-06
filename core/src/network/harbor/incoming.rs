@@ -8,38 +8,20 @@
 //! - Connection handler (accepts QUIC connections, dispatches to handlers)
 
 use rusqlite::Connection;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 use crate::data::harbor::{
     all_recipients_delivered, cache_packet, delete_packet, get_packets_for_recipient,
-    get_packets_for_sync, mark_delivered, PacketType,
+    get_packets_for_sync, mark_delivered,
 };
 use crate::resilience::{RateLimitResult, StorageCheckResult};
 use crate::security::send::packet::{verify_for_storage, PacketError};
 
 use super::protocol::{
-    DeliveryAck, DeliveryUpdate, HarborMessage, HarborPacketType, PacketInfo, PullRequest,
+    DeliveryAck, DeliveryUpdate, HarborMessage, PacketInfo, PullRequest,
     PullResponse, StoreRequest, StoreResponse, SyncRequest, SyncResponse,
 };
 use super::service::{HarborError, HarborService};
-
-/// Convert from protocol packet type to data layer packet type
-fn harbor_packet_type_to_data(hpt: HarborPacketType) -> PacketType {
-    match hpt {
-        HarborPacketType::Content => PacketType::Content,
-        HarborPacketType::Join => PacketType::Join,
-        HarborPacketType::Leave => PacketType::Leave,
-    }
-}
-
-/// Convert from data layer packet type to protocol packet type
-fn data_packet_type_to_harbor(pt: PacketType) -> HarborPacketType {
-    match pt {
-        PacketType::Content => HarborPacketType::Content,
-        PacketType::Join => HarborPacketType::Join,
-        PacketType::Leave => HarborPacketType::Leave,
-    }
-}
 
 impl HarborService {
     /// Check rate limit for a connection
@@ -118,52 +100,34 @@ impl HarborService {
             "Harbor STORE: received store request"
         );
 
+        // Verify Proof of Work first (before rate limits so we don't waste limiter state)
+        let packet_size = request.packet_data.len() as u64;
+        if let Err(e) = self.verify_pow(
+            &request.pow,
+            &request.harbor_id,
+            &request.packet_id,
+            &request.sender_id,
+            packet_size,
+        ) {
+            if let HarborError::InsufficientPoW { required } = &e {
+                warn!(
+                    packet_id = %packet_id_hex,
+                    required_difficulty = required,
+                    provided_difficulty = request.pow.difficulty_bits,
+                    "Harbor STORE: rejected - insufficient PoW"
+                );
+                return Ok(StoreResponse {
+                    packet_id: request.packet_id,
+                    success: false,
+                    error: Some(format!("insufficient proof of work: {} bits required", required)),
+                    required_difficulty: Some(*required),
+                });
+            }
+            return Err(e);
+        }
+
         // Check rate limits (both connection and harbor limits)
         self.check_store_rate_limit(&request.sender_id, &request.harbor_id)?;
-
-        // Verify Proof of Work if enabled
-        if self.pow_config.enabled {
-            match &request.proof_of_work {
-                Some(pow) => {
-                    use crate::resilience::{verify_pow, PoWVerifyResult};
-
-                    // Verify PoW is bound to this request
-                    if pow.harbor_id != request.harbor_id {
-                        warn!(
-                            packet_id = %packet_id_hex,
-                            "Harbor STORE: rejected - PoW harbor_id mismatch"
-                        );
-                        return Err(HarborError::InvalidPoW(PoWVerifyResult::InsufficientDifficulty));
-                    }
-                    if pow.packet_id != request.packet_id {
-                        warn!(
-                            packet_id = %packet_id_hex,
-                            "Harbor STORE: rejected - PoW packet_id mismatch"
-                        );
-                        return Err(HarborError::InvalidPoW(PoWVerifyResult::InsufficientDifficulty));
-                    }
-
-                    // Verify PoW meets requirements
-                    let result = verify_pow(pow, &self.pow_config);
-                    if !result.is_valid() {
-                        warn!(
-                            packet_id = %packet_id_hex,
-                            result = %result,
-                            "Harbor STORE: rejected - invalid PoW"
-                        );
-                        return Err(HarborError::InvalidPoW(result));
-                    }
-                    trace!(packet_id = %packet_id_hex, nonce = pow.nonce, "PoW verified");
-                }
-                None => {
-                    warn!(
-                        packet_id = %packet_id_hex,
-                        "Harbor STORE: rejected - PoW required but not provided"
-                    );
-                    return Err(HarborError::PoWRequired);
-                }
-            }
-        }
 
         // Check storage limits before accepting
         let packet_size = request.packet_data.len() as u64;
@@ -218,6 +182,7 @@ impl HarborService {
                 packet_id: request.packet_id,
                 success: false,
                 error: Some("empty packet data".to_string()),
+                required_difficulty: None,
             });
         }
 
@@ -230,6 +195,7 @@ impl HarborService {
                 packet_id: request.packet_id,
                 success: false,
                 error: Some("no recipients".to_string()),
+                required_difficulty: None,
             });
         }
 
@@ -251,6 +217,7 @@ impl HarborService {
                         packet_id: request.packet_id,
                         success: false,
                         error: Some("packet_id mismatch".to_string()),
+                        required_difficulty: None,
                     });
                 }
                 debug!(
@@ -278,12 +245,10 @@ impl HarborService {
                     packet_id: request.packet_id,
                     success: false,
                     error: Some(error_msg),
+                    required_difficulty: None,
                 });
             }
         }
-
-        // Convert packet type
-        let packet_type = harbor_packet_type_to_data(request.packet_type);
 
         // Store the packet (now verified!)
         cache_packet(
@@ -292,7 +257,6 @@ impl HarborService {
             &request.harbor_id,
             &request.sender_id,
             &request.packet_data,
-            packet_type,
             &request.recipients,
             false, // Not synced, this is an original
         )
@@ -319,6 +283,7 @@ impl HarborService {
             packet_id: request.packet_id,
             success: true,
             error: None,
+            required_difficulty: None,
         })
     }
 
@@ -380,7 +345,6 @@ impl HarborService {
                 sender_id: p.sender_id,
                 packet_data: p.packet_data,
                 created_at: p.created_at,
-                packet_type: data_packet_type_to_harbor(p.packet_type),
             })
             .collect();
 
@@ -494,7 +458,6 @@ impl HarborService {
                 sender_id: p.sender_id,
                 packet_data: p.packet_data,
                 created_at: p.created_at,
-                packet_type: data_packet_type_to_harbor(p.packet_type),
             })
             .collect();
 
@@ -602,8 +565,9 @@ mod tests {
     use super::*;
     use crate::data::harbor::{cache_packet, get_cached_packet, get_undelivered_recipients};
     use crate::data::schema::create_harbor_table;
+    use crate::resilience::ProofOfWork;
     use crate::security::create_key_pair::generate_key_pair;
-    use crate::security::send::packet::PacketBuilder;
+    use crate::security::send::packet::{PacketBuilder, generate_packet_id};
     use crate::security::topic_keys::harbor_id_from_topic;
 
     fn setup_db() -> Connection {
@@ -615,6 +579,15 @@ mod tests {
 
     fn test_id(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    /// Create a dummy PoW for tests (difficulty 0 = always passes)
+    fn test_pow() -> ProofOfWork {
+        ProofOfWork {
+            timestamp: 0,
+            nonce: 0,
+            difficulty_bits: 0,
+        }
     }
 
     #[test]
@@ -632,7 +605,7 @@ mod tests {
             sender_keypair.private_key,
             sender_keypair.public_key,
         )
-        .build(b"test message")
+        .build(b"test message", generate_packet_id())
         .expect("packet build should succeed");
 
         let packet_bytes = packet.to_bytes().expect("serialization should succeed");
@@ -643,8 +616,7 @@ mod tests {
             harbor_id,
             sender_id: sender_keypair.public_key,
             recipients: vec![test_id(40), test_id(41)],
-            packet_type: HarborPacketType::Content,
-            proof_of_work: None, // PoW disabled in without_rate_limiting()
+            pow: test_pow(),
         };
 
         let response = service.handle_store(&mut conn, request).unwrap();
@@ -666,8 +638,7 @@ mod tests {
             harbor_id: test_id(20),
             sender_id: test_id(30),
             recipients: vec![test_id(40)],
-            packet_type: HarborPacketType::Content,
-            proof_of_work: None,
+            pow: test_pow(),
         };
 
         let response = service.handle_store(&mut conn, request).unwrap();
@@ -686,7 +657,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet 1",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -698,7 +668,6 @@ mod tests {
             &test_id(20),
             &test_id(31),
             b"packet 2",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -728,7 +697,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -758,7 +726,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet 1",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -770,7 +737,6 @@ mod tests {
             &test_id(20),
             &test_id(31),
             b"packet 2",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -801,7 +767,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -832,7 +797,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet",
-            PacketType::Content,
             &[test_id(1)],
             false,
         )
@@ -860,7 +824,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet",
-            PacketType::Content,
             &[test_id(1), test_id(2)],
             false,
         )
@@ -891,7 +854,6 @@ mod tests {
             &test_id(20), // harbor_id
             &test_id(30),
             b"packet data",
-            PacketType::Content,
             &[test_id(40)],
             false,
         )
@@ -925,7 +887,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet data",
-            PacketType::Content,
             &[test_id(40)],
             false,
         )
@@ -958,7 +919,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet data",
-            PacketType::Content,
             &[test_id(40), test_id(41)],
             false,
         )
@@ -996,8 +956,7 @@ mod tests {
             harbor_id: test_id(20),
             sender_id: test_id(30),
             recipients: vec![test_id(40)],
-            packet_type: HarborPacketType::Content,
-            proof_of_work: None,
+            pow: test_pow(),
         });
 
         // Authenticated node ID is test_id(40)
@@ -1033,7 +992,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet",
-            PacketType::Content,
             &[test_id(40)],
             false,
         )
@@ -1064,7 +1022,6 @@ mod tests {
             &test_id(20),
             &test_id(30),
             b"packet",
-            PacketType::Content,
             &[test_id(40)],
             false,
         )
@@ -1100,7 +1057,6 @@ mod tests {
             &test_id(20), // harbor_id
             &test_id(30),
             b"packet data",
-            PacketType::Content,
             &[test_id(40), test_id(41)],
             false,
         )

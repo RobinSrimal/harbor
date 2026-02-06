@@ -39,6 +39,18 @@ scenario_dm_stream_basic() {
     local NODE2_ID=$(api_get_endpoint_id 2)
     info "Node-2 endpoint: ${NODE2_ID:0:16}..."
 
+    # Establish DM connection via Control protocol (required for STREAM_ALPN gate)
+    log "Phase 2b: Establishing DM connection..."
+    local INVITE=$(api_control_generate_invite 1)
+    local INVITE_STRING=$(extract_invite_string "$INVITE")
+    if [ -n "$INVITE_STRING" ]; then
+        api_control_connect_with_invite 2 "$INVITE_STRING" > /dev/null
+        info "  Node-1 ↔ Node-2: connection established"
+    else
+        warn "  Failed to establish connection"
+    fi
+    sleep 2
+
     # Node-1 requests DM stream to Node-2
     log "Phase 3: Node-1 requesting DM stream to Node-2..."
     local req_response=$(api_dm_stream_request 1 "$NODE2_ID" "dm-test-stream")

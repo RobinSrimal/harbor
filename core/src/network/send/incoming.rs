@@ -3,7 +3,6 @@
 //! Type definitions for incoming packet processing. The actual logic
 //! lives on `SendService` methods in `outgoing.rs`.
 
-use crate::resilience::PoWVerifyResult;
 use crate::security::PacketError;
 use super::protocol::Receipt;
 
@@ -51,26 +50,17 @@ pub struct ProcessResult {
     pub content_payload: Option<Vec<u8>>,
 }
 
-/// Error during PoW-protected receive operations
+/// Error during receive operations
 #[derive(Debug)]
 pub enum ReceiveError {
     /// Failed to verify/decrypt packet
     PacketVerification(PacketError),
-    /// Proof of Work required but not provided
-    PoWRequired,
-    /// Invalid Proof of Work
-    InvalidPoW(PoWVerifyResult),
-    /// PoW target mismatch (wrong topic or recipient)
-    PoWTargetMismatch,
 }
 
 impl std::fmt::Display for ReceiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReceiveError::PacketVerification(e) => write!(f, "packet verification failed: {}", e),
-            ReceiveError::PoWRequired => write!(f, "proof of work required"),
-            ReceiveError::InvalidPoW(result) => write!(f, "invalid proof of work: {}", result),
-            ReceiveError::PoWTargetMismatch => write!(f, "proof of work target mismatch"),
         }
     }
 }
@@ -87,7 +77,7 @@ impl From<PacketError> for ReceiveError {
 mod tests {
     use super::*;
     use crate::security::create_key_pair::generate_key_pair;
-    use crate::security::send::packet::create_packet;
+    use crate::security::send::packet::{create_packet, generate_packet_id};
     use crate::data::schema::create_all_tables;
     use crate::data::send::store_outgoing_packet;
     use crate::security::harbor_id_from_topic;
@@ -120,18 +110,6 @@ mod tests {
     }
 
     #[test]
-    fn test_receive_error_display() {
-        let err = ReceiveError::PoWRequired;
-        assert_eq!(err.to_string(), "proof of work required");
-
-        let err = ReceiveError::PoWTargetMismatch;
-        assert_eq!(err.to_string(), "proof of work target mismatch");
-
-        let err = ReceiveError::InvalidPoW(PoWVerifyResult::Expired);
-        assert!(err.to_string().contains("invalid proof of work"));
-    }
-
-    #[test]
     fn test_receive_packet_success() {
         let sender_keys = generate_key_pair();
         let topic_id = test_id(100);
@@ -142,6 +120,7 @@ mod tests {
             &sender_keys.private_key,
             &sender_keys.public_key,
             plaintext,
+            generate_packet_id(),
         ).unwrap();
 
         let receiver_keys = generate_key_pair();
@@ -163,6 +142,7 @@ mod tests {
             &sender_keys.private_key,
             &sender_keys.public_key,
             b"Secret",
+            generate_packet_id(),
         ).unwrap();
 
         let result = SendService::receive_packet(&packet, &wrong_topic_id, [0u8; 32]);

@@ -53,9 +53,19 @@ mod tests {
 
     use super::*;
     use super::internal::routing::KBucket;
+    use crate::resilience::ProofOfWork;
 
     fn make_id(seed: u8) -> Id {
         Id::new([seed; 32])
+    }
+
+    /// Create a dummy PoW for tests (difficulty 0 = always passes)
+    fn test_pow() -> ProofOfWork {
+        ProofOfWork {
+            timestamp: 0,
+            nonce: 0,
+            difficulty_bits: 0,
+        }
     }
 
     fn make_id_with_prefix(prefix: &[u8]) -> Id {
@@ -323,6 +333,7 @@ mod tests {
             target: make_id(100),
             requester: Some([1u8; 32]),
             requester_relay_url: Some("https://relay.example.com/".to_string()),
+            pow: test_pow(),
         };
 
         let bytes = postcard::to_allocvec(&request).unwrap();

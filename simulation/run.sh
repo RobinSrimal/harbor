@@ -16,6 +16,9 @@ NODES_DIR="$SCRIPT_DIR/nodes"
 BASE_API_PORT=9001
 BOOTSTRAP_FILE="$SCRIPT_DIR/bootstrap.txt"
 
+# Database encryption key for all nodes
+export HARBOR_DB_KEY="${HARBOR_DB_KEY:-486172626f724e6f64654b6579323032355f76315f7365727665725f6b657921}"
+
 # Check for --clean flag
 CLEAN_FIRST=false
 for arg in "$@"; do

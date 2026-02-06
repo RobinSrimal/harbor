@@ -61,6 +61,18 @@ impl DhtService {
                     let requester = find_node_msg.requester;
                     let requester_relay_url = find_node_msg.requester_relay_url.clone();
 
+                    // Verify PoW first (context: sender_id || target_bytes)
+                    if !self.verify_pow(&find_node_msg.pow, &sender_id, &target) {
+                        debug!(
+                            sender = %hex::encode(&sender_id[..8]),
+                            target = %target,
+                            "DHT FindNode rejected: insufficient PoW"
+                        );
+                        // Return empty response on PoW failure
+                        find_node_msg.tx.send(FindNodeResponse { nodes: vec![] }).await.ok();
+                        continue;
+                    }
+
                     trace!(
                         target = %target,
                         requester = ?requester.map(hex::encode),
@@ -98,17 +110,17 @@ impl DhtService {
                     // Persist requester to database for recovery after restart
                     // Note: relay URL is NOT written here — it flows through the in-memory
                     // node_relay_urls map → save_routing_table → DB with correct freshness
-                    if let Some(requester_id) = requester {
-                        if requester_id != our_id {
-                            let db_lock = db.lock().await;
-                            let entry = crate::data::dht::DhtEntry {
-                                endpoint_id: requester_id,
-                                bucket_index: 0, // Will be recalculated on load
-                                added_at: current_timestamp(),
-                            };
-                            // Ignore errors - best effort
-                            let _ = crate::data::dht::insert_dht_entry(&db_lock, &entry);
-                        }
+                    if let Some(requester_id) = requester
+                        && requester_id != our_id
+                    {
+                        let db_lock = db.lock().await;
+                        let entry = crate::data::dht::DhtEntry {
+                            endpoint_id: requester_id,
+                            bucket_index: 0, // Will be recalculated on load
+                            added_at: current_timestamp(),
+                        };
+                        // Ignore errors - best effort
+                        let _ = crate::data::dht::insert_dht_entry(&db_lock, &entry);
                     }
                 }
             }
@@ -163,9 +175,19 @@ impl DhtService {
 mod tests {
     use crate::network::dht::Id;
     use crate::network::dht::protocol::{FindNode, FindNodeResponse, NodeInfo};
+    use crate::resilience::ProofOfWork;
 
     fn make_id(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    /// Create a dummy PoW for tests (difficulty 0 = always passes)
+    fn test_pow() -> ProofOfWork {
+        ProofOfWork {
+            timestamp: 0,
+            nonce: 0,
+            difficulty_bits: 0,
+        }
     }
 
     // ========== DHT Protocol Tests ==========
@@ -176,6 +198,7 @@ mod tests {
             target: Id::new(make_id(42)),
             requester: Some(make_id(1)),
             requester_relay_url: Some("https://relay.example.com/".to_string()),
+            pow: test_pow(),
         };
 
         let bytes = postcard::to_allocvec(&request).unwrap();
@@ -192,6 +215,7 @@ mod tests {
             target: Id::new(make_id(42)),
             requester: None,
             requester_relay_url: None,
+            pow: test_pow(),
         };
 
         let bytes = postcard::to_allocvec(&request).unwrap();
@@ -241,6 +265,7 @@ mod tests {
             target: Id::new(make_id(42)),
             requester: None,
             requester_relay_url: None,
+            pow: test_pow(),
         };
 
         let request_bytes = postcard::to_allocvec(&request).unwrap();

@@ -217,11 +217,13 @@ impl TestNode {
         topic_id: &[u8; 32],
         plaintext: &[u8],
     ) -> Result<SendPacket, crate::security::PacketError> {
+        let packet_id = crate::security::send::generate_packet_id();
         let packet = crate::security::create_packet(
             topic_id,
             &self.key_pair.private_key,
             &self.key_pair.public_key,
             plaintext,
+            packet_id,
         )?;
 
         // Track pending receipts

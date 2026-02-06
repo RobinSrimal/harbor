@@ -40,48 +40,25 @@ impl HarborMessage {
     }
 }
 
-/// Packet type for Harbor storage
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HarborPacketType {
-    /// Regular content packet - requires full verification
-    Content,
-    /// Join control packet - MAC-only verification (sender key unknown)
-    Join,
-    /// Leave control packet - full verification
-    Leave,
-}
-
-impl HarborPacketType {
-    /// Check if this packet type requires signature verification
-    pub fn requires_signature(&self) -> bool {
-        match self {
-            HarborPacketType::Content => true,
-            HarborPacketType::Join => false, // Sender's key not known yet
-            HarborPacketType::Leave => true,
-        }
-    }
-}
-
 /// Request to store a packet on a Harbor Node
+///
+/// Harbor stores opaque encrypted bytes. The packet type is not stored
+/// separately - recipients derive the decryption key from the harbor_id
+/// they're pulling from, then read plaintext[0] to get the PacketType.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreRequest {
-    /// The serialized SendPacket
+    /// The serialized SendPacket (opaque encrypted bytes)
     pub packet_data: Vec<u8>,
     /// Packet ID (for deduplication)
     pub packet_id: [u8; 32],
-    /// HarborID (for routing/validation)
+    /// HarborID (for routing)
     pub harbor_id: [u8; 32],
     /// Sender's EndpointID
     pub sender_id: [u8; 32],
     /// Recipients who haven't received the packet
     pub recipients: Vec<[u8; 32]>,
-    /// Type of packet (affects verification mode)
-    pub packet_type: HarborPacketType,
-    /// Proof of Work (required when PoW is enabled on Harbor Node)
-    /// 
-    /// The PoW must be bound to this request's `harbor_id` and `packet_id`.
-    /// This prevents replay attacks and spam.
-    pub proof_of_work: Option<ProofOfWork>,
+    /// Proof of Work (context: harbor_id || packet_id)
+    pub pow: ProofOfWork,
 }
 
 /// Response to store request
@@ -93,6 +70,8 @@ pub struct StoreResponse {
     pub success: bool,
     /// Error message if failed
     pub error: Option<String>,
+    /// Required PoW difficulty (hint when rejected for insufficient PoW)
+    pub required_difficulty: Option<u8>,
 }
 
 /// Request packets for a specific recipient
@@ -123,18 +102,19 @@ pub struct PullResponse {
 }
 
 /// Info about a packet in pull response
+///
+/// Harbor returns opaque encrypted bytes. Recipients derive the
+/// packet type from plaintext[0] after decryption.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PacketInfo {
     /// Packet ID
     pub packet_id: [u8; 32],
     /// Sender's EndpointID
     pub sender_id: [u8; 32],
-    /// Serialized packet data
+    /// Serialized packet data (opaque encrypted bytes)
     pub packet_data: Vec<u8>,
     /// When the packet was created
     pub created_at: i64,
-    /// Type of packet (for verification mode)
-    pub packet_type: HarborPacketType,
 }
 
 /// Acknowledge that a packet was received
@@ -227,6 +207,15 @@ impl std::error::Error for DecodeError {}
 mod tests {
     use super::*;
 
+    /// Create a dummy PoW for tests (difficulty 0 = always passes)
+    fn test_pow() -> ProofOfWork {
+        ProofOfWork {
+            timestamp: 0,
+            nonce: 0,
+            difficulty_bits: 0,
+        }
+    }
+
     #[test]
     fn test_store_request_roundtrip() {
         let msg = HarborMessage::Store(StoreRequest {
@@ -235,8 +224,7 @@ mod tests {
             harbor_id: [2u8; 32],
             sender_id: [3u8; 32],
             recipients: vec![[10u8; 32], [11u8; 32]],
-            packet_type: HarborPacketType::Content,
-            proof_of_work: None,
+            pow: test_pow(),
         });
 
         let encoded = msg.encode();
@@ -246,7 +234,6 @@ mod tests {
             assert_eq!(req.packet_id, [1u8; 32]);
             assert_eq!(req.harbor_id, [2u8; 32]);
             assert_eq!(req.recipients.len(), 2);
-            assert_eq!(req.packet_type, HarborPacketType::Content);
         } else {
             panic!("wrong message type");
         }
@@ -258,6 +245,7 @@ mod tests {
             packet_id: [1u8; 32],
             success: true,
             error: None,
+            required_difficulty: None,
         });
 
         let encoded = msg.encode();
@@ -322,14 +310,12 @@ mod tests {
                     sender_id: [20u8; 32],
                     packet_data: b"packet 1".to_vec(),
                     created_at: 1704067200,
-                    packet_type: HarborPacketType::Content,
                 },
                 PacketInfo {
                     packet_id: [11u8; 32],
                     sender_id: [21u8; 32],
                     packet_data: b"packet 2".to_vec(),
                     created_at: 1704067201,
-                    packet_type: HarborPacketType::Join,
                 },
             ],
         });
@@ -451,7 +437,6 @@ mod tests {
                 sender_id: [20u8; 32],
                 packet_data: b"packet data".to_vec(),
                 created_at: 1704067200,
-                packet_type: HarborPacketType::Content,
             }],
             delivery_updates: vec![DeliveryUpdate {
                 packet_id: [11u8; 32],
@@ -513,18 +498,6 @@ mod tests {
     }
 
     #[test]
-    fn test_harbor_packet_type_requires_signature() {
-        // Content requires signature (sender should be known)
-        assert!(HarborPacketType::Content.requires_signature());
-        
-        // Join does NOT require signature (sender's key not known yet)
-        assert!(!HarborPacketType::Join.requires_signature());
-        
-        // Leave requires signature (sender should be known member)
-        assert!(HarborPacketType::Leave.requires_signature());
-    }
-
-    #[test]
     fn test_decode_error_display() {
         let err = DecodeError::InvalidMessage("test error".to_string());
         assert_eq!(err.to_string(), "invalid message: test error");
@@ -536,6 +509,7 @@ mod tests {
             packet_id: [1u8; 32],
             success: false,
             error: Some("packet too large".to_string()),
+            required_difficulty: None,
         });
 
         let encoded = msg.encode();
@@ -546,32 +520,6 @@ mod tests {
             assert_eq!(resp.error, Some("packet too large".to_string()));
         } else {
             panic!("wrong message type");
-        }
-    }
-
-    #[test]
-    fn test_packet_info_all_types() {
-        // Test each packet type in PacketInfo
-        for packet_type in [HarborPacketType::Content, HarborPacketType::Join, HarborPacketType::Leave] {
-            let info = PacketInfo {
-                packet_id: [1u8; 32],
-                sender_id: [2u8; 32],
-                packet_data: b"data".to_vec(),
-                created_at: 12345,
-                packet_type,
-            };
-            
-            let msg = HarborMessage::PullResponse(PullResponse {
-                harbor_id: [0u8; 32],
-                packets: vec![info],
-            });
-            
-            let encoded = msg.encode();
-            let decoded = HarborMessage::decode(&encoded).unwrap();
-            
-            if let HarborMessage::PullResponse(resp) = decoded {
-                assert_eq!(resp.packets[0].packet_type, packet_type);
-            }
         }
     }
 

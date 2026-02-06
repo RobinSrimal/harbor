@@ -43,6 +43,27 @@ pub enum ProtocolEvent {
     DmSyncResponse(DmSyncResponseEvent),
     /// A file was announced via DM (peer-to-peer file share)
     DmFileAnnounced(DmFileAnnouncedEvent),
+
+    // =========================================================================
+    // Control events
+    // =========================================================================
+
+    /// A peer wants to connect with us
+    ConnectionRequest(ConnectionRequestEvent),
+    /// Our connection request was accepted
+    ConnectionAccepted(ConnectionAcceptedEvent),
+    /// Our connection request was declined
+    ConnectionDeclined(ConnectionDeclinedEvent),
+    /// We received an invitation to join a topic
+    TopicInviteReceived(TopicInviteReceivedEvent),
+    /// A new member joined a topic we're in
+    TopicMemberJoined(TopicMemberJoinedEvent),
+    /// A member left a topic we're in
+    TopicMemberLeft(TopicMemberLeftEvent),
+    /// Topic epoch key was rotated (member removed)
+    TopicEpochRotated(TopicEpochRotatedEvent),
+    /// Someone suggested a peer to us
+    PeerSuggested(PeerSuggestedEvent),
 }
 
 /// An incoming message from the event bus
@@ -260,6 +281,112 @@ pub struct DmFileAnnouncedEvent {
     pub num_sections: u8,
     /// Timestamp when announced
     pub timestamp: i64,
+}
+
+// =============================================================================
+// Control events
+// =============================================================================
+
+/// Event: A peer wants to connect with us
+///
+/// Application should accept or decline via `protocol.accept_connection()` / `decline_connection()`.
+#[derive(Debug, Clone)]
+pub struct ConnectionRequestEvent {
+    /// The peer requesting connection
+    pub peer_id: [u8; 32],
+    /// Unique identifier for this request
+    pub request_id: [u8; 32],
+    /// Optional display name from the requester
+    pub display_name: Option<String>,
+    /// Optional relay URL from the requester
+    pub relay_url: Option<String>,
+}
+
+/// Event: Our connection request was accepted
+#[derive(Debug, Clone)]
+pub struct ConnectionAcceptedEvent {
+    /// The peer who accepted
+    pub peer_id: [u8; 32],
+    /// The request that was accepted
+    pub request_id: [u8; 32],
+}
+
+/// Event: Our connection request was declined
+#[derive(Debug, Clone)]
+pub struct ConnectionDeclinedEvent {
+    /// The peer who declined
+    pub peer_id: [u8; 32],
+    /// The request that was declined
+    pub request_id: [u8; 32],
+    /// Optional reason for declining
+    pub reason: Option<String>,
+}
+
+/// Event: We received an invitation to join a topic
+///
+/// Application should accept or decline via `protocol.accept_topic_invite()` / `decline_topic_invite()`.
+#[derive(Debug, Clone)]
+pub struct TopicInviteReceivedEvent {
+    /// Unique identifier for this invite
+    pub message_id: [u8; 32],
+    /// The topic we're being invited to
+    pub topic_id: [u8; 32],
+    /// Who sent the invite
+    pub sender_id: [u8; 32],
+    /// Human-readable topic name
+    pub topic_name: Option<String>,
+    /// Topic administrator's endpoint ID
+    pub admin_id: [u8; 32],
+    /// Current member count
+    pub member_count: usize,
+}
+
+/// Event: A new member joined a topic we're in
+#[derive(Debug, Clone)]
+pub struct TopicMemberJoinedEvent {
+    /// The topic
+    pub topic_id: [u8; 32],
+    /// The new member
+    pub member_id: [u8; 32],
+    /// Their relay URL
+    pub relay_url: Option<String>,
+}
+
+/// Event: A member left a topic we're in
+#[derive(Debug, Clone)]
+pub struct TopicMemberLeftEvent {
+    /// The topic
+    pub topic_id: [u8; 32],
+    /// The member who left
+    pub member_id: [u8; 32],
+}
+
+/// Event: Topic epoch key was rotated (member removed)
+///
+/// A member was removed by the admin and we received a new epoch key.
+#[derive(Debug, Clone)]
+pub struct TopicEpochRotatedEvent {
+    /// The topic
+    pub topic_id: [u8; 32],
+    /// New epoch number
+    pub new_epoch: u64,
+    /// The member who was removed
+    pub removed_member: [u8; 32],
+}
+
+/// Event: Someone suggested a peer to us
+///
+/// Application can decide to connect to the suggested peer.
+#[derive(Debug, Clone)]
+pub struct PeerSuggestedEvent {
+    /// Who made the suggestion
+    pub introducer_id: [u8; 32],
+    /// The suggested peer
+    pub suggested_peer_id: [u8; 32],
+    /// Suggested peer's relay URL
+    pub relay_url: Option<String>,
+    /// Optional note about the suggested peer
+    pub note: Option<String>,
 }
 
 #[cfg(test)]

@@ -126,14 +126,37 @@ pub enum AppEvent {
     SyncResponse(SyncResponseEventFE),
 }
 
-/// Fixed database key for persistent identity (32 bytes)
-/// This allows the test app to reuse the same key pair across restarts
-const DB_KEY: [u8; 32] = [
-    0x48, 0x61, 0x72, 0x62, 0x6f, 0x72, 0x54, 0x65,  // "HarborTe"
-    0x73, 0x74, 0x41, 0x70, 0x70, 0x4b, 0x65, 0x79,  // "stAppKey"
-    0x32, 0x30, 0x32, 0x35, 0x5f, 0x76, 0x31, 0x5f,  // "2025_v1_"
-    0x73, 0x65, 0x63, 0x72, 0x65, 0x74, 0x21, 0x21,  // "secret!!"
-];
+/// Resolve the database key: try keychain first, then generate a new random one.
+/// Always returns a key — Protocol requires one.
+fn resolve_db_key() -> [u8; 32] {
+    // Try to retrieve from OS keychain
+    match harbor_core::keychain::retrieve_passphrase() {
+        Ok(Some(hex_str)) => {
+            if let Ok(bytes) = hex::decode(&hex_str) {
+                if bytes.len() == 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&bytes);
+                    println!("Using database key from OS keychain");
+                    return key;
+                }
+            }
+            println!("Warning: keychain passphrase invalid, generating new key");
+        }
+        Ok(None) => {
+            println!("No database key in keychain, generating new key");
+        }
+        Err(e) => {
+            println!("Keychain not available ({}), generating new key", e);
+        }
+    }
+
+    // Generate a random key
+    use rand::RngCore;
+    let mut key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key);
+    println!("Generated new random database key (use 'remember me' to persist)");
+    key
+}
 
 /// Start the Harbor Protocol
 #[tauri::command]
@@ -147,11 +170,12 @@ async fn start_protocol(state: State<'_, AppState>) -> Result<StartResponse, Str
     // Bootstrap ID from bootstrap.rs
     let bootstrap_id = "1f5c436e4511ab2db15db837b827f237931bc722ede6f223c7f5d41b412c0cad";
     
-    // Use fixed db_key for persistent identity
+    let db_key = resolve_db_key();
+
     // Add bootstrap node so we can join the DHT network
     // Check for HARBOR_DB_PATH env var to allow multiple instances
     let mut config = ProtocolConfig::for_testing()
-        .with_db_key(DB_KEY)
+        .with_db_key(db_key)
         .with_bootstrap_node(bootstrap_id.to_string());
 
     // Allow overriding db path via environment variable for running multiple instances
@@ -469,7 +493,16 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
                     | ProtocolEvent::DmSyncUpdate(_)
                     | ProtocolEvent::DmSyncRequest(_)
                     | ProtocolEvent::DmSyncResponse(_)
-                    | ProtocolEvent::DmFileAnnounced(_) => continue,
+                    | ProtocolEvent::DmFileAnnounced(_)
+                    // Control events — not yet surfaced to test-app frontend
+                    | ProtocolEvent::ConnectionRequest(_)
+                    | ProtocolEvent::ConnectionAccepted(_)
+                    | ProtocolEvent::ConnectionDeclined(_)
+                    | ProtocolEvent::TopicInviteReceived(_)
+                    | ProtocolEvent::TopicMemberJoined(_)
+                    | ProtocolEvent::TopicMemberLeft(_)
+                    | ProtocolEvent::TopicEpochRotated(_)
+                    | ProtocolEvent::PeerSuggested(_) => continue,
                 };
                 events.push(app_event);
             }
@@ -777,6 +810,30 @@ async fn write_frontend_log(state: State<'_, AppState>, message: String) -> Resu
     Ok(())
 }
 
+// ============================================================================
+// Keychain Commands
+// ============================================================================
+
+/// Store the current database passphrase in the OS keychain ("remember me").
+#[tauri::command]
+async fn keychain_store(passphrase_hex: String) -> Result<(), String> {
+    harbor_core::keychain::store_passphrase(&passphrase_hex)
+        .map_err(|e| e.to_string())
+}
+
+/// Delete the stored passphrase from the OS keychain ("forget").
+#[tauri::command]
+async fn keychain_delete() -> Result<(), String> {
+    harbor_core::keychain::delete_passphrase()
+        .map_err(|e| e.to_string())
+}
+
+/// Check if a passphrase is stored in the OS keychain.
+#[tauri::command]
+async fn keychain_has_passphrase() -> Result<bool, String> {
+    Ok(harbor_core::keychain::has_stored_passphrase())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize tracing - write to file if HARBOR_DB_PATH is set
@@ -847,6 +904,10 @@ pub fn run() {
             sync_send_update,
             sync_request,
             sync_respond,
+            // Keychain
+            keychain_store,
+            keychain_delete,
+            keychain_has_passphrase,
             // Logging
             write_frontend_log,
         ])

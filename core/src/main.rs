@@ -8,26 +8,38 @@
 //!   harbor-cli --serve --bootstrap <id>:<relay>     # Use custom bootstrap node
 //!   harbor-cli --serve --no-default-bootstrap       # Don't use default bootstrap
 
+mod http;
+mod events;
+
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn, trace};
+use tracing::info;
 
-use harbor_core::{Protocol, ProtocolConfig, TopicInvite};
+use harbor_core::{Protocol, ProtocolConfig};
 
-/// Shared state for active stream tracks (source side)
-/// Maps request_id → TrackProducer for reuse across publish calls
-type ActiveTracks = Arc<RwLock<HashMap<[u8; 32], moq_lite::TrackProducer>>>;
-
-/// Fixed database key for persistent identity (32 bytes)
-const DB_KEY: [u8; 32] = [
-    0x48, 0x61, 0x72, 0x62, 0x6f, 0x72, 0x4e, 0x6f,  // "HarborNo"
-    0x64, 0x65, 0x4b, 0x65, 0x79, 0x32, 0x30, 0x32,  // "deKey202"
-    0x35, 0x5f, 0x76, 0x31, 0x5f, 0x73, 0x65, 0x72,  // "5_v1_ser"
-    0x76, 0x65, 0x72, 0x5f, 0x6b, 0x65, 0x79, 0x21,  // "ver_key!"
-];
+/// Parse HARBOR_DB_KEY env var (64 hex chars) into a 32-byte key.
+fn db_key_from_env() -> [u8; 32] {
+    let hex_str = env::var("HARBOR_DB_KEY").unwrap_or_else(|_| {
+        eprintln!("Error: HARBOR_DB_KEY environment variable is not set.");
+        eprintln!("  Set it to a 64-character hex string (32 bytes), e.g.:");
+        eprintln!("  export HARBOR_DB_KEY=$(openssl rand -hex 32)");
+        std::process::exit(1);
+    });
+    let bytes = hex::decode(&hex_str).unwrap_or_else(|_| {
+        eprintln!("Error: HARBOR_DB_KEY is not valid hex.");
+        std::process::exit(1);
+    });
+    if bytes.len() != 32 {
+        eprintln!("Error: HARBOR_DB_KEY must be exactly 64 hex characters (32 bytes), got {}.", hex_str.len());
+        std::process::exit(1);
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    key
+}
 
 fn print_usage() {
     println!("Harbor Protocol Node v0.1.0");
@@ -81,32 +93,70 @@ fn print_usage() {
     println!("DM Share Endpoints:");
     println!("  POST /api/dm/share          Share a file via DM (JSON: recipient, file_path)");
     println!();
+    println!("Control Endpoints (peer connections & topic invites):");
+    println!("  POST /api/control/connect          Request peer connection (JSON: peer, relay_url?, display_name?, token?)");
+    println!("  POST /api/control/accept           Accept connection request (JSON: request_id)");
+    println!("  POST /api/control/decline          Decline connection request (JSON: request_id, reason?)");
+    println!("  POST /api/control/invite           Generate connect invite (QR code)");
+    println!("  POST /api/control/connect-with-invite  Connect using invite (JSON: invite)");
+    println!("  POST /api/control/block            Block a peer (JSON: peer)");
+    println!("  POST /api/control/unblock          Unblock a peer (JSON: peer)");
+    println!("  GET  /api/control/connections      List all connections");
+    println!("  POST /api/control/topic-invite     Invite peer to topic (JSON: peer, topic)");
+    println!("  POST /api/control/topic-accept     Accept topic invite (JSON: message_id)");
+    println!("  POST /api/control/topic-decline    Decline topic invite (JSON: message_id)");
+    println!("  POST /api/control/leave            Leave topic (JSON: topic)");
+    println!("  POST /api/control/remove-member    Remove member from topic (JSON: topic, member)");
+    println!("  POST /api/control/suggest          Suggest peer introduction (JSON: to_peer, suggested_peer, note?)");
+    println!("  GET  /api/control/pending-invites  List pending topic invites");
+    println!();
     println!("Environment:");
+    println!("  HARBOR_DB_KEY               Database encryption key (64 hex chars, required)");
     println!("  RUST_LOG                    Set log level (e.g., info, debug)");
 }
 
-/// Bootstrap info for sharing
-struct BootstrapInfo {
-    endpoint_id: String,
-    relay_url: Option<String>,
+/// Parse bootstrap argument: "endpoint_id:relay_url" or just "endpoint_id"
+fn parse_bootstrap_arg(arg: &str) -> Option<(String, Option<String>)> {
+    if arg.contains(':') {
+        // Could be endpoint_id:relay_url or just a relay URL with colons
+        // Endpoint IDs are 64 hex chars, so check if first part looks like one
+        if let Some(colon_pos) = arg.find(':') {
+            let first_part = &arg[..colon_pos];
+            // Check if it looks like a hex endpoint ID (64 chars, all hex)
+            if first_part.len() == 64 && first_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                let endpoint_id = first_part.to_string();
+                let relay_url = arg[colon_pos + 1..].to_string();
+                return Some((endpoint_id, Some(relay_url)));
+            }
+        }
+    }
+
+    // Just an endpoint ID (or invalid format)
+    if arg.len() == 64 && arg.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some((arg.to_string(), None))
+    } else {
+        eprintln!("⚠️  Invalid bootstrap format: {}...", &arg[..arg.len().min(32)]);
+        eprintln!("   Expected: <64-hex-endpoint-id> or <64-hex-endpoint-id>:<relay-url>");
+        None
+    }
 }
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
-    
+
     // Parse arguments
     let show_help = args.iter().any(|a| a == "--help" || a == "-h");
     let serve_mode = args.iter().any(|a| a == "--serve" || a == "-s");
     let no_default_bootstrap = args.iter().any(|a| a == "--no-default-bootstrap");
     let testing_mode = args.iter().any(|a| a == "--testing");
-    
+
     // Parse --db-path
     let db_path: PathBuf = args.windows(2)
         .find(|w| w[0] == "--db-path")
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or_else(|| PathBuf::from("harbor.db"));
-    
+
     // Parse --blob-path (default: hidden folder next to db)
     let blob_path: PathBuf = args.windows(2)
         .find(|w| w[0] == "--blob-path")
@@ -117,7 +167,7 @@ async fn main() {
                 .map(|p| p.join(".harbor_blobs"))
                 .unwrap_or_else(|| PathBuf::from(".harbor_blobs"))
         });
-    
+
     // Parse --api-port
     let api_port: Option<u16> = args.windows(2)
         .find(|w| w[0] == "--api-port")
@@ -128,7 +178,7 @@ async fn main() {
         .filter(|w| w[0] == "--bootstrap")
         .filter_map(|w| parse_bootstrap_arg(&w[1]))
         .collect();
-    
+
     if show_help {
         print_usage();
         return;
@@ -152,25 +202,23 @@ async fn main() {
     println!("Harbor Protocol Node v0.1.0");
     println!();
 
+    let db_key = db_key_from_env();
+
     // Build config - use testing intervals if --testing flag is set
     let mut config = if testing_mode {
         ProtocolConfig::for_testing()
-            .with_db_key(DB_KEY)
+            .with_db_key(db_key)
             .with_db_path(db_path.clone())
             .with_blob_path(blob_path.clone())
     } else {
         ProtocolConfig::default()
-            .with_db_key(DB_KEY)
+            .with_db_key(db_key)
             .with_db_path(db_path.clone())
             .with_blob_path(blob_path.clone())
     };
 
-    // Handle bootstrap configuration:
-    // - If custom bootstrap nodes are provided, use ONLY those (ignore defaults)
-    // - If --no-default-bootstrap is set, use no bootstrap
-    // - Otherwise, use hardcoded defaults
+    // Handle bootstrap configuration
     if !custom_bootstraps.is_empty() {
-        // Custom bootstrap nodes provided - use ONLY these
         let bootstrap_strings: Vec<String> = custom_bootstraps
             .iter()
             .map(|(endpoint_id, relay_url)| {
@@ -181,9 +229,9 @@ async fn main() {
                 }
             })
             .collect();
-        
+
         config = config.with_bootstrap_nodes(bootstrap_strings);
-        
+
         for (endpoint_id, relay_url) in &custom_bootstraps {
             if let Some(relay) = relay_url {
                 println!("Bootstrap: {}... @ {}", &endpoint_id[..16], relay);
@@ -192,11 +240,9 @@ async fn main() {
             }
         }
     } else if no_default_bootstrap {
-        // Explicitly no bootstrap
         config = config.with_bootstrap_nodes(vec![]);
         println!("Bootstrap: none (--no-default-bootstrap)");
     } else {
-        // Use hardcoded defaults (already in ProtocolConfig::default())
         println!("Bootstrap: using defaults");
     }
 
@@ -204,7 +250,7 @@ async fn main() {
     println!("Starting Harbor Protocol...");
     println!("Database: {}", db_path.display());
     println!("Blob storage: {}", blob_path.display());
-    
+
     let protocol = match Protocol::start(config).await {
         Ok(p) => Arc::new(p),
         Err(e) => {
@@ -233,7 +279,7 @@ async fn main() {
     }
 
     // Create bootstrap info for API
-    let bootstrap_info = Arc::new(BootstrapInfo {
+    let bootstrap_info = Arc::new(http::BootstrapInfo {
         endpoint_id: endpoint_hex.clone(),
         relay_url: relay_url.clone(),
     });
@@ -253,19 +299,19 @@ async fn main() {
         println!("📡 API: http://127.0.0.1:{}", port);
     }
     println!();
-    
+
     // Print bootstrap info for convenience
     if let Some(ref relay) = relay_url {
         println!("To use this node as bootstrap:");
         println!("  --bootstrap {}:{}", endpoint_hex, relay);
     }
-    
+
     println!();
     println!("Press Ctrl+C to stop...");
     println!();
 
     // Shared state for active stream tracks
-    let active_tracks: ActiveTracks = Arc::new(RwLock::new(HashMap::new()));
+    let active_tracks: http::ActiveTracks = Arc::new(RwLock::new(HashMap::new()));
 
     // Start API server if port specified
     let api_handle = if let Some(port) = api_port {
@@ -273,1262 +319,27 @@ async fn main() {
         let bootstrap_clone = bootstrap_info.clone();
         let tracks_clone = active_tracks.clone();
         Some(tokio::spawn(async move {
-            run_api_server(protocol_clone, bootstrap_clone, port, tracks_clone).await;
+            http::run_api_server(protocol_clone, bootstrap_clone, port, tracks_clone).await;
         }))
     } else {
         None
     };
 
-    // Process events
-    let mut events = protocol.events().await;
-    
+    // Run event loop until shutdown
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!();
             info!("Received shutdown signal");
         }
-        _ = async {
-            if let Some(ref mut rx) = events {
-                while let Some(event) = rx.recv().await {
-                    match event {
-                        harbor_core::ProtocolEvent::Message(msg) => {
-                            // Try to decode payload as UTF-8 for display
-                            let content = String::from_utf8_lossy(&msg.payload);
-                            info!(
-                                topic = %hex::encode(&msg.topic_id[..8]),
-                                sender = %hex::encode(&msg.sender_id[..8]),
-                                size = msg.payload.len(),
-                                content = %content,
-                                "Received message"
-                            );
-                        }
-                        harbor_core::ProtocolEvent::FileAnnounced(ev) => {
-                            info!(
-                                topic = %hex::encode(&ev.topic_id[..8]),
-                                source = %hex::encode(&ev.source_id[..8]),
-                                hash = %hex::encode(&ev.hash[..8]),
-                                name = %ev.display_name,
-                                size = ev.total_size,
-                                "File announced"
-                            );
-                        }
-                        harbor_core::ProtocolEvent::FileProgress(ev) => {
-                            debug!(
-                                hash = %hex::encode(&ev.hash[..8]),
-                                progress = %format!("{}/{}", ev.chunks_complete, ev.total_chunks),
-                                "File progress"
-                            );
-                        }
-                        harbor_core::ProtocolEvent::FileComplete(ev) => {
-                            info!(
-                                hash = %hex::encode(&ev.hash[..8]),
-                                name = %ev.display_name,
-                                size = ev.total_size,
-                                "File complete"
-                            );
-                        }
-                        harbor_core::ProtocolEvent::SyncUpdate(ev) => {
-                            debug!(
-                                topic = %hex::encode(&ev.topic_id[..8]),
-                                sender = %hex::encode(&ev.sender_id[..8]),
-                                size = ev.data.len(),
-                                "Sync update received"
-                            );
-                        }
-                        harbor_core::ProtocolEvent::SyncRequest(ev) => {
-                            debug!(
-                                topic = %hex::encode(&ev.topic_id[..8]),
-                                sender = %hex::encode(&ev.sender_id[..8]),
-                                "Sync request received"
-                            );
-                        }
-                        harbor_core::ProtocolEvent::SyncResponse(ev) => {
-                            info!(
-                                topic = %hex::encode(&ev.topic_id[..8]),
-                                size = ev.data.len(),
-                                "Sync response received"
-                            );
-                        }
-                        harbor_core::ProtocolEvent::StreamRequest(ev) => {
-                            info!(
-                                request_id = %hex::encode(&ev.request_id[..8]),
-                                name = %ev.name,
-                                "Stream request received"
-                            );
-                            // Auto-accept stream requests (for simulation testing)
-                            let p = protocol.clone();
-                            let rid = ev.request_id;
-                            tokio::spawn(async move {
-                                match p.accept_stream(&rid).await {
-                                    Ok(()) => info!(request_id = %hex::encode(&rid[..8]), "Stream auto-accepted"),
-                                    Err(e) => warn!(request_id = %hex::encode(&rid[..8]), error = %e, "Stream auto-accept failed"),
-                                }
-                            });
-                        }
-                        harbor_core::ProtocolEvent::StreamAccepted(ev) => {
-                            info!(request_id = %hex::encode(&ev.request_id[..8]), "Stream accepted");
-                        }
-                        harbor_core::ProtocolEvent::StreamRejected(ev) => {
-                            info!(request_id = %hex::encode(&ev.request_id[..8]), "Stream rejected");
-                        }
-                        harbor_core::ProtocolEvent::StreamEnded(ev) => {
-                            // Clean up stored track producer
-                            active_tracks.write().await.remove(&ev.request_id);
-                            info!(request_id = %hex::encode(&ev.request_id[..8]), "Stream ended");
-                        }
-                        harbor_core::ProtocolEvent::DmReceived(ev) => {
-                            let content = String::from_utf8_lossy(&ev.payload);
-                            info!(
-                                sender = %hex::encode(&ev.sender_id[..8]),
-                                size = ev.payload.len(),
-                                content = %content,
-                                "DM received"
-                            );
-                        }
-                        harbor_core::ProtocolEvent::StreamConnected(ev) => {
-                            info!(
-                                request_id = %hex::encode(&ev.request_id[..8]),
-                                is_source = ev.is_source,
-                                "MOQ stream connected"
-                            );
-                            // Source side: create broadcast and wait for subscriber's track request
-                            if ev.is_source {
-                                let p = protocol.clone();
-                                let rid = ev.request_id;
-                                let tracks = active_tracks.clone();
-                                tokio::spawn(async move {
-                                    match p.publish_to_stream(&rid, "test").await {
-                                        Ok(mut broadcast) => {
-                                            // Wait for the destination to subscribe to the "data" track.
-                                            // The subscriber creates a TrackProducer via requested_track()
-                                            // which we use to write frames.
-                                            if let Some(track) = broadcast.requested_track().await {
-                                                info!(
-                                                    request_id = %hex::encode(&rid[..8]),
-                                                    track = %track.info.name,
-                                                    "Track requested by subscriber"
-                                                );
-                                                tracks.write().await.insert(rid, track);
-                                            } else {
-                                                warn!(request_id = %hex::encode(&rid[..8]), "Broadcast closed before track requested");
-                                            }
-                                            // Keep broadcast alive for the stream's lifetime
-                                            let _broadcast = broadcast;
-                                            tokio::sync::Notify::new().notified().await;
-                                        }
-                                        Err(e) => {
-                                            warn!(request_id = %hex::encode(&rid[..8]), error = %e, "Failed to create broadcast for stream");
-                                        }
-                                    }
-                                });
-                            }
-                            // Destination side: spawn consumer to read incoming data
-                            if !ev.is_source {
-                                let p = protocol.clone();
-                                let rid = ev.request_id;
-                                tokio::spawn(async move {
-                                    // Retry consume_stream — the source may not have announced
-                                    // the broadcast yet when we first connect
-                                    let broadcast = {
-                                        let mut result = None;
-                                        for attempt in 0..10 {
-                                            match p.consume_stream(&rid, "test").await {
-                                                Ok(b) => { result = Some(b); break; }
-                                                Err(_) if attempt < 9 => {
-                                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                                }
-                                                Err(e) => {
-                                                    warn!(request_id = %hex::encode(&rid[..8]), error = %e, "Stream consume failed after retries");
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                        result.unwrap()
-                                    };
-                                    info!(request_id = %hex::encode(&rid[..8]), "Stream consumer started");
-                                    let mut track = broadcast.subscribe_track(&moq_lite::Track { name: "data".to_string(), priority: 0 });
-                                    while let Ok(Some(mut group)) = track.next_group().await {
-                                        while let Ok(Some(frame)) = group.read_frame().await {
-                                            info!(
-                                                request_id = %hex::encode(&rid[..8]),
-                                                size = frame.len(),
-                                                data = %hex::encode(&frame),
-                                                "Stream data received"
-                                            );
-                                        }
-                                    }
-                                    info!(request_id = %hex::encode(&rid[..8]), "Stream consumer ended");
-                                });
-                            }
-                        }
-                        harbor_core::ProtocolEvent::DmSyncUpdate(ev) => {
-                            info!(sender = %hex::encode(&ev.sender_id[..8]), "DM sync update received");
-                        }
-                        harbor_core::ProtocolEvent::DmSyncRequest(ev) => {
-                            info!(sender = %hex::encode(&ev.sender_id[..8]), "DM sync request received");
-                        }
-                        harbor_core::ProtocolEvent::DmSyncResponse(ev) => {
-                            info!(sender = %hex::encode(&ev.sender_id[..8]), "DM sync response received");
-                        }
-                        harbor_core::ProtocolEvent::DmFileAnnounced(ev) => {
-                            info!(
-                                sender = %hex::encode(&ev.sender_id[..8]),
-                                hash = %hex::encode(&ev.hash[..8]),
-                                name = %ev.display_name,
-                                "DM file announced"
-                            );
-                        }
-                    }
-                }
-            } else {
-                std::future::pending::<()>().await
-            }
-        } => {}
+        _ = events::run_event_loop(protocol.clone(), active_tracks.clone()) => {}
     }
 
     // Cleanup
     if let Some(handle) = api_handle {
         handle.abort();
     }
-    
+
     println!("Shutting down...");
     protocol.stop().await;
     println!("✅ Done");
 }
-
-/// Parse bootstrap argument: "endpoint_id:relay_url" or just "endpoint_id"
-fn parse_bootstrap_arg(arg: &str) -> Option<(String, Option<String>)> {
-    if arg.contains(':') {
-        // Could be endpoint_id:relay_url or just a relay URL with colons
-        // Endpoint IDs are 64 hex chars, so check if first part looks like one
-        if let Some(colon_pos) = arg.find(':') {
-            let first_part = &arg[..colon_pos];
-            // Check if it looks like a hex endpoint ID (64 chars, all hex)
-            if first_part.len() == 64 && first_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                let endpoint_id = first_part.to_string();
-                let relay_url = arg[colon_pos + 1..].to_string();
-                return Some((endpoint_id, Some(relay_url)));
-            }
-        }
-    }
-    
-    // Just an endpoint ID (or invalid format)
-    if arg.len() == 64 && arg.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some((arg.to_string(), None))
-    } else {
-        eprintln!("⚠️  Invalid bootstrap format: {}...", &arg[..arg.len().min(32)]);
-        eprintln!("   Expected: <64-hex-endpoint-id> or <64-hex-endpoint-id>:<relay-url>");
-        None
-    }
-}
-
-// ============================================================================
-// Simple HTTP API Server
-// ============================================================================
-
-async fn run_api_server(protocol: Arc<Protocol>, bootstrap_info: Arc<BootstrapInfo>, port: u16, active_tracks: ActiveTracks) {
-    use tokio::net::TcpListener;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let listener = match TcpListener::bind(format!("127.0.0.1:{}", port)).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("❌ Failed to bind API port {}: {}", port, e);
-            return;
-        }
-    };
-
-    info!(port = port, "API server started");
-
-    loop {
-        let (mut socket, _) = match listener.accept().await {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        let protocol = protocol.clone();
-        let bootstrap = bootstrap_info.clone();
-        let tracks = active_tracks.clone();
-
-        tokio::spawn(async move {
-            // Buffer large enough for max message (512KB) + HTTP headers
-            let mut buf = vec![0u8; 600 * 1024];
-            let mut total_read = 0;
-            
-            // Read until we have complete HTTP request (headers + body based on Content-Length)
-            loop {
-                let n = match socket.read(&mut buf[total_read..]).await {
-                    Ok(0) => break, // EOF
-                    Ok(n) => n,
-                    Err(_) => return,
-                };
-                total_read += n;
-                
-                // Check if we have complete headers (look for \r\n\r\n or \n\n)
-                let data = &buf[..total_read];
-                let header_end = if let Some(pos) = find_header_end(data) {
-                    pos
-                } else {
-                    // Keep reading until we have headers
-                    if total_read >= buf.len() {
-                        warn!("API: request too large");
-                        return;
-                    }
-                    continue;
-                };
-                
-                // Parse Content-Length from headers
-                let headers = String::from_utf8_lossy(&data[..header_end]);
-                let content_length = parse_content_length(&headers);
-                
-                // Calculate expected total size
-                let expected_total = header_end + content_length;
-                
-                if total_read >= expected_total {
-                    break; // We have everything
-                }
-                
-                // Need more data, keep reading
-                if total_read >= buf.len() {
-                    warn!("API: request too large");
-                    return;
-                }
-            }
-            
-            if total_read == 0 {
-                return;
-            }
-
-            let request = String::from_utf8_lossy(&buf[..total_read]);
-            let response = handle_request(&protocol, &bootstrap, &tracks, &request).await;
-            
-            if let Err(e) = socket.write_all(response.as_bytes()).await {
-                warn!("API: failed to send response: {}", e);
-                return;
-            }
-            
-            // Explicitly shutdown the socket to signal EOF to curl
-            if let Err(e) = socket.shutdown().await {
-                trace!("API: socket shutdown error (expected): {}", e);
-            }
-        });
-    }
-}
-
-/// Find the end of HTTP headers (position after \r\n\r\n or \n\n)
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    // Look for \r\n\r\n
-    for i in 0..data.len().saturating_sub(3) {
-        if &data[i..i+4] == b"\r\n\r\n" {
-            return Some(i + 4);
-        }
-    }
-    // Look for \n\n (curl sometimes uses this)
-    for i in 0..data.len().saturating_sub(1) {
-        if &data[i..i+2] == b"\n\n" {
-            return Some(i + 2);
-        }
-    }
-    None
-}
-
-/// Parse Content-Length header from HTTP headers string
-fn parse_content_length(headers: &str) -> usize {
-    for line in headers.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("content-length:") {
-            if let Some(value) = line.split(':').nth(1) {
-                if let Ok(len) = value.trim().parse::<usize>() {
-                    return len;
-                }
-            }
-        }
-    }
-    0 // No Content-Length header means no body
-}
-
-async fn handle_request(protocol: &Protocol, bootstrap: &BootstrapInfo, active_tracks: &ActiveTracks, request: &str) -> String {
-    let lines: Vec<&str> = request.lines().collect();
-    if lines.is_empty() {
-        return http_response(400, "Bad Request");
-    }
-
-    let first_line = lines[0];
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return http_response(400, "Bad Request");
-    }
-
-    let method = parts[0];
-    let path = parts[1];
-
-    // Extract body (after empty line)
-    let body = request
-        .split("\r\n\r\n")
-        .nth(1)
-        .or_else(|| request.split("\n\n").nth(1))
-        .unwrap_or("")
-        .trim();
-
-    // Handle /api/invite/:topic path
-    if method == "GET" && path.starts_with("/api/invite/") {
-        let topic_hex = &path[12..]; // Strip "/api/invite/"
-        return handle_get_invite(protocol, topic_hex).await;
-    }
-
-    // Handle /api/share/status/:hash path
-    if method == "GET" && path.starts_with("/api/share/status/") {
-        let hash_hex = &path[18..]; // Strip "/api/share/status/"
-        return handle_share_status(protocol, hash_hex).await;
-    }
-
-    // Handle /api/share/blobs/:topic path
-    if method == "GET" && path.starts_with("/api/share/blobs/") {
-        let topic_hex = &path[17..]; // Strip "/api/share/blobs/"
-        return handle_list_blobs(protocol, topic_hex).await;
-    }
-    
-    match (method, path) {
-        ("POST", "/api/topic") => handle_create_topic(protocol).await,
-        ("POST", "/api/join") => handle_join_topic(protocol, body).await,
-        ("POST", "/api/send") => handle_send(protocol, body).await,
-        ("POST", "/api/dm") => handle_send_dm(protocol, body).await,
-        ("POST", "/api/share") => handle_share_file(protocol, body).await,
-        ("POST", "/api/share/pull") => handle_share_pull(protocol, body).await,
-        ("POST", "/api/share/export") => handle_share_export(protocol, body).await,
-        // Sync transport endpoints
-        ("POST", "/api/sync/update") => handle_sync_update(protocol, body).await,
-        ("POST", "/api/sync/request") => handle_sync_request(protocol, body).await,
-        ("POST", "/api/sync/respond") => handle_sync_respond(protocol, body).await,
-        // DM sync endpoints
-        ("POST", "/api/dm/sync/update") => handle_dm_sync_update(protocol, body).await,
-        ("POST", "/api/dm/sync/request") => handle_dm_sync_request(protocol, body).await,
-        ("POST", "/api/dm/sync/respond") => handle_dm_sync_respond(protocol, body).await,
-        // DM share endpoints
-        ("POST", "/api/dm/share") => handle_dm_share(protocol, body).await,
-        // DM stream endpoints
-        ("POST", "/api/dm/stream/request") => handle_dm_stream_request(protocol, body).await,
-        // Stream endpoints
-        ("POST", "/api/stream/request") => handle_stream_request(protocol, body).await,
-        ("POST", "/api/stream/accept") => handle_stream_accept(protocol, body).await,
-        ("POST", "/api/stream/reject") => handle_stream_reject(protocol, body).await,
-        ("POST", "/api/stream/publish") => handle_stream_publish(active_tracks, body).await,
-        ("POST", "/api/stream/end") => handle_stream_end(protocol, body).await,
-        ("GET", "/api/stats") => handle_stats(protocol).await,
-        ("GET", "/api/topics") => handle_list_topics(protocol).await,
-        ("GET", "/api/bootstrap") => handle_bootstrap(bootstrap),
-        ("GET", "/api/health") => http_response(200, "OK"),
-        _ => http_response(404, "Not Found"),
-    }
-}
-
-async fn handle_create_topic(protocol: &Protocol) -> String {
-    match protocol.create_topic().await {
-        Ok(invite) => {
-            match invite.to_hex() {
-                Ok(hex) => http_response(200, &hex),
-                Err(e) => http_response(500, &format!("Failed to encode invite: {}", e)),
-            }
-        }
-        Err(e) => http_response(500, &format!("Failed to create topic: {}", e)),
-    }
-}
-
-async fn handle_get_invite(protocol: &Protocol, topic_hex: &str) -> String {
-    let topic_bytes = match hex::decode(topic_hex.trim()) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
-    };
-
-    match protocol.get_invite(&topic_bytes).await {
-        Ok(invite) => {
-            match invite.to_hex() {
-                Ok(hex) => http_response(200, &hex),
-                Err(e) => http_response(500, &format!("Failed to encode invite: {}", e)),
-            }
-        }
-        Err(e) => http_response(404, &format!("Topic not found: {}", e)),
-    }
-}
-
-async fn handle_join_topic(protocol: &Protocol, body: &str) -> String {
-    let invite_hex = body.trim();
-    if invite_hex.is_empty() {
-        return http_response(400, "Missing invite in body");
-    }
-
-    match TopicInvite::from_hex(invite_hex) {
-        Ok(invite) => {
-            let topic_hex = hex::encode(invite.topic_id);
-            match protocol.join_topic(invite).await {
-                Ok(()) => http_response(200, &format!("Joined topic: {}", topic_hex)),
-                Err(e) => http_response(500, &format!("Failed to join: {}", e)),
-            }
-        }
-        Err(e) => http_response(400, &format!("Invalid invite: {}", e)),
-    }
-}
-
-async fn handle_send(protocol: &Protocol, body: &str) -> String {
-    info!("API: handle_send started, body_len={}", body.len());
-    
-    // Expect JSON: {"topic": "hex...", "message": "text"}
-    let topic_start = body.find("\"topic\"");
-    let msg_start = body.find("\"message\"");
-    
-    if topic_start.is_none() || msg_start.is_none() {
-        warn!("API: JSON parse failed - missing 'topic' or 'message' field, body_len={}", body.len());
-        return http_response(400, "Expected JSON with 'topic' and 'message' fields");
-    }
-
-    let topic_hex = extract_json_string(body, "topic");
-    let message = extract_json_string(body, "message");
-
-    if topic_hex.is_none() || message.is_none() {
-        warn!("API: JSON parse failed - couldn't extract values, body_len={}", body.len());
-        return http_response(400, "Failed to parse topic or message");
-    }
-
-    let topic_hex = topic_hex.unwrap();
-    let message = message.unwrap();
-
-    let topic_bytes = match hex::decode(&topic_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
-    };
-
-    info!("API: calling protocol.send()");
-    let result = match protocol.send(harbor_core::Target::Topic(topic_bytes), message.as_bytes()).await {
-        Ok(()) => {
-            info!("API: protocol.send() completed successfully");
-            http_response(200, "Message sent")
-        }
-        Err(e) => {
-            info!("API: protocol.send() failed: {}", e);
-            http_response(500, &format!("Failed to send: {}", e))
-        }
-    };
-    info!("API: handle_send returning response");
-    result
-}
-
-/// POST /api/dm - Send a direct message
-/// Body: {"recipient":"hex64","message":"text"}
-async fn handle_send_dm(protocol: &Protocol, body: &str) -> String {
-    let recipient_hex = extract_json_string(body, "recipient");
-    let message = extract_json_string(body, "message");
-
-    if recipient_hex.is_none() || message.is_none() {
-        return http_response(400, "Expected JSON with 'recipient' and 'message' fields");
-    }
-
-    let recipient_hex = recipient_hex.unwrap();
-    let message = message.unwrap();
-
-    let recipient_bytes = match hex::decode(&recipient_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid recipient ID (must be 64 hex chars)"),
-    };
-
-    match protocol.send(harbor_core::Target::Dm(recipient_bytes), message.as_bytes()).await {
-        Ok(()) => {
-            info!("API: DM sent to {}", &recipient_hex[..16]);
-            http_response(200, "DM sent")
-        }
-        Err(e) => {
-            info!("API: DM send failed: {}", e);
-            http_response(500, &format!("Failed to send DM: {}", e))
-        }
-    }
-}
-
-async fn handle_stats(protocol: &Protocol) -> String {
-    match protocol.get_stats().await {
-        Ok(stats) => {
-            // dht_nodes = in-memory (real-time, accurate)
-            // dht_nodes_db = database (persisted, may lag behind)
-            let json = format!(
-                r#"{{"endpoint_id":"{}","dht_nodes":{},"dht_nodes_db":{},"topics":{},"harbor_packets":{}}}"#,
-                stats.identity.endpoint_id,
-                stats.dht.in_memory_nodes,
-                stats.dht.total_nodes,
-                stats.topics.subscribed_count,
-                stats.harbor.packets_stored
-            );
-            http_json_response(200, &json)
-        }
-        Err(e) => http_response(500, &format!("Failed to get stats: {}", e)),
-    }
-}
-
-async fn handle_list_topics(protocol: &Protocol) -> String {
-    match protocol.list_topics().await {
-        Ok(topics) => {
-            let hex_topics: Vec<String> = topics.iter().map(|t| hex::encode(t)).collect();
-            let json = format!(r#"{{"topics":[{}]}}"#, 
-                hex_topics.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(",")
-            );
-            http_json_response(200, &json)
-        }
-        Err(e) => http_response(500, &format!("Failed to list topics: {}", e)),
-    }
-}
-
-fn handle_bootstrap(bootstrap: &BootstrapInfo) -> String {
-    let relay = bootstrap.relay_url.as_deref().unwrap_or("");
-    let json = format!(
-        r#"{{"endpoint_id":"{}","relay_url":"{}","bootstrap_arg":"{}:{}"}}"#,
-        bootstrap.endpoint_id,
-        relay,
-        bootstrap.endpoint_id,
-        relay
-    );
-    http_json_response(200, &json)
-}
-
-// ============================================================================
-// Share API Handlers
-// ============================================================================
-
-/// Share a file with a topic
-/// POST /api/share
-/// Body: {"topic": "hex...", "file_path": "/path/to/file"}
-async fn handle_share_file(protocol: &Protocol, body: &str) -> String {
-    let topic_hex = match extract_json_string(body, "topic") {
-        Some(t) => t,
-        None => return http_response(400, "Missing 'topic' field"),
-    };
-    
-    let file_path = match extract_json_string(body, "file_path") {
-        Some(f) => f,
-        None => return http_response(400, "Missing 'file_path' field"),
-    };
-
-    let topic_bytes = match hex::decode(&topic_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
-    };
-
-    match protocol.share_file(harbor_core::Target::Topic(topic_bytes), &file_path).await {
-        Ok(hash) => {
-            let json = format!(r#"{{"hash":"{}","status":"announced"}}"#, hex::encode(hash));
-            http_json_response(200, &json)
-        }
-        Err(e) => http_response(500, &format!("Failed to share file: {}", e)),
-    }
-}
-
-/// Get share status for a blob
-/// GET /api/share/status/:hash
-async fn handle_share_status(protocol: &Protocol, hash_hex: &str) -> String {
-    let hash_bytes = match hex::decode(hash_hex.trim()) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid hash (must be 64 hex chars)"),
-    };
-
-    match protocol.get_share_status(&hash_bytes).await {
-        Ok(status) => {
-            let state_str = match status.state {
-                harbor_core::data::BlobState::Partial => "partial",
-                harbor_core::data::BlobState::Complete => "complete",
-            };
-            let json = format!(
-                r#"{{"hash":"{}","display_name":"{}","total_size":{},"total_chunks":{},"chunks_complete":{},"state":"{}","section_count":{}}}"#,
-                hex::encode(status.hash),
-                status.display_name,
-                status.total_size,
-                status.total_chunks,
-                status.chunks_complete,
-                state_str,
-                status.num_sections
-            );
-            http_json_response(200, &json)
-        }
-        Err(e) => http_response(404, &format!("Blob not found: {}", e)),
-    }
-}
-
-/// List blobs for a topic
-/// GET /api/share/blobs/:topic
-async fn handle_list_blobs(protocol: &Protocol, topic_hex: &str) -> String {
-    let topic_bytes = match hex::decode(topic_hex.trim()) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
-    };
-
-    match protocol.list_topic_blobs(&topic_bytes).await {
-        Ok(blobs) => {
-            let blob_jsons: Vec<String> = blobs.iter().map(|b| {
-                let state_str = match b.state {
-                    harbor_core::data::BlobState::Partial => "partial",
-                    harbor_core::data::BlobState::Complete => "complete",
-                };
-                format!(
-                    r#"{{"hash":"{}","display_name":"{}","total_size":{},"total_chunks":{},"state":"{}"}}"#,
-                    hex::encode(b.hash),
-                    b.display_name,
-                    b.total_size,
-                    b.total_chunks,
-                    state_str
-                )
-            }).collect();
-            let json = format!(r#"{{"blobs":[{}]}}"#, blob_jsons.join(","));
-            http_json_response(200, &json)
-        }
-        Err(e) => http_response(500, &format!("Failed to list blobs: {}", e)),
-    }
-}
-
-/// Request to pull a blob
-/// POST /api/share/pull
-/// Body: {"hash": "hex..."}
-async fn handle_share_pull(protocol: &Protocol, body: &str) -> String {
-    let hash_hex = match extract_json_string(body, "hash") {
-        Some(h) => h,
-        None => return http_response(400, "Missing 'hash' field"),
-    };
-
-    let hash_bytes = match hex::decode(&hash_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid hash (must be 64 hex chars)"),
-    };
-
-    match protocol.request_blob(&hash_bytes).await {
-        Ok(()) => http_response(200, "Pull started"),
-        Err(e) => http_response(500, &format!("Failed to start pull: {}", e)),
-    }
-}
-
-/// Export a completed blob to a file
-/// POST /api/share/export
-/// Body: {"hash": "hex...", "dest_path": "/path/to/output"}
-async fn handle_share_export(protocol: &Protocol, body: &str) -> String {
-    let hash_hex = match extract_json_string(body, "hash") {
-        Some(h) => h,
-        None => return http_response(400, "Missing 'hash' field"),
-    };
-    
-    let dest_path = match extract_json_string(body, "dest_path") {
-        Some(p) => p,
-        None => return http_response(400, "Missing 'dest_path' field"),
-    };
-
-    let hash_bytes = match hex::decode(&hash_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid hash (must be 64 hex chars)"),
-    };
-
-    match protocol.export_blob(&hash_bytes, &dest_path).await {
-        Ok(()) => http_response(200, "Exported successfully"),
-        Err(e) => http_response(500, &format!("Failed to export: {}", e)),
-    }
-}
-
-// ============================================================================
-// Sync API Handlers
-// ============================================================================
-
-/// Send a sync update to all topic members
-/// POST /api/sync/update
-/// Body: {"topic": "hex...", "data": "hex-encoded-crdt-update"}
-async fn handle_sync_update(protocol: &Protocol, body: &str) -> String {
-    let topic_hex = match extract_json_string(body, "topic") {
-        Some(t) => t,
-        None => return http_response(400, "Missing 'topic' field"),
-    };
-
-    let data_hex = match extract_json_string(body, "data") {
-        Some(d) => d,
-        None => return http_response(400, "Missing 'data' field"),
-    };
-
-    let topic_bytes = match hex::decode(&topic_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
-    };
-
-    let data = match hex::decode(&data_hex) {
-        Ok(d) => d,
-        Err(_) => return http_response(400, "Invalid hex data"),
-    };
-
-    match protocol.send_sync_update(harbor_core::Target::Topic(topic_bytes), data).await {
-        Ok(()) => http_response(200, "Sync update sent"),
-        Err(e) => http_response(500, &format!("Failed to send sync update: {}", e)),
-    }
-}
-
-/// Request sync state from topic members
-/// POST /api/sync/request
-/// Body: {"topic": "hex..."}
-async fn handle_sync_request(protocol: &Protocol, body: &str) -> String {
-    let topic_hex = match extract_json_string(body, "topic") {
-        Some(t) => t,
-        None => return http_response(400, "Missing 'topic' field"),
-    };
-
-    let topic_bytes = match hex::decode(&topic_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
-    };
-
-    match protocol.request_sync(harbor_core::Target::Topic(topic_bytes)).await {
-        Ok(()) => http_response(200, "Sync request sent"),
-        Err(e) => http_response(500, &format!("Failed to request sync: {}", e)),
-    }
-}
-
-/// Respond to a sync request with current state
-/// POST /api/sync/respond
-/// Body: {"topic": "hex...", "requester": "hex...", "data": "hex-encoded-crdt-snapshot"}
-async fn handle_sync_respond(protocol: &Protocol, body: &str) -> String {
-    let topic_hex = match extract_json_string(body, "topic") {
-        Some(t) => t,
-        None => return http_response(400, "Missing 'topic' field"),
-    };
-
-    let requester_hex = match extract_json_string(body, "requester") {
-        Some(r) => r,
-        None => return http_response(400, "Missing 'requester' field"),
-    };
-
-    let data_hex = match extract_json_string(body, "data") {
-        Some(d) => d,
-        None => return http_response(400, "Missing 'data' field"),
-    };
-
-    let topic_bytes = match hex::decode(&topic_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
-    };
-
-    let requester_bytes = match hex::decode(&requester_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid requester ID (must be 64 hex chars)"),
-    };
-
-    let data = match hex::decode(&data_hex) {
-        Ok(d) => d,
-        Err(_) => return http_response(400, "Invalid hex data"),
-    };
-
-    match protocol.respond_sync(harbor_core::Target::Topic(topic_bytes), &requester_bytes, data).await {
-        Ok(()) => http_response(200, "Sync response sent"),
-        Err(e) => http_response(500, &format!("Failed to respond to sync: {}", e)),
-    }
-}
-
-// ============================================================================
-// DM Sync API Handlers
-// ============================================================================
-
-/// POST /api/dm/sync/update
-/// Body: {"recipient": "hex64", "data": "hex-encoded-crdt-update"}
-async fn handle_dm_sync_update(protocol: &Protocol, body: &str) -> String {
-    let recipient_hex = match extract_json_string(body, "recipient") {
-        Some(r) => r,
-        None => return http_response(400, "Missing 'recipient' field"),
-    };
-
-    let data_hex = match extract_json_string(body, "data") {
-        Some(d) => d,
-        None => return http_response(400, "Missing 'data' field"),
-    };
-
-    let recipient_bytes = match hex::decode(&recipient_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid recipient ID (must be 64 hex chars)"),
-    };
-
-    let data = match hex::decode(&data_hex) {
-        Ok(d) => d,
-        Err(_) => return http_response(400, "Invalid hex data"),
-    };
-
-    match protocol.send_sync_update(harbor_core::Target::Dm(recipient_bytes), data).await {
-        Ok(()) => http_response(200, "DM sync update sent"),
-        Err(e) => http_response(500, &format!("Failed to send DM sync update: {}", e)),
-    }
-}
-
-/// POST /api/dm/sync/request
-/// Body: {"recipient": "hex64"}
-async fn handle_dm_sync_request(protocol: &Protocol, body: &str) -> String {
-    let recipient_hex = match extract_json_string(body, "recipient") {
-        Some(r) => r,
-        None => return http_response(400, "Missing 'recipient' field"),
-    };
-
-    let recipient_bytes = match hex::decode(&recipient_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid recipient ID (must be 64 hex chars)"),
-    };
-
-    match protocol.request_sync(harbor_core::Target::Dm(recipient_bytes)).await {
-        Ok(()) => http_response(200, "DM sync request sent"),
-        Err(e) => http_response(500, &format!("Failed to send DM sync request: {}", e)),
-    }
-}
-
-/// POST /api/dm/sync/respond
-/// Body: {"recipient": "hex64", "data": "hex-encoded-crdt-snapshot"}
-async fn handle_dm_sync_respond(protocol: &Protocol, body: &str) -> String {
-    let recipient_hex = match extract_json_string(body, "recipient") {
-        Some(r) => r,
-        None => return http_response(400, "Missing 'recipient' field"),
-    };
-
-    let data_hex = match extract_json_string(body, "data") {
-        Some(d) => d,
-        None => return http_response(400, "Missing 'data' field"),
-    };
-
-    let recipient_bytes = match hex::decode(&recipient_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid recipient ID (must be 64 hex chars)"),
-    };
-
-    let data = match hex::decode(&data_hex) {
-        Ok(d) => d,
-        Err(_) => return http_response(400, "Invalid hex data"),
-    };
-
-    // requester_id is unused for DM target, pass recipient as placeholder
-    match protocol.respond_sync(harbor_core::Target::Dm(recipient_bytes), &recipient_bytes, data).await {
-        Ok(()) => http_response(200, "DM sync response sent"),
-        Err(e) => http_response(500, &format!("Failed to send DM sync response: {}", e)),
-    }
-}
-
-// ============================================================================
-// DM Share API Handlers
-// ============================================================================
-
-/// POST /api/dm/share
-/// Body: {"recipient": "hex64", "file_path": "/path/to/file"}
-async fn handle_dm_share(protocol: &Protocol, body: &str) -> String {
-    let recipient_hex = match extract_json_string(body, "recipient") {
-        Some(r) => r,
-        None => return http_response(400, "Missing 'recipient' field"),
-    };
-
-    let file_path = match extract_json_string(body, "file_path") {
-        Some(p) => p,
-        None => return http_response(400, "Missing 'file_path' field"),
-    };
-
-    let recipient_bytes = match hex::decode(&recipient_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid recipient ID (must be 64 hex chars)"),
-    };
-
-    match protocol.share_file(harbor_core::Target::Dm(recipient_bytes), &file_path).await {
-        Ok(hash) => {
-            let json = format!(r#"{{"hash":"{}","status":"announced"}}"#, hex::encode(hash));
-            http_json_response(200, &json)
-        }
-        Err(e) => http_response(500, &format!("Failed to share DM file: {}", e)),
-    }
-}
-
-// ============================================================================
-// Stream API Handlers
-// ============================================================================
-
-/// Request a DM stream to a peer (peer-to-peer, no topic)
-/// POST /api/dm/stream/request
-/// Body: {"peer": "hex...", "name": "stream-name"}
-async fn handle_dm_stream_request(protocol: &Protocol, body: &str) -> String {
-    let peer_hex = match extract_json_string(body, "peer") {
-        Some(p) => p,
-        None => return http_response(400, "Missing 'peer' field"),
-    };
-    let name = extract_json_string(body, "name").unwrap_or_else(|| "test".to_string());
-
-    let peer_bytes = match hex::decode(&peer_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid peer ID"),
-    };
-
-    match protocol.dm_stream_request(&peer_bytes, &name).await {
-        Ok(request_id) => {
-            let json = format!(r#"{{"request_id":"{}"}}"#, hex::encode(request_id));
-            http_json_response(200, &json)
-        }
-        Err(e) => http_response(500, &format!("Failed to request DM stream: {}", e)),
-    }
-}
-
-/// Request a stream to a peer
-/// POST /api/stream/request
-/// Body: {"topic": "hex...", "peer": "hex...", "name": "stream-name"}
-async fn handle_stream_request(protocol: &Protocol, body: &str) -> String {
-    let topic_hex = match extract_json_string(body, "topic") {
-        Some(t) => t,
-        None => return http_response(400, "Missing 'topic' field"),
-    };
-    let peer_hex = match extract_json_string(body, "peer") {
-        Some(p) => p,
-        None => return http_response(400, "Missing 'peer' field"),
-    };
-    let name = extract_json_string(body, "name").unwrap_or_else(|| "test".to_string());
-
-    let topic_bytes = match hex::decode(&topic_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid topic ID"),
-    };
-    let peer_bytes = match hex::decode(&peer_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid peer ID"),
-    };
-
-    match protocol.request_stream(&topic_bytes, &peer_bytes, &name, vec![]).await {
-        Ok(request_id) => {
-            let json = format!(r#"{{"request_id":"{}"}}"#, hex::encode(request_id));
-            http_json_response(200, &json)
-        }
-        Err(e) => http_response(500, &format!("Failed to request stream: {}", e)),
-    }
-}
-
-/// Accept a stream request
-/// POST /api/stream/accept
-/// Body: {"request_id": "hex..."}
-async fn handle_stream_accept(protocol: &Protocol, body: &str) -> String {
-    let id_hex = match extract_json_string(body, "request_id") {
-        Some(h) => h,
-        None => return http_response(400, "Missing 'request_id' field"),
-    };
-    let id_bytes = match hex::decode(&id_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid request_id"),
-    };
-
-    match protocol.accept_stream(&id_bytes).await {
-        Ok(()) => http_response(200, "Stream accepted"),
-        Err(e) => http_response(500, &format!("Failed to accept stream: {}", e)),
-    }
-}
-
-/// Reject a stream request
-/// POST /api/stream/reject
-/// Body: {"request_id": "hex...", "reason": "optional reason"}
-async fn handle_stream_reject(protocol: &Protocol, body: &str) -> String {
-    let id_hex = match extract_json_string(body, "request_id") {
-        Some(h) => h,
-        None => return http_response(400, "Missing 'request_id' field"),
-    };
-    let reason = extract_json_string(body, "reason");
-
-    let id_bytes = match hex::decode(&id_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid request_id"),
-    };
-
-    match protocol.reject_stream(&id_bytes, reason).await {
-        Ok(()) => http_response(200, "Stream rejected"),
-        Err(e) => http_response(500, &format!("Failed to reject stream: {}", e)),
-    }
-}
-
-/// Publish data to an active stream
-/// POST /api/stream/publish
-/// Body: {"request_id": "hex...", "data": "hex-encoded-payload"}
-async fn handle_stream_publish(active_tracks: &ActiveTracks, body: &str) -> String {
-    let id_hex = match extract_json_string(body, "request_id") {
-        Some(h) => h,
-        None => return http_response(400, "Missing 'request_id' field"),
-    };
-    let data_hex = match extract_json_string(body, "data") {
-        Some(d) => d,
-        None => return http_response(400, "Missing 'data' field"),
-    };
-
-    let id_bytes = match hex::decode(&id_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid request_id"),
-    };
-    let data = match hex::decode(&data_hex) {
-        Ok(d) => d,
-        Err(_) => return http_response(400, "Invalid hex data"),
-    };
-
-    // Write frame to the existing track (created on StreamConnected)
-    let mut tracks = active_tracks.write().await;
-    match tracks.get_mut(&id_bytes) {
-        Some(track) => {
-            track.write_frame(bytes::Bytes::from(data));
-            info!(
-                request_id = %hex::encode(&id_bytes[..8]),
-                "Stream data published"
-            );
-            http_response(200, "Published")
-        }
-        None => http_response(404, "No active track for this stream — not connected yet?"),
-    }
-}
-
-/// End an active stream
-/// POST /api/stream/end
-/// Body: {"request_id": "hex..."}
-async fn handle_stream_end(protocol: &Protocol, body: &str) -> String {
-    let id_hex = match extract_json_string(body, "request_id") {
-        Some(h) => h,
-        None => return http_response(400, "Missing 'request_id' field"),
-    };
-    let id_bytes = match hex::decode(&id_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => return http_response(400, "Invalid request_id"),
-    };
-
-    match protocol.end_stream(&id_bytes).await {
-        Ok(()) => http_response(200, "Stream ended"),
-        Err(e) => http_response(500, &format!("Failed to end stream: {}", e)),
-    }
-}
-
-fn http_response(status: u16, body: &str) -> String {
-    let status_text = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "Unknown",
-    };
-    format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        status, status_text, body.len(), body
-    )
-}
-
-fn http_json_response(status: u16, body: &str) -> String {
-    let status_text = match status {
-        200 => "OK",
-        _ => "Error",
-    };
-    format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        status, status_text, body.len(), body
-    )
-}
-
-/// Simple JSON string extraction (avoids adding serde_json dependency)
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\"", key);
-    let start = json.find(&pattern)?;
-    let after_key = &json[start + pattern.len()..];
-    
-    let colon_pos = after_key.find(':')?;
-    let after_colon = &after_key[colon_pos + 1..];
-    
-    let quote_start = after_colon.find('"')?;
-    let after_quote = &after_colon[quote_start + 1..];
-    
-    let mut end = 0;
-    let chars: Vec<char> = after_quote.chars().collect();
-    while end < chars.len() {
-        if chars[end] == '"' && (end == 0 || chars[end - 1] != '\\') {
-            break;
-        }
-        end += 1;
-    }
-    
-    if end < chars.len() {
-        Some(after_quote[..end].to_string())
-    } else {
-        None
-    }
-}
-

@@ -63,7 +63,7 @@ pub fn insert_blob(
     total_size: u64,
     num_sections: u8,
 ) -> rusqlite::Result<()> {
-    let total_chunks = ((total_size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
+    let total_chunks = total_size.div_ceil(CHUNK_SIZE) as u32;
 
     conn.execute(
         "INSERT OR REPLACE INTO blobs
@@ -138,7 +138,7 @@ pub fn init_blob_sections(
     num_sections: u8,
     total_chunks: u32,
 ) -> rusqlite::Result<()> {
-    let chunks_per_section = (total_chunks + num_sections as u32 - 1) / num_sections as u32;
+    let chunks_per_section = total_chunks.div_ceil(num_sections as u32);
     
     for section_id in 0..num_sections {
         let chunk_start = section_id as u32 * chunks_per_section;

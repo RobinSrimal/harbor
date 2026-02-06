@@ -16,15 +16,19 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::info;
 
-use crate::data::{get_or_create_identity, start_db, LocalIdentity};
+use crate::data::{
+    add_topic_member, ensure_self_in_peers, get_or_create_identity, start_db,
+    subscribe_dm_topic, LocalIdentity,
+};
+use crate::network::control::ControlService;
 use crate::network::dht::DhtService;
 use crate::data::BlobStore;
+use crate::network::gate::ConnectionGate;
 use crate::network::harbor::HarborService;
 use crate::network::stream::StreamService;
 use crate::network::send::SendService;
 use crate::network::share::{ShareConfig, ShareService};
 use crate::network::sync::SyncService;
-use crate::network::topic::TopicService;
 
 use super::config::ProtocolConfig;
 use super::error::ProtocolError;
@@ -33,16 +37,6 @@ use super::stats::StatsService;
 
 /// Maximum message size (512 KB)
 pub const MAX_MESSAGE_SIZE: usize = 512 * 1024;
-
-/// Retention period for Harbor packets (90 days)
-///
-/// How long packets are stored on Harbor Nodes before expiration.
-#[allow(dead_code)]
-pub const RETENTION_PERIOD: Duration = Duration::from_secs(90 * 24 * 60 * 60);
-
-/// Retention period in seconds (for database queries)
-#[allow(dead_code)]
-pub const RETENTION_PERIOD_SECS: i64 = 90 * 24 * 60 * 60;
 
 /// The Harbor Protocol
 ///
@@ -68,8 +62,8 @@ pub struct Protocol {
     pub(crate) sync_service: Arc<SyncService>,
     /// Stream service
     pub(crate) stream_service: Arc<StreamService>,
-    /// Topic service for topic lifecycle
-    pub(crate) topic_service: Arc<TopicService>,
+    /// Control service for lifecycle management (includes topic lifecycle)
+    pub(crate) control_service: Arc<ControlService>,
     /// Stats service for monitoring
     pub(crate) stats_service: Arc<StatsService>,
     /// Event sender (for app notifications: messages, file events, etc.)
@@ -99,16 +93,12 @@ impl Protocol {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "harbor_protocol.db".to_string());
 
-        // Generate or use provided key - convert to hex string for passphrase
+        // Require a database encryption key — the caller must always provide one
         use zeroize::Zeroize;
-        let mut db_key = config.db_key.unwrap_or_else(|| {
-            // Generate a random key using rand
-            use rand::{rngs::OsRng, Rng};
-            let mut key = [0u8; 32];
-            OsRng.fill(&mut key);
-            key
-        });
-        let passphrase = hex::encode(&db_key);
+        let mut db_key = config.db_key.ok_or_else(|| {
+            ProtocolError::Database("db_key is required — set it via ProtocolConfig::with_db_key()".to_string())
+        })?;
+        let passphrase = hex::encode(db_key);
         db_key.zeroize();
 
         let db = start_db(&db_path, &passphrase).map_err(|e| ProtocolError::Database(e.to_string()))?;
@@ -124,6 +114,16 @@ impl Protocol {
             "Loaded identity from database"
         );
 
+        // Ensure our own endpoint is in the peers table (needed for FK constraints)
+        ensure_self_in_peers(&db, &identity.public_key)
+            .map_err(|e| ProtocolError::Database(e.to_string()))?;
+
+        // Register our endpoint_id as a "DM topic" for unified harbor node discovery
+        // This allows the pull loop to handle DMs and regular topics identically
+        // Uses raw endpoint_id as harbor_id (NOT hashed) to match how DM packets are stored
+        let _ = subscribe_dm_topic(&db, &identity.public_key);
+        let _ = add_topic_member(&db, &identity.public_key, &identity.public_key);
+
         // Create Iroh endpoint with our identity's secret key
         let secret_key = iroh::SecretKey::from_bytes(&identity.private_key);
         let endpoint = Endpoint::builder()
@@ -136,6 +136,9 @@ impl Protocol {
 
         // Wrap db in Arc<Mutex<>> for sharing with services
         let db = Arc::new(Mutex::new(db));
+
+        // Initialize connection gate (loads DM connections and topic membership from DB)
+        let connection_gate = Arc::new(ConnectionGate::new(db.clone(), identity.public_key).await);
 
         // Initialize DHT
         let dht_service = DhtService::start(
@@ -157,18 +160,10 @@ impl Protocol {
             identity.clone(),
             db.clone(),
             event_tx.clone(),
+            Some(connection_gate.clone()),
         ));
 
         // Initialize Harbor service
-        let pow_config = if config.enable_pow {
-            crate::resilience::PoWConfig {
-                enabled: true,
-                difficulty_bits: config.pow_difficulty,
-                ..crate::resilience::PoWConfig::default()
-            }
-        } else {
-            crate::resilience::PoWConfig::disabled()
-        };
         let storage_config = crate::resilience::StorageConfig {
             max_total_bytes: config.max_storage_bytes,
             ..crate::resilience::StorageConfig::default()
@@ -179,7 +174,6 @@ impl Protocol {
             db.clone(),
             event_tx.clone(),
             dht_service.clone(),
-            pow_config,
             storage_config,
             Duration::from_secs(config.harbor_connect_timeout_secs),
             Duration::from_secs(config.harbor_response_timeout_secs),
@@ -205,6 +199,7 @@ impl Protocol {
             blob_store,
             ShareConfig::default(),
             Some(send_service.clone()),
+            Some(connection_gate.clone()),
         ));
 
         // Initialize Sync service
@@ -214,6 +209,7 @@ impl Protocol {
             db.clone(),
             event_tx.clone(),
             send_service.clone(),
+            Some(connection_gate.clone()),
         ));
 
         // Initialize Stream service
@@ -223,18 +219,11 @@ impl Protocol {
             db.clone(),
             event_tx.clone(),
             send_service.clone(),
+            Some(connection_gate.clone()),
         );
 
         // Give SendService access to StreamService (for routing stream signaling)
         send_service.set_stream_service(stream_service.clone()).await;
-
-        // Initialize Topic service
-        let topic_service = Arc::new(TopicService::new(
-            endpoint.clone(),
-            identity.clone(),
-            db.clone(),
-            send_service.clone(),
-        ));
 
         // Initialize Stats service
         let stats_service = Arc::new(StatsService::new(
@@ -243,6 +232,15 @@ impl Protocol {
             db.clone(),
             dht_service.clone(),
         ));
+
+        // Initialize Control service
+        let control_service = ControlService::new(
+            endpoint.clone(),
+            identity.clone(),
+            db.clone(),
+            event_tx.clone(),
+            Some(connection_gate.clone()),
+        );
 
         // Build the iroh Router for ALPN-based connection dispatch
         let router = crate::handlers::build_router(
@@ -253,6 +251,7 @@ impl Protocol {
             share_service.clone(),
             sync_service.clone(),
             stream_service.clone(),
+            control_service.clone(),
         );
 
         let protocol = Self {
@@ -266,7 +265,7 @@ impl Protocol {
             share_service,
             sync_service,
             stream_service,
-            topic_service,
+            control_service,
             stats_service,
             event_tx,
             event_rx: Arc::new(RwLock::new(Some(event_rx))),
@@ -372,8 +371,8 @@ mod tests {
     use super::*;
     use crate::data::schema::create_all_tables;
     use crate::data::{
-        add_topic_member, get_all_topics, get_topic_members, remove_topic_member, subscribe_topic,
-        unsubscribe_topic,
+        add_topic_member, ensure_peer_exists, get_all_topics, get_topic_members, remove_topic_member,
+        subscribe_topic, subscribe_topic_with_admin, unsubscribe_topic,
     };
     use crate::protocol::TopicInvite;
 
@@ -391,7 +390,7 @@ mod tests {
     #[test]
     fn test_protocol_config() {
         let config = ProtocolConfig::for_testing();
-        assert!(!config.enable_pow);
+        assert!(config.bootstrap_nodes.is_empty());
     }
 
     #[test]
@@ -530,23 +529,30 @@ mod tests {
     fn test_topic_invite_from_db() {
         let conn = setup_test_db();
         let topic_id = test_id(42);
+        let admin_id = test_id(1);
         let members = vec![test_id(1), test_id(2)];
 
-        // Setup
-        subscribe_topic(&conn, &topic_id).unwrap();
+        // Ensure peers exist for FK constraints
+        for m in &members {
+            ensure_peer_exists(&conn, m).unwrap();
+        }
+
+        // Setup - use subscribe_topic_with_admin
+        subscribe_topic_with_admin(&conn, &topic_id, &admin_id).unwrap();
         for m in &members {
             add_topic_member(&conn, &topic_id, m).unwrap();
         }
 
         // Create invite from DB state
         let db_members = get_topic_members(&conn, &topic_id).unwrap();
-        let invite = TopicInvite::new(topic_id, db_members);
+        let invite = TopicInvite::new(topic_id, admin_id, db_members);
 
         // Serialize and restore
         let hex = invite.to_hex().unwrap();
         let restored = TopicInvite::from_hex(&hex).unwrap();
 
         assert_eq!(restored.topic_id, topic_id);
+        assert_eq!(restored.admin_id, Some(admin_id));
         assert_eq!(restored.members.len(), 2);
     }
 }

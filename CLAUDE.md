@@ -72,6 +72,7 @@ Each service:
 | `ShareService` | `harbor/share/0` | File chunk distribution |
 | `DhtService` | `harbor/dht/0` | Peer discovery, routing table |
 | `SyncService` | `harbor/sync/0` | Large sync responses (point-to-point) |
+| `ControlService` | `harbor/control/0` | Peer lifecycle, topic invites, membership |
 
 **Service interaction example** (send message):
 1. User calls `protocol.send(topic, data)`
@@ -113,6 +114,7 @@ Tasks are spawned by Protocol on startup and run independently. They use Service
 - `harbor.rs` - Harbor packet storage
 - `dht.rs` - DHT routing table persistence
 - `blobs.rs` - File chunk storage (filesystem)
+- `control/` - Connection list, connect tokens, pending invites
 
 **Key principle**: Data layer is accessed by Services, not directly by Protocol or handlers.
 
@@ -147,6 +149,7 @@ Harbor uses multiple ALPN identifiers for different protocols:
 | `harbor/dht/0` | DhtService | Peer discovery, routing |
 | `harbor/share/0` | ShareService | File chunk requests, bitfields |
 | `harbor/sync/0` | SyncService | **Sync responses ONLY** (large snapshots) |
+| `harbor/control/0` | ControlService | Peer connections, topic invites, membership |
 
 ## Key Files
 
@@ -158,6 +161,8 @@ Harbor uses multiple ALPN identifiers for different protocols:
 | `core/src/network/dht/` | DhtService, Kademlia DHT |
 | `core/src/network/share/` | ShareService, file distribution |
 | `core/src/network/sync/` | SyncService, large sync responses |
+| `core/src/network/control/` | ControlService, peer lifecycle, invites |
+| `core/src/resilience/proof_of_work.rs` | Adaptive PoW with per-peer scaling |
 | `core/src/handlers/incoming/` | Incoming connection handlers (per ALPN) |
 | `core/src/handlers/outgoing/` | Outgoing operations |
 | `core/src/tasks/` | Background tasks (pull, replication, persist) |
@@ -169,17 +174,19 @@ See [SIMULATIONS.md](SIMULATIONS.md) for details on running simulations and test
 
 ## Common Gotchas
 
-1. **Don't confuse Send protocol with SYNC_ALPN**: Sync updates/requests use Send, sync responses use SYNC_ALPN
-2. **TopicMessage is only for Send protocol**: Direct SYNC_ALPN uses raw format `[topic_id][type_byte][data]`
-3. **Harbor sync vs CRDT sync**: "Harbor sync" = syncing packets between harbor nodes; "CRDT sync" = application-level state synchronization
-4. **Size limits**: Send protocol has 512KB limit; SYNC_ALPN has no limit (designed for large snapshots)
-5. **The protocol is CRDT-agnostic**: Applications choose their own CRDT library (Loro, Yjs, Automerge, etc.)
-6. **Protocol is just API**: Don't add business logic to Protocol - it delegates to Services
-7. **Services call services**: Services communicate directly, not through Protocol
-8. **Encryption layers**: QUIC provides transport encryption; packet encryption is only needed for Harbor storage
+1. **NO BACKWARDS COMPATIBILITY NEEDED**: This is pre-production. Do NOT use `#[serde(default)]`, `Option<T>` for compat, or mention "backward compatible" in plans. Just change the wire format directly.
+2. **Don't confuse Send protocol with SYNC_ALPN**: Sync updates/requests use Send, sync responses use SYNC_ALPN
+3. **TopicMessage is only for Send protocol**: Direct SYNC_ALPN uses raw format `[topic_id][type_byte][data]`
+4. **Harbor sync vs CRDT sync**: "Harbor sync" = syncing packets between harbor nodes; "CRDT sync" = application-level state synchronization
+5. **Size limits**: Send protocol has 512KB limit; SYNC_ALPN has no limit (designed for large snapshots)
+6. **The protocol is CRDT-agnostic**: Applications choose their own CRDT library (Loro, Yjs, Automerge, etc.)
+7. **Protocol is just API**: Don't add business logic to Protocol - it delegates to Services
+8. **Services call services**: Services communicate directly, not through Protocol
+9. **Encryption layers**: QUIC provides transport encryption; packet encryption is only needed for Harbor storage
 
 ## Development Notes
 
+- **Status: Pre-production development** - Breaking changes are acceptable, no backwards compatibility required
 - The codebase uses async Rust with Tokio
 - QUIC transport via `iroh` library
 - SQLite for local persistence (identity, topics, harbor packets, etc.)

@@ -8,7 +8,7 @@
 //! - Incoming connection handling (via handle_send_connection)
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -22,27 +22,21 @@ use crate::data::dht::peer::{get_peer_relay_info, update_peer_relay_url, current
 use crate::data::send::store_outgoing_packet;
 use crate::data::send::acknowledge_receipt as db_acknowledge_receipt;
 use crate::data::{
-    get_topic_members, LocalIdentity, WILDCARD_RECIPIENT,
-    add_topic_member, remove_topic_member, mark_pulled,
+    get_topic_members, LocalIdentity, WILDCARD_RECIPIENT, mark_pulled,
     get_blob, insert_blob, init_blob_sections, record_peer_can_seed, CHUNK_SIZE,
 };
 use crate::network::connect;
-use crate::network::harbor::protocol::HarborPacketType;
-use crate::network::send::topic_messages::TopicMessage;
-use crate::network::send::topic_messages::get_verification_mode_from_payload;
-use crate::resilience::{PoWConfig, verify_pow};
+use crate::network::gate::ConnectionGate;
+use crate::network::packet::TopicMessage;
 use crate::security::{
     SendPacket, PacketError, verify_and_decrypt_packet, verify_and_decrypt_packet_with_mode,
-    send_target_id, VerificationMode,
-    create_dm_packet, verify_and_decrypt_dm_packet,
+    VerificationMode, verify_and_decrypt_dm_packet,
 };
-use super::incoming::{ProcessError, ProcessResult, PacketSource, ReceiveError};
+use super::incoming::{ProcessError, ProcessResult, PacketSource};
 
 /// Options controlling how a packet is sent and stored
 #[derive(Debug, Clone)]
 pub struct SendOptions {
-    /// Packet type for harbor storage semantics
-    pub packet_type: HarborPacketType,
     /// If true, skip storing in outgoing table (direct delivery only, no harbor replication)
     pub skip_harbor: bool,
     /// Override default harbor TTL. None = use default (PACKET_LIFETIME_SECS)
@@ -52,7 +46,6 @@ pub struct SendOptions {
 impl Default for SendOptions {
     fn default() -> Self {
         Self {
-            packet_type: HarborPacketType::Content,
             skip_harbor: false,
             ttl: None,
         }
@@ -68,16 +61,9 @@ impl SendOptions {
     /// Direct-only delivery (no harbor storage)
     pub fn direct_only() -> Self {
         Self {
-            packet_type: HarborPacketType::Content,
             skip_harbor: true,
             ttl: None,
         }
-    }
-
-    /// With a specific packet type
-    pub fn with_packet_type(mut self, packet_type: HarborPacketType) -> Self {
-        self.packet_type = packet_type;
-        self
     }
 
     /// With a custom harbor TTL
@@ -88,10 +74,17 @@ impl SendOptions {
 }
 use crate::network::rpc::ExistingConnection;
 use crate::protocol::{MemberInfo, ProtocolEvent};
-use crate::security::{
-    create_packet, harbor_id_from_topic,
-};
-use super::protocol::{SEND_ALPN, Receipt, DeliverPacket, SendRpcProtocol};
+use crate::resilience::{ProofOfWork, PoWConfig, PoWResult, PoWVerifier, build_context};
+use crate::security::harbor_id_from_topic;
+use super::protocol::{SEND_ALPN, Receipt, DeliverTopic, DeliverDm, SendRpcProtocol};
+
+/// Generate a random packet ID (32 bytes)
+fn generate_packet_id() -> [u8; 32] {
+    let mut id = [0u8; 32];
+    use rand::RngCore;
+    rand::rngs::OsRng.fill_bytes(&mut id);
+    id
+}
 
 /// Error during Send operations
 #[derive(Debug)]
@@ -170,6 +163,10 @@ pub struct SendService {
     connections: Arc<RwLock<HashMap<EndpointId, Connection>>>,
     /// Stream service for stream signaling routing (set after construction)
     stream_service: RwLock<Option<Arc<crate::network::stream::StreamService>>>,
+    /// Connection gate for peer authorization
+    connection_gate: Option<Arc<ConnectionGate>>,
+    /// Proof of Work verifier for abuse prevention
+    pow_verifier: StdMutex<PoWVerifier>,
 }
 
 impl SendService {
@@ -179,6 +176,7 @@ impl SendService {
         identity: Arc<LocalIdentity>,
         db: Arc<Mutex<DbConnection>>,
         event_tx: mpsc::Sender<ProtocolEvent>,
+        connection_gate: Option<Arc<ConnectionGate>>,
     ) -> Self {
         Self {
             endpoint,
@@ -188,7 +186,14 @@ impl SendService {
             send_timeout: Duration::from_secs(5),
             connections: Arc::new(RwLock::new(HashMap::new())),
             stream_service: RwLock::new(None),
+            connection_gate,
+            pow_verifier: StdMutex::new(PoWVerifier::new(PoWConfig::send())),
         }
+    }
+
+    /// Get the connection gate (for handler to check peer authorization)
+    pub fn connection_gate(&self) -> Option<&Arc<ConnectionGate>> {
+        self.connection_gate.as_ref()
     }
 
     /// Set the StreamService reference (called after both services are constructed)
@@ -219,6 +224,48 @@ impl SendService {
     /// Get the database connection
     pub fn db(&self) -> &Arc<Mutex<DbConnection>> {
         &self.db
+    }
+
+    // ========== PoW Verification ==========
+
+    /// Verify Proof of Work for a topic delivery
+    ///
+    /// Context for Send PoW (topics): `sender_id || harbor_id`
+    /// Uses ByteBased scaling with gentle progression.
+    pub fn verify_topic_pow(
+        &self,
+        pow: &ProofOfWork,
+        sender_id: &[u8; 32],
+        harbor_id: &[u8; 32],
+        payload_len: usize,
+    ) -> bool {
+        let context = build_context(&[sender_id, harbor_id]);
+        let verifier = self.pow_verifier.lock().unwrap();
+
+        matches!(
+            verifier.verify(pow, &context, sender_id, Some(payload_len as u64)),
+            PoWResult::Allowed
+        )
+    }
+
+    /// Verify Proof of Work for a DM delivery
+    ///
+    /// Context for Send PoW (DMs): `sender_id || recipient_id`
+    /// Uses ByteBased scaling with gentle progression.
+    pub fn verify_dm_pow(
+        &self,
+        pow: &ProofOfWork,
+        sender_id: &[u8; 32],
+        recipient_id: &[u8; 32],
+        payload_len: usize,
+    ) -> bool {
+        let context = build_context(&[sender_id, recipient_id]);
+        let verifier = self.pow_verifier.lock().unwrap();
+
+        matches!(
+            verifier.verify(pow, &context, sender_id, Some(payload_len as u64)),
+            PoWResult::Allowed
+        )
     }
 
     // ========== Outgoing ==========
@@ -268,7 +315,7 @@ impl SendService {
         }
 
         // Encode as Content message and send
-        let content_msg = super::topic_messages::TopicMessage::Content(payload.to_vec());
+        let content_msg = crate::network::packet::TopicMessage::Content(payload.to_vec());
         let encoded_payload = content_msg.encode();
 
         self.send_to_topic(topic_id, &encoded_payload, &recipients, SendOptions::content())
@@ -285,7 +332,7 @@ impl SendService {
         recipient_id: &[u8; 32],
         payload: &[u8],
     ) -> Result<(), SendError> {
-        use crate::network::send::dm_messages::DmMessage;
+        use crate::network::packet::DmMessage;
 
         let encoded = DmMessage::Content(payload.to_vec()).encode();
         self.send_to_dm(recipient_id, &encoded).await
@@ -297,26 +344,22 @@ impl SendService {
     /// (e.g., FileAnnouncement, CanSeed, SyncUpdate).
     /// Callers encode the DmMessage themselves.
     ///
-    /// Encrypts with ECDH using the recipient's public key.
-    /// The packet is delivered directly and stored on harbor using the
-    /// recipient's endpoint_id as harbor_id.
+    /// # Flow:
+    /// 1. Store RAW payload in outgoing_packets (no encryption)
+    /// 2. Deliver raw payload directly via QUIC TLS (DeliverDm)
+    /// 3. Harbor replication task will seal() undelivered packets later
+    ///
+    /// The packet is stored using the recipient's endpoint_id as harbor_id.
     pub async fn send_to_dm(
         &self,
         recipient_id: &[u8; 32],
         encoded_payload: &[u8],
     ) -> Result<(), SendError> {
-        let packet = create_dm_packet(
-            &self.identity.private_key,
-            &self.identity.public_key,
-            recipient_id,
-            encoded_payload,
-        )?;
-
-        let packet_id = packet.packet_id;
+        // Generate packet_id for tracking (seal() will use this when creating the sealed packet)
+        let packet_id = generate_packet_id();
         let harbor_id = *recipient_id;
-        let packet_bytes = packet.to_bytes().map_err(SendError::PacketCreation)?;
 
-        // Store in outgoing table for harbor replication
+        // Store RAW payload in outgoing table (no encryption - seal() called during harbor replication)
         {
             let mut db = self.db.lock().await;
             store_outgoing_packet(
@@ -324,15 +367,15 @@ impl SendService {
                 &packet_id,
                 recipient_id, // use recipient_id as "topic_id" for DM tracking
                 &harbor_id,
-                &packet_bytes,
+                encoded_payload,  // Raw payload, not encrypted
                 &[*recipient_id],
-                HarborPacketType::Content as u8,
+                0, // packet_type is embedded in payload now
             ).map_err(|e| SendError::Database(e.to_string()))?;
         }
 
-        // Try direct delivery
+        // Try direct delivery via DeliverDm (raw payload over QUIC TLS)
         let member = MemberInfo::new(*recipient_id);
-        match self.deliver_to_member(&member, packet).await {
+        match self.deliver_dm_to_member(&member, encoded_payload, packet_id).await {
             Ok(receipt) => {
                 trace!(
                     recipient = hex::encode(recipient_id),
@@ -357,6 +400,11 @@ impl SendService {
     /// Lower-level entry point for all send operations.
     /// Takes pre-encoded TopicMessage bytes and delivers to all recipients.
     ///
+    /// # Flow:
+    /// 1. Store RAW payload in outgoing_packets (no encryption)
+    /// 2. Deliver raw payload directly via QUIC TLS (DeliverTopic)
+    /// 3. Harbor replication task will seal() undelivered packets later
+    ///
     /// # Arguments
     /// * `topic_id` - The topic to send on
     /// * `encoded_payload` - Pre-encoded TopicMessage bytes (from TopicMessage::encode())
@@ -376,20 +424,11 @@ impl SendService {
         // Extract endpoint IDs for storage
         let recipient_ids: Vec<[u8; 32]> = recipients.iter().map(|m| m.endpoint_id).collect();
 
-        // Create the packet
-        let packet = create_packet(
-            topic_id,
-            &self.identity.private_key,
-            &self.identity.public_key,
-            encoded_payload,
-        )?;
-
-        let packet_id = packet.packet_id;
+        // Generate packet_id for tracking (seal() will use this when creating the sealed packet)
+        let packet_id = generate_packet_id();
         let harbor_id = harbor_id_from_topic(topic_id);
-        let packet_bytes = packet.to_bytes()
-            .map_err(SendError::PacketCreation)?;
 
-        // Store in outgoing table for tracking (unless skip_harbor)
+        // Store RAW payload in outgoing table (no encryption - seal() called during harbor replication)
         if !options.skip_harbor {
             let mut db = self.db.lock().await;
             store_outgoing_packet(
@@ -397,9 +436,9 @@ impl SendService {
                 &packet_id,
                 topic_id,
                 &harbor_id,
-                &packet_bytes,
+                encoded_payload,  // Raw payload, not encrypted
                 &recipient_ids,
-                options.packet_type as u8,
+                0, // packet_type is embedded in payload now
             ).map_err(|e| SendError::Database(e.to_string()))?;
         }
 
@@ -426,15 +465,17 @@ impl SendService {
         info!(
             packet_id = hex::encode(&packet_id[..8]),
             recipient_count = actual_recipients.len(),
-            "sending to recipients in parallel"
+            "sending to recipients in parallel (direct delivery)"
         );
 
-        // Deliver to all recipients in parallel via irpc RPC
+        // Deliver RAW payload to all recipients in parallel via DeliverTopic
         let send_futures = actual_recipients.iter().map(|member| {
-            let packet_clone = packet.clone();
             let member = (*member).clone();
+            let topic_id = *topic_id;
+            let payload = encoded_payload.to_vec();
+            let pkt_id = packet_id;
             async move {
-                let result = self.deliver_to_member(&member, packet_clone).await;
+                let result = self.deliver(&member, &topic_id, &payload, pkt_id).await;
                 (member.endpoint_id, result)
             }
         });
@@ -457,7 +498,7 @@ impl SendService {
                     debug!(
                         recipient = hex::encode(endpoint_id),
                         error = %err_msg,
-                        "delivery failed"
+                        "direct delivery failed, will rely on harbor"
                     );
                 }
             }
@@ -479,13 +520,21 @@ impl SendService {
 
     // ========== Transport: irpc RPC delivery ==========
 
-    /// Deliver a packet to a single member via irpc RPC
+    /// Deliver raw topic payload directly to a member via DeliverTopic
     ///
-    /// Opens a connection, sends DeliverPacket RPC, receives Receipt inline.
-    async fn deliver_to_member(
+    /// Uses QUIC TLS for encryption - no app-level crypto needed.
+    /// This is the fast path for direct delivery to online peers.
+    ///
+    /// The message includes a membership proof (BLAKE3 hash) that proves
+    /// we know the topic_id without revealing it on the wire.
+    ///
+    /// The packet_id is included for deduplication - same ID is used for Harbor storage.
+    async fn deliver(
         &self,
         member: &MemberInfo,
-        packet: crate::security::SendPacket,
+        topic_id: &[u8; 32],
+        payload: &[u8],
+        packet_id: [u8; 32],
     ) -> Result<Receipt, SendError> {
         let node_id = EndpointId::from_bytes(&member.endpoint_id)
             .map_err(|e| SendError::Connection(e.to_string()))?;
@@ -493,12 +542,68 @@ impl SendService {
         // Get or create connection (relay URL looked up from peers table)
         let conn = self.get_connection(node_id).await?;
 
-        // Send via irpc RPC - DeliverPacket request, Receipt response
+        // Compute harbor_id and membership proof
+        let harbor_id = harbor_id_from_topic(topic_id);
+        let sender_id = self.endpoint_id();
+        let membership_proof = super::protocol::create_membership_proof(topic_id, &harbor_id, &sender_id);
+
+        // Compute PoW (context: sender_id || harbor_id)
+        let pow_context = build_context(&[&sender_id, &harbor_id]);
+        let pow = ProofOfWork::compute(&pow_context, PoWConfig::send().base_difficulty)
+            .ok_or_else(|| SendError::Send("failed to compute PoW".to_string()))?;
+
+        // Send via irpc RPC - DeliverTopic request, Receipt response
         let client = irpc::Client::<SendRpcProtocol>::boxed(
             ExistingConnection::new(&conn)
         );
         let receipt = client
-            .rpc(DeliverPacket { packet })
+            .rpc(DeliverTopic {
+                packet_id,
+                harbor_id,
+                membership_proof,
+                payload: payload.to_vec(),
+                pow,
+            })
+            .await
+            .map_err(|e| SendError::Send(e.to_string()))?;
+
+        Ok(receipt)
+    }
+
+    /// Deliver raw DM payload directly to a member via DeliverDm
+    ///
+    /// Uses QUIC TLS for encryption - no app-level crypto needed.
+    /// This is the fast path for direct delivery to online peers.
+    ///
+    /// The packet_id is included for deduplication - same ID is used for Harbor storage.
+    async fn deliver_dm_to_member(
+        &self,
+        member: &MemberInfo,
+        payload: &[u8],
+        packet_id: [u8; 32],
+    ) -> Result<Receipt, SendError> {
+        let node_id = EndpointId::from_bytes(&member.endpoint_id)
+            .map_err(|e| SendError::Connection(e.to_string()))?;
+
+        // Get or create connection (relay URL looked up from peers table)
+        let conn = self.get_connection(node_id).await?;
+
+        // Compute PoW (context: sender_id || recipient_id)
+        let sender_id = self.endpoint_id();
+        let pow_context = build_context(&[&sender_id, &member.endpoint_id]);
+        let pow = ProofOfWork::compute(&pow_context, PoWConfig::send().base_difficulty)
+            .ok_or_else(|| SendError::Send("failed to compute PoW".to_string()))?;
+
+        // Send via irpc RPC - DeliverDm request, Receipt response
+        let client = irpc::Client::<SendRpcProtocol>::boxed(
+            ExistingConnection::new(&conn)
+        );
+        let receipt = client
+            .rpc(DeliverDm {
+                packet_id,
+                payload: payload.to_vec(),
+                pow,
+            })
             .await
             .map_err(|e| SendError::Send(e.to_string()))?;
 
@@ -568,7 +673,379 @@ impl SendService {
         }
     }
 
-    // ========== Incoming ==========
+    // ========== Incoming (Direct Delivery - Raw Payloads) ==========
+
+    /// Process a raw topic message payload received via direct delivery (DeliverTopic)
+    ///
+    /// The payload is already plaintext (QUIC TLS provides encryption).
+    /// No decryption or MAC/signature verification needed.
+    ///
+    /// The packet_id is provided by the sender for deduplication.
+    pub async fn process_raw_topic_payload_with_id(
+        &self,
+        topic_id: &[u8; 32],
+        sender_id: [u8; 32],
+        payload: &[u8],
+        packet_id: [u8; 32],
+    ) -> Result<ProcessResult, ProcessError> {
+        let db = &self.db;
+        let event_tx = &self.event_tx;
+        let stream = self.stream_service().await;
+
+        info!(payload_len = payload.len(), "processing raw topic payload (direct delivery)");
+
+        // Parse topic message (payload is already plaintext)
+        let topic_msg = match TopicMessage::decode(payload) {
+            Ok(msg) => {
+                info!(msg_type = ?msg.packet_type(), "decoded TopicMessage from raw payload");
+                Some(msg)
+            }
+            Err(e) => {
+                warn!(
+                    topic = %hex::encode(&topic_id[..8]),
+                    error = %e,
+                    payload_len = payload.len(),
+                    first_byte = ?payload.first(),
+                    "failed to decode TopicMessage from raw payload"
+                );
+                None
+            }
+        };
+
+        // Handle the decoded message (same logic as process_incoming_packet, but no packet)
+        self.handle_topic_message(topic_id, sender_id, &topic_msg, &packet_id, db, event_tx, stream.as_ref()).await
+    }
+
+    /// Process a raw DM payload received via direct delivery (DeliverDm)
+    ///
+    /// The payload is already plaintext (QUIC TLS provides encryption).
+    /// No decryption or signature verification needed.
+    ///
+    /// The packet_id is provided by the sender for deduplication.
+    pub async fn process_raw_dm_payload_with_id(
+        &self,
+        sender_id: [u8; 32],
+        payload: &[u8],
+        packet_id: [u8; 32],
+    ) -> Result<ProcessResult, ProcessError> {
+        use crate::network::packet::{
+            DmMessage, StreamSignalingMessage, is_dm_message_type, is_stream_signaling_type
+        };
+
+        let our_id = self.endpoint_id();
+        info!(payload_len = payload.len(), "processing raw DM payload (direct delivery)");
+
+        if payload.is_empty() {
+            return Err(ProcessError::VerificationFailed("empty payload".to_string()));
+        }
+
+        let type_byte = payload[0];
+
+        // Check if this is a stream signaling message (0x50-0x5F)
+        if is_stream_signaling_type(type_byte) {
+            let stream_msg = StreamSignalingMessage::decode(payload)
+                .map_err(|e| ProcessError::VerificationFailed(format!("Stream signaling decode: {}", e)))?;
+
+            if let Some(stream_svc) = self.stream_service().await {
+                stream_svc.handle_stream_signaling_msg(&stream_msg, sender_id).await;
+            }
+
+            return Ok(ProcessResult {
+                receipt: super::protocol::Receipt::new(packet_id, our_id),
+                content_payload: None,
+            });
+        }
+
+        // Check if this is a DM message (0x40-0x4F)
+        if !is_dm_message_type(type_byte) {
+            return Err(ProcessError::VerificationFailed(format!("unknown type byte: 0x{:02x}", type_byte)));
+        }
+
+        // Decode DmMessage (payload is already plaintext)
+        let dm_msg = DmMessage::decode(payload)
+            .map_err(|e| ProcessError::VerificationFailed(format!("DM decode: {}", e)))?;
+
+        // Handle the decoded DM message
+        match dm_msg {
+            DmMessage::Content(data) => {
+                let event = crate::protocol::ProtocolEvent::DmReceived(
+                    crate::protocol::DmReceivedEvent {
+                        sender_id,
+                        payload: data,
+                        timestamp: crate::data::current_timestamp(),
+                    },
+                );
+                let _ = self.event_tx.send(event).await;
+            }
+            DmMessage::SyncUpdate(msg) => {
+                let event = crate::protocol::ProtocolEvent::DmSyncUpdate(
+                    crate::protocol::DmSyncUpdateEvent {
+                        sender_id,
+                        data: msg.data,
+                    },
+                );
+                let _ = self.event_tx.send(event).await;
+            }
+            DmMessage::SyncRequest => {
+                let event = crate::protocol::ProtocolEvent::DmSyncRequest(
+                    crate::protocol::DmSyncRequestEvent {
+                        sender_id,
+                    },
+                );
+                let _ = self.event_tx.send(event).await;
+            }
+            DmMessage::FileAnnouncement(msg) => {
+                let event = crate::protocol::ProtocolEvent::DmFileAnnounced(
+                    crate::protocol::DmFileAnnouncedEvent {
+                        sender_id,
+                        hash: msg.hash,
+                        display_name: msg.display_name,
+                        total_size: msg.total_size,
+                        total_chunks: msg.total_chunks,
+                        num_sections: msg.num_sections,
+                        timestamp: crate::data::current_timestamp(),
+                    },
+                );
+                let _ = self.event_tx.send(event).await;
+            }
+            // DM stream request — route to StreamService
+            DmMessage::StreamRequest(_) => {
+                if let Some(stream_svc) = self.stream_service().await {
+                    stream_svc.handle_dm_signaling(&dm_msg, sender_id).await;
+                }
+            }
+        }
+
+        Ok(ProcessResult {
+            receipt: super::protocol::Receipt::new(packet_id, our_id),
+            content_payload: None,
+        })
+    }
+
+    /// Helper: Handle a decoded TopicMessage
+    ///
+    /// Used by both `process_incoming_packet` (sealed) and `process_raw_topic_payload` (direct).
+    async fn handle_topic_message(
+        &self,
+        topic_id: &[u8; 32],
+        sender_id: [u8; 32],
+        topic_msg: &Option<TopicMessage>,
+        packet_id: &[u8; 32],
+        db: &Arc<Mutex<DbConnection>>,
+        event_tx: &mpsc::Sender<ProtocolEvent>,
+        stream: Option<&Arc<crate::network::stream::StreamService>>,
+    ) -> Result<ProcessResult, ProcessError> {
+        let our_id = self.endpoint_id();
+
+        // Handle SyncUpdate - emit event for app to handle
+        if let Some(TopicMessage::SyncUpdate(sync_msg)) = topic_msg {
+            info!(
+                topic = %hex::encode(&topic_id[..8]),
+                sender = %hex::encode(&sender_id[..8]),
+                size = sync_msg.data.len(),
+                "SYNC: received update from peer"
+            );
+
+            let event = crate::protocol::ProtocolEvent::SyncUpdate(crate::protocol::SyncUpdateEvent {
+                topic_id: *topic_id,
+                sender_id,
+                data: sync_msg.data.clone(),
+            });
+            let _ = event_tx.send(event).await;
+
+            {
+                let db_lock = db.lock().await;
+                let _ = mark_pulled(&db_lock, topic_id, packet_id);
+            }
+
+            return Ok(ProcessResult {
+                receipt: super::protocol::Receipt::new(*packet_id, our_id),
+                content_payload: None,
+            });
+        }
+
+        // Handle SyncRequest - emit event for app to respond
+        if let Some(TopicMessage::SyncRequest) = topic_msg {
+            info!(
+                topic = %hex::encode(&topic_id[..8]),
+                sender = %hex::encode(&sender_id[..8]),
+                "SYNC: received sync request from peer"
+            );
+
+            let event = crate::protocol::ProtocolEvent::SyncRequest(crate::protocol::SyncRequestEvent {
+                topic_id: *topic_id,
+                sender_id,
+            });
+            let _ = event_tx.send(event).await;
+
+            {
+                let db_lock = db.lock().await;
+                let _ = mark_pulled(&db_lock, topic_id, packet_id);
+            }
+
+            return Ok(ProcessResult {
+                receipt: super::protocol::Receipt::new(*packet_id, our_id),
+                content_payload: None,
+            });
+        }
+
+        // Handle control messages
+        if let Some(msg) = topic_msg {
+            let db_lock = db.lock().await;
+            match msg {
+                TopicMessage::FileAnnouncement(ann) => {
+                    if ann.source_id != sender_id {
+                        warn!(
+                            source = %hex::encode(ann.source_id),
+                            sender = %hex::encode(sender_id),
+                            "file announcement source doesn't match packet sender - ignoring"
+                        );
+                    } else {
+                        info!(
+                            hash = hex::encode(&ann.hash[..8]),
+                            source = hex::encode(&ann.source_id[..8]),
+                            name = ann.display_name,
+                            size = ann.total_size,
+                            chunks = ann.total_chunks,
+                            sections = ann.num_sections,
+                            "SHARE: Received file announcement"
+                        );
+
+                        let existing = get_blob(&db_lock, &ann.hash);
+                        if existing.is_ok() && existing.as_ref().unwrap().is_some() {
+                            debug!(
+                                hash = hex::encode(&ann.hash[..8]),
+                                "blob already known, skipping insert"
+                            );
+                        } else {
+                            if let Err(e) = insert_blob(
+                                &db_lock,
+                                &ann.hash,
+                                topic_id, // scope_id: topic scopes the blob
+                                &ann.source_id,
+                                &ann.display_name,
+                                ann.total_size,
+                                ann.num_sections,
+                            ) {
+                                warn!(error = %e, "failed to store blob metadata");
+                            } else {
+                                let total_chunks = ((ann.total_size + CHUNK_SIZE - 1)
+                                    / CHUNK_SIZE) as u32;
+                                if let Err(e) = init_blob_sections(
+                                    &db_lock,
+                                    &ann.hash,
+                                    ann.num_sections,
+                                    total_chunks,
+                                ) {
+                                    warn!(error = %e, "failed to init blob sections");
+                                }
+                                debug!(
+                                    hash = hex::encode(&ann.hash[..8]),
+                                    "blob stored, will pull via background task"
+                                );
+
+                                // Drop db_lock before sending event to avoid deadlock
+                                drop(db_lock);
+                                let file_event = crate::protocol::ProtocolEvent::FileAnnounced(crate::protocol::FileAnnouncedEvent {
+                                    topic_id: *topic_id,
+                                    source_id: ann.source_id,
+                                    hash: ann.hash,
+                                    display_name: ann.display_name.clone(),
+                                    total_size: ann.total_size,
+                                    total_chunks,
+                                    timestamp: crate::data::current_timestamp(),
+                                });
+                                if event_tx.send(file_event).await.is_err() {
+                                    debug!("event receiver dropped");
+                                }
+
+                                {
+                                    let db_lock = db.lock().await;
+                                    let _ = mark_pulled(&db_lock, topic_id, packet_id);
+                                }
+                                return Ok(ProcessResult {
+                                    receipt: super::protocol::Receipt::new(*packet_id, our_id),
+                                    content_payload: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                TopicMessage::CanSeed(can_seed) => {
+                    if can_seed.seeder_id != sender_id {
+                        warn!(
+                            seeder = %hex::encode(can_seed.seeder_id),
+                            sender = %hex::encode(sender_id),
+                            "can seed message seeder doesn't match packet sender - ignoring"
+                        );
+                    } else {
+                        info!(
+                            hash = hex::encode(&can_seed.hash[..8]),
+                            peer = hex::encode(&can_seed.seeder_id[..8]),
+                            "SHARE: Peer can seed file"
+                        );
+
+                        if let Err(e) = record_peer_can_seed(
+                            &db_lock,
+                            &can_seed.hash,
+                            &can_seed.seeder_id,
+                        ) {
+                            warn!(error = %e, "failed to record peer can seed");
+                        }
+                    }
+                }
+                TopicMessage::Content(_) => {}
+                TopicMessage::SyncUpdate(_) => {}
+                TopicMessage::SyncRequest => {}
+                // Stream signaling — route to StreamService
+                TopicMessage::StreamRequest(_) => {
+                    drop(db_lock);
+                    if let Some(ref stream_svc) = stream {
+                        stream_svc.handle_signaling(msg, topic_id, sender_id, PacketSource::Direct).await;
+                    }
+
+                    {
+                        let db_lock = db.lock().await;
+                        let _ = mark_pulled(&db_lock, topic_id, packet_id);
+                    }
+                    return Ok(ProcessResult {
+                        receipt: super::protocol::Receipt::new(*packet_id, our_id),
+                        content_payload: None,
+                    });
+                }
+            }
+        }
+
+        // Extract content payload if this is a Content message
+        let content_payload = if let Some(TopicMessage::Content(data)) = topic_msg.clone() {
+            let event = crate::protocol::ProtocolEvent::Message(crate::protocol::IncomingMessage {
+                topic_id: *topic_id,
+                sender_id,
+                payload: data.clone(),
+                timestamp: crate::data::current_timestamp(),
+            });
+
+            if event_tx.send(event).await.is_err() {
+                debug!("event receiver dropped");
+            }
+            Some(data)
+        } else {
+            None
+        };
+
+        // Mark packet as seen (dedup)
+        {
+            let db_lock = db.lock().await;
+            let _ = mark_pulled(&db_lock, topic_id, packet_id);
+        }
+
+        Ok(ProcessResult {
+            receipt: super::protocol::Receipt::new(*packet_id, our_id),
+            content_payload,
+        })
+    }
+
+    // ========== Incoming (Sealed Packets) ==========
 
     /// Process an incoming packet using service-owned db, event_tx, identity, and stream_service.
     pub async fn process_incoming_packet(
@@ -583,12 +1060,13 @@ impl SendService {
         let event_tx = &self.event_tx;
         let stream = self.stream_service().await;
 
-        // Determine verification mode from payload prefix
-        let mode = get_verification_mode_from_payload(&packet.ciphertext)
-            .unwrap_or(VerificationMode::Full);
-
-        // Verify and decrypt
-        let plaintext = verify_and_decrypt_packet_with_mode(packet, topic_id, mode)
+        // Verify and decrypt - try Full mode first, fall back to MacOnly for TopicJoin
+        // We can't know the packet type until after decryption (harbor stores opaque bytes)
+        let plaintext = verify_and_decrypt_packet_with_mode(packet, topic_id, VerificationMode::Full)
+            .or_else(|_| {
+                // Fall back to MacOnly for packets from unknown senders (TopicJoin)
+                verify_and_decrypt_packet_with_mode(packet, topic_id, VerificationMode::MacOnly)
+            })
             .map_err(|e| ProcessError::VerificationFailed(e.to_string()))?;
 
         info!(plaintext_len = plaintext.len(), "packet decrypted successfully");
@@ -596,7 +1074,7 @@ impl SendService {
         // Parse topic message
         let topic_msg = match TopicMessage::decode(&plaintext) {
             Ok(msg) => {
-                info!(msg_type = ?msg.message_type(), "decoded TopicMessage");
+                info!(msg_type = ?msg.packet_type(), "decoded TopicMessage");
                 Some(msg)
             }
             Err(e) => {
@@ -667,59 +1145,6 @@ impl SendService {
         if let Some(ref msg) = topic_msg {
             let db_lock = db.lock().await;
             match msg {
-                TopicMessage::Join(join) => {
-                    if join.joiner != sender_id {
-                        warn!(
-                            joiner = %hex::encode(join.joiner),
-                            sender = %hex::encode(sender_id),
-                            "join message joiner doesn't match packet sender - ignoring"
-                        );
-                    } else {
-                        trace!(
-                            joiner = %hex::encode(join.joiner),
-                            relay = ?join.relay_url,
-                            topic = %hex::encode(topic_id),
-                            "received join message"
-                        );
-
-                        if let Err(e) = add_topic_member(
-                            &db_lock,
-                            topic_id,
-                            &join.joiner,
-                        ) {
-                            warn!(error = %e, "failed to add member");
-                        }
-
-                        if let Some(ref relay_url) = join.relay_url {
-                            let _ = crate::data::update_peer_relay_url(
-                                &db_lock,
-                                &join.joiner,
-                                relay_url,
-                                crate::data::current_timestamp(),
-                            );
-                        }
-
-                        debug!(
-                            joiner = hex::encode(join.joiner),
-                            relay = ?join.relay_url,
-                            "member joined"
-                        );
-                    }
-                }
-                TopicMessage::Leave(leave) => {
-                    if leave.leaver != sender_id {
-                        warn!(
-                            leaver = %hex::encode(leave.leaver),
-                            sender = %hex::encode(sender_id),
-                            "leave message leaver doesn't match packet sender - ignoring"
-                        );
-                    } else {
-                        if let Err(e) = remove_topic_member(&db_lock, topic_id, &leave.leaver) {
-                            warn!(error = %e, "failed to remove member");
-                        }
-                        debug!(leaver = hex::encode(leave.leaver), "member left");
-                    }
-                }
                 TopicMessage::FileAnnouncement(ann) => {
                     if ann.source_id != sender_id {
                         warn!(
@@ -877,7 +1302,9 @@ impl SendService {
         &self,
         packet: &SendPacket,
     ) -> Result<ProcessResult, ProcessError> {
-        use crate::network::send::dm_messages::DmMessage;
+        use crate::network::packet::{
+            DmMessage, StreamSignalingMessage, is_dm_message_type, is_stream_signaling_type
+        };
 
         let our_id = self.endpoint_id();
 
@@ -886,6 +1313,32 @@ impl SendService {
             .map_err(|e| ProcessError::VerificationFailed(e.to_string()))?;
 
         info!(plaintext_len = plaintext.len(), "DM packet decrypted");
+
+        if plaintext.is_empty() {
+            return Err(ProcessError::VerificationFailed("empty plaintext".to_string()));
+        }
+
+        let type_byte = plaintext[0];
+
+        // Check if this is a stream signaling message (0x50-0x5F)
+        if is_stream_signaling_type(type_byte) {
+            let stream_msg = StreamSignalingMessage::decode(&plaintext)
+                .map_err(|e| ProcessError::VerificationFailed(format!("Stream signaling decode: {}", e)))?;
+
+            if let Some(stream_svc) = self.stream_service().await {
+                stream_svc.handle_stream_signaling_msg(&stream_msg, packet.endpoint_id).await;
+            }
+
+            return Ok(ProcessResult {
+                receipt: super::protocol::Receipt::new(packet.packet_id, our_id),
+                content_payload: None,
+            });
+        }
+
+        // Check if this is a DM message (0x40-0x4F)
+        if !is_dm_message_type(type_byte) {
+            return Err(ProcessError::VerificationFailed(format!("unknown type byte: 0x{:02x}", type_byte)));
+        }
 
         // Decode DmMessage
         let dm_msg = DmMessage::decode(&plaintext)
@@ -902,11 +1355,11 @@ impl SendService {
                 );
                 let _ = self.event_tx.send(event).await;
             }
-            DmMessage::SyncUpdate(data) => {
+            DmMessage::SyncUpdate(msg) => {
                 let event = crate::protocol::ProtocolEvent::DmSyncUpdate(
                     crate::protocol::DmSyncUpdateEvent {
                         sender_id: packet.endpoint_id,
-                        data,
+                        data: msg.data,
                     },
                 );
                 let _ = self.event_tx.send(event).await;
@@ -933,13 +1386,8 @@ impl SendService {
                 );
                 let _ = self.event_tx.send(event).await;
             }
-            // DM stream signaling — route to StreamService
-            DmMessage::StreamAccept(_)
-            | DmMessage::StreamReject(_)
-            | DmMessage::StreamQuery(_)
-            | DmMessage::StreamActive(_)
-            | DmMessage::StreamEnded(_)
-            | DmMessage::StreamRequest(_) => {
+            // DM stream request — route to StreamService
+            DmMessage::StreamRequest(_) => {
                 if let Some(stream_svc) = self.stream_service().await {
                     stream_svc.handle_dm_signaling(&dm_msg, packet.endpoint_id).await;
                 }
@@ -952,44 +1400,12 @@ impl SendService {
         })
     }
 
-    /// Verify and decrypt a packet (no PoW verification)
+    /// Verify and decrypt a packet
     pub fn receive_packet(
         packet: &SendPacket,
         topic_id: &[u8; 32],
         our_id: [u8; 32],
     ) -> Result<(Vec<u8>, super::protocol::Receipt), PacketError> {
-        let plaintext = verify_and_decrypt_packet(packet, topic_id)?;
-        let receipt = super::protocol::Receipt::new(packet.packet_id, our_id);
-        Ok((plaintext, receipt))
-    }
-
-    /// Verify and decrypt a packet with PoW verification
-    pub fn receive_packet_with_pow(
-        packet: &SendPacket,
-        proof_of_work: &crate::resilience::ProofOfWork,
-        topic_id: &[u8; 32],
-        our_id: [u8; 32],
-        pow_config: &PoWConfig,
-    ) -> Result<(Vec<u8>, super::protocol::Receipt), ReceiveError> {
-        if !pow_config.enabled {
-            let (plaintext, receipt) = Self::receive_packet(packet, topic_id, our_id)?;
-            return Ok((plaintext, receipt));
-        }
-
-        let expected_target = send_target_id(topic_id, &our_id);
-        if proof_of_work.harbor_id != expected_target {
-            return Err(ReceiveError::PoWTargetMismatch);
-        }
-
-        if proof_of_work.packet_id != packet.packet_id {
-            return Err(ReceiveError::PoWTargetMismatch);
-        }
-
-        let result = verify_pow(proof_of_work, pow_config);
-        if !result.is_valid() {
-            return Err(ReceiveError::InvalidPoW(result));
-        }
-
         let plaintext = verify_and_decrypt_packet(packet, topic_id)?;
         let receipt = super::protocol::Receipt::new(packet.packet_id, our_id);
         Ok((plaintext, receipt))

@@ -5,6 +5,7 @@
 //! - InitialSyncRequest: New member requests full state (via Send)
 //! - InitialSyncResponse: Full snapshot (via direct connection - no size limit)
 
+use crate::network::wire;
 use serde::{Deserialize, Serialize};
 
 /// Sync protocol ALPN (for direct connections - initial sync)
@@ -75,55 +76,52 @@ pub struct InitialSyncResponse {
 
 impl SyncMessage {
     /// Encode for transmission via Send protocol
-    /// Format: [SYNC_PREFIX][type][length][payload]
+    /// Format: [SYNC_PREFIX][type][length][payload] using shared wire framing
     pub fn encode(&self) -> Vec<u8> {
         let (msg_type, payload) = match self {
-            SyncMessage::Update(u) => {
-                (SyncMessageType::Update, postcard::to_allocvec(u).expect("serialization should not fail"))
-            }
-            SyncMessage::InitialSyncRequest(r) => {
-                (SyncMessageType::InitialSyncRequest, postcard::to_allocvec(r).expect("serialization should not fail"))
-            }
+            SyncMessage::Update(u) => (
+                SyncMessageType::Update,
+                postcard::to_allocvec(u).expect("serialization should not fail"),
+            ),
+            SyncMessage::InitialSyncRequest(r) => (
+                SyncMessageType::InitialSyncRequest,
+                postcard::to_allocvec(r).expect("serialization should not fail"),
+            ),
         };
-        
-        let mut bytes = Vec::with_capacity(1 + 1 + 4 + payload.len());
+
+        // Prepend sync prefix, then use standard wire framing
+        let frame = wire::encode_frame(msg_type as u8, &payload);
+        let mut bytes = Vec::with_capacity(1 + frame.len());
         bytes.push(SYNC_MESSAGE_PREFIX);
-        bytes.push(msg_type as u8);
-        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&frame);
         bytes
     }
 
     /// Decode from bytes received via Send protocol
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < 6 {
+        if bytes.is_empty() {
             return Err(DecodeError::TooShort);
         }
-        
+
         if bytes[0] != SYNC_MESSAGE_PREFIX {
             return Err(DecodeError::InvalidPrefix);
         }
-        
-        let msg_type = SyncMessageType::try_from(bytes[1])
-            .map_err(|_| DecodeError::InvalidType)?;
-        
-        let len = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
-        
-        if bytes.len() < 6 + len {
-            return Err(DecodeError::TooShort);
-        }
-        
-        let payload = &bytes[6..6 + len];
-        
+
+        // Skip prefix, decode using standard wire framing
+        let frame = wire::decode_frame(&bytes[1..]).map_err(|_| DecodeError::TooShort)?;
+
+        let msg_type =
+            SyncMessageType::try_from(frame.msg_type).map_err(|_| DecodeError::InvalidType)?;
+
         match msg_type {
             SyncMessageType::Update => {
-                let update: SyncUpdate = postcard::from_bytes(payload)
-                    .map_err(|_| DecodeError::InvalidPayload)?;
+                let update: SyncUpdate =
+                    postcard::from_bytes(frame.payload).map_err(|_| DecodeError::InvalidPayload)?;
                 Ok(SyncMessage::Update(update))
             }
             SyncMessageType::InitialSyncRequest => {
-                let request: InitialSyncRequest = postcard::from_bytes(payload)
-                    .map_err(|_| DecodeError::InvalidPayload)?;
+                let request: InitialSyncRequest =
+                    postcard::from_bytes(frame.payload).map_err(|_| DecodeError::InvalidPayload)?;
                 Ok(SyncMessage::InitialSyncRequest(request))
             }
             SyncMessageType::InitialSyncResponse => {
@@ -132,7 +130,7 @@ impl SyncMessage {
             }
         }
     }
-    
+
     /// Check if bytes start with sync message prefix
     pub fn is_sync_message(bytes: &[u8]) -> bool {
         !bytes.is_empty() && bytes[0] == SYNC_MESSAGE_PREFIX
@@ -140,35 +138,21 @@ impl SyncMessage {
 }
 
 impl InitialSyncResponse {
-    /// Encode for transmission via direct connection
+    /// Encode for transmission via direct connection using shared wire framing
     pub fn encode(&self) -> Vec<u8> {
         let payload = postcard::to_allocvec(self).expect("serialization should not fail");
-        let mut bytes = Vec::with_capacity(1 + 4 + payload.len());
-        bytes.push(SyncMessageType::InitialSyncResponse as u8);
-        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(&payload);
-        bytes
+        wire::encode_frame(SyncMessageType::InitialSyncResponse as u8, &payload)
     }
-    
+
     /// Decode from bytes received via direct connection
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < 5 {
-            return Err(DecodeError::TooShort);
-        }
-        
-        if bytes[0] != SyncMessageType::InitialSyncResponse as u8 {
+        let frame = wire::decode_frame(bytes).map_err(|_| DecodeError::TooShort)?;
+
+        if frame.msg_type != SyncMessageType::InitialSyncResponse as u8 {
             return Err(DecodeError::InvalidType);
         }
-        
-        let len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
-        
-        if bytes.len() < 5 + len {
-            return Err(DecodeError::TooShort);
-        }
-        
-        let payload = &bytes[5..5 + len];
-        
-        postcard::from_bytes(payload).map_err(|_| DecodeError::InvalidPayload)
+
+        postcard::from_bytes(frame.payload).map_err(|_| DecodeError::InvalidPayload)
     }
 }
 

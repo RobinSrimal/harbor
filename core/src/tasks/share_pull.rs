@@ -308,7 +308,7 @@ async fn pull_missing_chunks(
     };
 
     let num_sections = blob_metadata.num_sections as u32;
-    let chunks_per_section = (blob_metadata.total_chunks + num_sections - 1) / num_sections;
+    let chunks_per_section = blob_metadata.total_chunks.div_ceil(num_sections);
 
     // For each missing chunk, find which section it belongs to
     let mut sections_needed: HashMap<u8, Vec<u32>> = HashMap::new();

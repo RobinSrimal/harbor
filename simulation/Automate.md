@@ -77,6 +77,23 @@ Scenarios are run in the order they appear in `simulate.sh` (source order):
 | 35 | dm-share-basic | `./simulate.sh dm-share-basic` | |
 | 36 | dm-share-offline | `./simulate.sh dm-share-offline` | |
 
+### Control Protocol
+| # | Scenario | Command | Status |
+|---|----------|---------|--------|
+| 37 | control-connect | `./simulate.sh control-connect` | |
+| 38 | control-topic-invite | `./simulate.sh control-topic-invite` | |
+| 39 | control-suggest | `./simulate.sh control-suggest` | |
+| 40 | control-offline | `./simulate.sh control-offline` | |
+
+### Connection Gating
+| # | Scenario | Command | Status |
+|---|----------|---------|--------|
+| 41 | gate-blocked | `./simulate.sh gate-blocked` | |
+| 42 | gate-dm-allowed | `./simulate.sh gate-dm-allowed` | |
+| 43 | gate-open-protocols | `./simulate.sh gate-open-protocols` | |
+| 44 | gate-stranger | `./simulate.sh gate-stranger` | |
+| 45 | gate-topic-allowed | `./simulate.sh gate-topic-allowed` | |
+
 ## Notes
 
 - Each scenario is self-contained (starts nodes, runs test, cleans up)

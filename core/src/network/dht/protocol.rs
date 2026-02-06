@@ -11,6 +11,7 @@ use irpc::rpc_requests;
 use serde::{Deserialize, Serialize};
 
 use super::internal::distance::Id;
+use crate::resilience::ProofOfWork;
 
 /// DHT RPC protocol version in ALPN
 pub const RPC_ALPN: &[u8] = b"harbor/dht/0";
@@ -28,6 +29,8 @@ pub struct FindNode {
     /// Optional requester relay URL (for connectivity)
     #[serde(default)]
     pub requester_relay_url: Option<String>,
+    /// Proof of Work (context: sender_id || target_bytes)
+    pub pow: ProofOfWork,
 }
 
 /// Response containing closest nodes
@@ -99,6 +102,15 @@ mod tests {
         Id::new([seed; 32])
     }
 
+    /// Create a dummy PoW for tests (difficulty 0 = always passes)
+    fn test_pow() -> ProofOfWork {
+        ProofOfWork {
+            timestamp: 0,
+            nonce: 0,
+            difficulty_bits: 0,
+        }
+    }
+
     #[test]
     fn test_node_info_from_id() {
         let id = make_id(42);
@@ -127,12 +139,13 @@ mod tests {
             target: make_id(1),
             requester: Some([2u8; 32]),
             requester_relay_url: Some("https://relay.example.com/".to_string()),
+            pow: test_pow(),
         };
-        
+
         // Test that it can be serialized/deserialized
         let bytes = postcard::to_allocvec(&request).unwrap();
         let decoded: FindNode = postcard::from_bytes(&bytes).unwrap();
-        
+
         assert_eq!(decoded.target, request.target);
         assert_eq!(decoded.requester, request.requester);
         assert_eq!(decoded.requester_relay_url, request.requester_relay_url);
@@ -177,6 +190,7 @@ mod tests {
             target: make_id(42),
             requester: None,
             requester_relay_url: None,
+            pow: test_pow(),
         };
 
         let bytes = postcard::to_allocvec(&request).unwrap();

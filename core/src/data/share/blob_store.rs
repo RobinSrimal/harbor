@@ -115,11 +115,11 @@ impl BlobStore {
         let mut file = File::open(&paths.sizes)?;
         let mut buf = [0u8; 8];
         
-        for i in 0..total_chunks as usize {
+        for chunk in bitfield.iter_mut().take(total_chunks as usize) {
             match file.read_exact(&mut buf) {
                 Ok(()) => {
                     let size = u64::from_le_bytes(buf);
-                    bitfield[i] = size > 0;
+                    *chunk = size > 0;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
@@ -259,7 +259,7 @@ impl BlobStore {
         self.write_outboard(&hash, &outboard)?;
         
         // Write sizes file (all chunks present)
-        let total_chunks = ((total_size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
+        let total_chunks = total_size.div_ceil(CHUNK_SIZE) as u32;
         let mut sizes_file = File::create(&paths.sizes)?;
         for _ in 0..total_chunks {
             sizes_file.write_all(&total_size.to_le_bytes())?;
@@ -413,6 +413,7 @@ impl BlobStore {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&paths.outboard)?;
         
         // Write hash at the appropriate position

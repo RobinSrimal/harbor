@@ -45,6 +45,20 @@ scenario_dm_basic() {
     info "Node-1 endpoint: ${NODE1_ID:0:16}..."
     info "Node-2 endpoint: ${NODE2_ID:0:16}..."
 
+    # Establish DM connections via Control protocol (required before sending DMs)
+    log "Phase 3b: Establishing DM connections..."
+
+    # Node-1 generates invite, Node-2 connects
+    local INVITE1=$(api_control_generate_invite 1)
+    local INVITE_STRING1=$(extract_invite_string "$INVITE1")
+    if [ -n "$INVITE_STRING1" ]; then
+        api_control_connect_with_invite 2 "$INVITE_STRING1" > /dev/null
+        info "  Node-1 ↔ Node-2: connection established"
+    else
+        warn "  Failed to establish Node-1 ↔ Node-2 connection"
+    fi
+    sleep 2
+
     # Send DM from node-1 to node-2
     log "Phase 4: Sending DMs..."
     local msg1="${DM_MSG_PREFIX}-from-Node1"
@@ -108,6 +122,15 @@ scenario_dm_basic() {
     local NODE4_ID=$(api_get_endpoint_id 4)
 
     if [ -n "$NODE3_ID" ] && [ -n "$NODE4_ID" ]; then
+        # Establish connection between Node-3 and Node-4 first
+        local INVITE3=$(api_control_generate_invite 3)
+        local INVITE_STRING3=$(extract_invite_string "$INVITE3")
+        if [ -n "$INVITE_STRING3" ]; then
+            api_control_connect_with_invite 4 "$INVITE_STRING3" > /dev/null
+            info "  Node-3 ↔ Node-4: connection established"
+        fi
+        sleep 2
+
         local msg3="${DM_MSG_PREFIX}-from-Node3"
         api_send_dm 3 "$NODE4_ID" "$msg3" > /dev/null
         sleep 2

@@ -24,6 +24,15 @@ const MAX_READ_SIZE: usize = (CHUNK_SIZE as usize) + 1024;
 impl ProtocolHandler for ShareService {
     async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
         let sender_id = *conn.remote_id().as_bytes();
+
+        // Connection gate check - must be a connected peer or share a topic
+        if let Some(gate) = self.connection_gate() {
+            if !gate.is_allowed(&sender_id).await {
+                trace!(sender = %hex::encode(sender_id), "SHARE: rejected connection from non-connected peer");
+                return Ok(()); // Silent drop
+            }
+        }
+
         if let Err(e) = self.handle_share_connection(conn, sender_id).await {
             debug!(error = %e, sender = %hex::encode(sender_id), "Share connection handler error");
         }

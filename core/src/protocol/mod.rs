@@ -55,10 +55,14 @@ pub use events::{
     StreamConnectedEvent,
     DmReceivedEvent, DmSyncUpdateEvent, DmSyncRequestEvent, DmSyncResponseEvent,
     DmFileAnnouncedEvent,
+    // Control events
+    ConnectionRequestEvent, ConnectionAcceptedEvent, ConnectionDeclinedEvent,
+    TopicInviteReceivedEvent, TopicMemberJoinedEvent, TopicMemberLeftEvent,
+    TopicEpochRotatedEvent, PeerSuggestedEvent,
 };
 
-// Domain types (from TopicService)
-pub use crate::network::topic::{MemberInfo, TopicInvite};
+// Domain types (from ControlService)
+pub use crate::network::control::{MemberInfo, TopicInvite};
 
 // Stats types
 pub use stats::{
@@ -68,6 +72,10 @@ pub use stats::{
 
 // Share types
 pub use api::ShareStatus;
+
+// Control types
+pub use crate::network::control::ConnectInvite;
+pub use crate::data::{ConnectionInfo, ConnectionState, PendingTopicInvite};
 
 // Target types (Topic vs DM)
 mod target;

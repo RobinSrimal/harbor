@@ -87,26 +87,6 @@ pub fn harbor_id_from_topic(topic_id: &[u8; 32]) -> [u8; 32] {
     *blake3::hash(topic_id).as_bytes()
 }
 
-/// Compute SendTargetID from TopicID and RecipientID (BLAKE3 hash).
-///
-/// The SendTargetID is used for PoW binding in direct send operations.
-/// It combines the topic and recipient so PoW cannot be reused across
-/// different topics or different recipients.
-///
-/// ```text
-/// SendTargetID = BLAKE3_HASH(TopicID || RecipientID)
-/// ```
-///
-/// This prevents:
-/// - Cross-topic replay: Same PoW can't target Alice on Topic A and Topic B
-/// - Cross-recipient replay: Same PoW can't target Alice and Bob on same topic
-pub fn send_target_id(topic_id: &[u8; 32], recipient_id: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(topic_id);
-    hasher.update(recipient_id);
-    *hasher.finalize().as_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,41 +241,6 @@ mod tests {
 
         assert_eq!(keys1.k_enc, keys2.k_enc);
         assert_eq!(keys1.k_mac, keys2.k_mac);
-    }
-
-    #[test]
-    fn test_send_target_id() {
-        let topic_id = [1u8; 32];
-        let recipient_id = [2u8; 32];
-        let target = send_target_id(&topic_id, &recipient_id);
-
-        // Should be 32 bytes
-        assert_eq!(target.len(), 32);
-
-        // Should be different from inputs
-        assert_ne!(target, topic_id);
-        assert_ne!(target, recipient_id);
-
-        // Should be deterministic
-        let target2 = send_target_id(&topic_id, &recipient_id);
-        assert_eq!(target, target2);
-    }
-
-    #[test]
-    fn test_send_target_id_different_inputs() {
-        let topic_id = [1u8; 32];
-        let recipient_a = [2u8; 32];
-        let recipient_b = [3u8; 32];
-
-        // Different recipients should have different targets (same topic)
-        let target_a = send_target_id(&topic_id, &recipient_a);
-        let target_b = send_target_id(&topic_id, &recipient_b);
-        assert_ne!(target_a, target_b);
-
-        // Different topics should have different targets (same recipient)
-        let topic_id_2 = [10u8; 32];
-        let target_c = send_target_id(&topic_id_2, &recipient_a);
-        assert_ne!(target_a, target_c);
     }
 
     #[test]

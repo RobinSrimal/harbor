@@ -97,7 +97,7 @@ pub fn get_peer(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite::Result<O
                 relay_url, relay_url_last_success
          FROM peers WHERE endpoint_id = ?1",
         [endpoint_id.as_slice()],
-        |row| parse_peer_row(row),
+        parse_peer_row,
     )
     .optional()
 }
@@ -205,6 +205,19 @@ pub fn touch_peer(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite::Result
     Ok(rows > 0)
 }
 
+/// Ensure a peer exists in the peers table (for FK constraints)
+///
+/// Uses INSERT OR IGNORE to create a minimal peer entry if it doesn't exist.
+/// This is needed before inserting into tables with FK references to peers.
+pub fn ensure_peer_exists(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite::Result<()> {
+    let now = current_timestamp();
+    conn.execute(
+        "INSERT OR IGNORE INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+        params![endpoint_id.as_slice(), now],
+    )?;
+    Ok(())
+}
+
 /// Update peer's endpoint address
 pub fn update_peer_address(
     conn: &Connection,
@@ -297,7 +310,7 @@ pub fn get_peers_with_fresh_addresses(conn: &Connection) -> rusqlite::Result<Vec
     )?;
     
     let peers = stmt
-        .query_map([threshold], |row| parse_peer_row(row))?
+        .query_map([threshold], parse_peer_row)?
         .collect::<Result<Vec<_>, _>>()?;
     
     Ok(peers)

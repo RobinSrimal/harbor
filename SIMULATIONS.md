@@ -39,7 +39,14 @@ cd simulation
 # Other scenario suites
 ./simulate.sh --scenario membership  # All membership tests
 ./simulate.sh --scenario share       # All file sharing tests
+./simulate.sh --scenario control     # All control protocol tests
 ./simulate.sh --scenario full        # Run all scenarios
+
+# Control protocol scenarios (peer connections, topic invites)
+./simulate.sh --scenario control-connect       # Connection via invite token
+./simulate.sh --scenario control-topic-invite  # Topic invite/accept flow
+./simulate.sh --scenario control-suggest       # Peer introduction
+./simulate.sh --scenario control-offline       # Offline delivery via Harbor
 ```
 
 ## How Bootstrap Works
@@ -103,6 +110,40 @@ Each node gets:
 4. Observe DHT recovery
 5. Restart nodes 3 & 4
 6. Verify DHT reconverges
+
+### Control Connection Flow
+1. Node-1 and Node-2 start
+2. Node-1 generates a connect invite (token)
+3. Node-2 connects using the invite
+4. Node-1 auto-accepts (valid token)
+5. Both nodes show `connected` state
+6. Verify log events: "connection auto-accepted via token", "CONNECTION_ACCEPTED"
+
+### Control Topic Invite Flow
+1. Node-1 and Node-2 connect via Control ALPN
+2. Node-1 creates a topic
+3. Node-1 invites Node-2 to the topic
+4. Node-2 receives TopicInviteReceived event
+5. Node-2 accepts the invite
+6. Both nodes have the topic membership
+7. Verify log events: "TOPIC_INVITE_RECEIVED", "TOPIC_MEMBER_JOINED"
+
+### Control Peer Suggestion
+1. Node-1 connects to Node-2 and Node-3
+2. Node-2 is NOT connected to Node-3
+3. Node-1 suggests Node-3 to Node-2
+4. Node-2 receives PeerSuggested event
+5. Node-2 can initiate connection to Node-3
+6. Verify log event: "PEER_SUGGESTED"
+
+### Control Offline Delivery
+1. Node-1, Node-2, Node-3 start and connect
+2. Node-3 goes offline
+3. Node-1 invites Node-3 to a topic (stored to Harbor)
+4. Node-3 comes back online
+5. Node-3 pulls TopicInvite from Harbor
+6. Node-3 accepts the invite
+7. All nodes have consistent topic membership
 
 ## Testing
 
@@ -179,7 +220,11 @@ simulation/
 │   ├── sync_basic.sh
 │   ├── sync_initial.sh
 │   ├── sync_concurrent.sh
-│   └── sync_offline.sh
+│   ├── sync_offline.sh
+│   ├── control_connect.sh
+│   ├── control_topic_invite.sh
+│   ├── control_suggest.sh
+│   └── control_offline.sh
 └── nodes/
     ├── node-1/         # Bootstrap node
     │   ├── harbor.db

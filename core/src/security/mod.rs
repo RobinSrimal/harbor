@@ -15,7 +15,6 @@
 //! - MAC + Signature verification proves topic membership and sender identity
 
 pub mod create_key_pair;
-pub mod derive_key;
 pub mod dm_keys;
 pub mod harbor;
 pub mod send;
@@ -26,10 +25,12 @@ pub use create_key_pair::{generate_key_pair, key_pair_from_bytes, KeyPair};
 pub use send::{
     // Tier 1 functions (topic_id-derived keys, epoch 0)
     create_packet, verify_and_decrypt_packet, verify_and_decrypt_packet_with_mode,
+    // Tier 2 functions (epoch-specific keys)
+    verify_and_decrypt_with_epoch, derive_epoch_secret_from_topic,
     // Types
     EpochKeys, PacketError, SendPacket, VerificationMode,
     // DM
     create_dm_packet, verify_and_decrypt_dm_packet, FLAG_DM,
 };
-pub use topic_keys::{harbor_id_from_topic, send_target_id, TopicKeys};
+pub use topic_keys::{harbor_id_from_topic, TopicKeys};
 pub use dm_keys::{dm_seal, dm_open, DmCryptoError};
