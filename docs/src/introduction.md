@@ -56,7 +56,7 @@ See [Harbor Node Privacy](./security/harbor-privacy.md) for details.
 - **Private messaging**: 1:1 and group chat with offline delivery
 - **Collaborative apps**: Real-time collaboration with CRDT support
 - **File sharing**: P2P file distribution (BitTorrent-style)
-- **IoT**: Device-to-device communication
+- **Live streaming**: Real-time audio/video between peers
 
 ## Getting Started
 
