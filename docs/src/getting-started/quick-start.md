@@ -1,91 +1,75 @@
 # Quick Start
 
-Get Harbor running in minutes.
+Get started building with Harbor in minutes.
 
-## Prerequisites
+## Add Dependency
 
-- Rust toolchain (1.75+)
-- A 32-byte database encryption key
-
-## Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/RobinSrimal/harbor
-cd harbor/core
-
-# Build
-cargo build --release
+```toml
+[dependencies]
+harbor-core = { git = "https://github.com/RobinSrimal/harbor", branch = "main" }
+tokio = { version = "1", features = ["full"] }
 ```
 
-## Running Your First Node
+## Minimal Example
 
-```bash
-# Generate a database key
-export HARBOR_DB_KEY=$(openssl rand -hex 32)
+```rust
+use harbor_core::{Protocol, ProtocolConfig, ProtocolEvent, Target};
 
-# Start a node with the HTTP API
-./target/release/harbor --serve --api-port 8080
-```
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Database encryption key (32 bytes)
+    let db_key: [u8; 32] = [0u8; 32]; // Use a real key in production!
 
-You'll see output like:
-```
-Harbor Protocol Node v0.1.0
+    // Start the protocol
+    let config = ProtocolConfig::default()
+        .with_db_key(db_key)
+        .with_db_path("myapp.db".into());
 
-Starting Harbor Protocol...
-Database: harbor.db
-Blob storage: .harbor_blobs
+    let protocol = Protocol::start(config).await?;
 
-=== Local Node Identity ===
-EndpointID: a1b2c3d4...
+    // Print your identity
+    println!("My EndpointID: {}", hex::encode(protocol.endpoint_id()));
 
-Waiting for relay connection...
-Relay: https://euc1-1.relay.iroh.link./
+    // Create a topic
+    let invite = protocol.create_topic().await?;
+    println!("Topic created: {}", hex::encode(&invite.topic_id));
+    println!("Invite: {}", invite.to_hex()?);
 
-🚀 Harbor Node running
-📡 API: http://127.0.0.1:8080
-```
+    // Send a message to the topic
+    protocol.send(Target::Topic(invite.topic_id), b"Hello, Harbor!").await?;
 
-## Create a Topic
+    // Listen for events
+    let mut events = protocol.events().await?;
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            match event {
+                ProtocolEvent::Message(msg) => {
+                    println!("Received: {}", String::from_utf8_lossy(&msg.payload));
+                }
+                _ => {}
+            }
+        }
+    });
 
-```bash
-# Create a new topic
-curl -X POST http://localhost:8080/api/topic
-```
+    // Keep running...
+    tokio::signal::ctrl_c().await?;
 
-Response:
-```json
-{
-  "topic_id": "abc123...",
-  "invite": "746f7069..."
+    protocol.stop().await;
+    Ok(())
 }
 ```
 
-## Send a Message
+## Key Concepts
 
-```bash
-# Send a message to the topic
-curl -X POST http://localhost:8080/api/send \
-  -H "Content-Type: application/json" \
-  -d '{"topic": "abc123...", "message": "Hello, Harbor!"}'
-```
-
-## Join from Another Node
-
-On a second machine (or terminal with different ports/paths):
-
-```bash
-export HARBOR_DB_KEY=$(openssl rand -hex 32)
-./target/release/harbor --serve --api-port 8081 --db-path node2.db
-
-# Join using the invite from node 1
-curl -X POST http://localhost:8081/api/join \
-  -H "Content-Type: application/json" \
-  -d '{"invite": "746f7069..."}'
-```
+1. **Protocol** - The main entry point. Start it, use it, stop it.
+2. **ProtocolConfig** - Configure database path, encryption key, bootstrap nodes, etc.
+3. **Target** - Where to send: `Target::Topic(id)` or `Target::Dm(peer_id)`
+4. **ProtocolEvent** - Events you receive: messages, file announcements, connection requests, etc.
 
 ## What's Next?
 
-- [Running a Node](./running-node.md) - Detailed node configuration
-- [Topics & Membership](../concepts/topics.md) - Understanding topics
-- [Simple Messaging App](../tutorials/messaging-app.md) - Build a chat app
+- [Configuration](./configuration.md) - All configuration options
+- [Topics & Membership](../concepts/topics.md) - Group communication
+- [Direct Messages](../concepts/direct-messages.md) - 1:1 messaging
+- [Simple Messaging App](../tutorials/messaging-app.md) - Complete example
+- [API Reference](../tutorials/api-reference.md) - Full API documentation
