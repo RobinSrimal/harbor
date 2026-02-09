@@ -7,13 +7,19 @@
 //!
 //! Architecture:
 //! - `protocol.rs` - Wire format and message types
-//! - `service.rs` - Business logic (ShareService)
+//! - `service.rs` - Core ShareService struct, config, shared methods
+//! - `distribute.rs` - File distribution (sharing)
+//! - `acquire.rs` - File acquisition (pulling)
+//! - `incoming.rs` - Incoming message handlers
 //!
 //! Messages:
 //! - FileAnnouncement: Broadcast via Send when sharing starts
 //! - CanSeed: Broadcast via Send when peer reaches 100%
 //! - Direct messages: ChunkMapRequest, ChunkRequest, Bitfield, PeerSuggestion
 
+pub mod acquire;
+pub mod distribute;
+pub mod incoming;
 pub mod protocol;
 pub mod service;
 

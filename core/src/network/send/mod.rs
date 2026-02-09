@@ -17,26 +17,22 @@
 //!
 //! # Module Structure
 //!
-//! - `outgoing.rs` - SendService (single entry point for all send operations)
-//! - `incoming.rs` - Receiving packets (process_incoming_packet, ProcessResult, ProcessError)
+//! - `service.rs` - SendService struct, shared infrastructure, types
+//! - `topic.rs` - Topic send + process + handler dispatch
+//! - `dm.rs` - DM send + process + handler dispatch
 //! - `protocol.rs` - irpc wire protocol (SendRpcProtocol, DeliverTopic, DeliverDm, Receipt)
 //! - `pool.rs` - Connection pooling
 
-pub mod incoming;
-pub mod outgoing;
+pub mod dm;
 pub mod pool;
 pub mod protocol;
 pub mod service;
+pub mod topic;
 
 pub use pool::{SendPool, SendPoolConfig, SendPoolError, SendConnectionRef, SendPoolStats, SEND_ALPN as SEND_ALPN_FROM_POOL};
 pub use protocol::{SEND_ALPN, Receipt};
-pub use service::SendConfig;
-
-// Outgoing (sending packets)
-pub use outgoing::{SendService, SendResult, SendError, SendOptions};
-
-// Incoming (types for receiving packets — logic is on SendService)
-pub use incoming::{
+pub use service::{
+    SendConfig, SendService, SendResult, SendError, SendOptions,
     ProcessResult, ProcessError, PacketSource, ReceiveError,
 };
 

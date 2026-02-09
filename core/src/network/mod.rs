@@ -53,6 +53,7 @@ pub use sync::{
 pub use stream::{StreamService, StreamError, StreamSession, STREAM_ALPN, STREAM_SIGNAL_TTL};
 pub use process::{ProcessContext, ProcessScope, ProcessError, process_packet};
 pub use gate::ConnectionGate;
+pub use connect::Connector;
 pub use control::{
     ControlAck, ControlPacketType, ControlRpcMessage, ControlRpcProtocol, CONTROL_ALPN,
     ConnectAccept, ConnectDecline, ConnectRequest, RemoveMember, Suggest, TopicInvite,

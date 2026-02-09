@@ -23,11 +23,27 @@ impl ProtocolHandler for HarborService {
     }
 }
 
+/// Send a response message on the connection
+async fn send_response(conn: &iroh::endpoint::Connection, msg: &HarborMessage) {
+    let bytes = msg.encode();
+    if let Ok(mut send) = conn.open_uni().await {
+        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut send, &bytes).await {
+            debug!(error = %e, "failed to send Harbor response");
+            return;
+        }
+        if let Err(e) = send.finish() {
+            debug!(error = %e, "failed to finish Harbor response stream");
+        }
+    } else {
+        debug!("failed to open response stream");
+    }
+}
+
 impl HarborService {
     /// Handle an incoming Harbor protocol connection
     ///
     /// Processes Store, Pull, Ack, and Sync requests from other nodes.
-    /// This allows this node to act as a Harbor Node (store packets for others).
+    /// Dispatches each message variant to the appropriate handler in `incoming`.
     pub(crate) async fn handle_harbor_connection(
         &self,
         conn: iroh::endpoint::Connection,
@@ -68,33 +84,52 @@ impl HarborService {
 
             trace!("decoded HarborMessage: {:?}", std::mem::discriminant(&message));
 
-            // Process with HarborService
+            // Dispatch to handlers
             let db = self.db();
-            let response = {
-                let mut db_lock = db.lock().await;
-                match self.handle_message(&mut db_lock, message, &sender_id) {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        warn!(error = %e, "Harbor message handling failed");
-                        continue;
+            match message {
+                HarborMessage::Store(req) => {
+                    let mut db_lock = db.lock().await;
+                    match self.handle_store(&mut db_lock, req) {
+                        Ok(resp) => {
+                            send_response(&conn, &HarborMessage::StoreResponse(resp)).await;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Harbor store failed");
+                        }
                     }
                 }
-            };
-
-            // Send response if there is one
-            if let Some(resp_msg) = response {
-                let resp_bytes = resp_msg.encode();
-
-                if let Ok(mut send) = conn.open_uni().await {
-                    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut send, &resp_bytes).await {
-                        debug!(error = %e, "failed to send Harbor response");
-                        continue;
+                HarborMessage::Pull(req) => {
+                    let db_lock = db.lock().await;
+                    match self.handle_pull(&db_lock, req, &sender_id) {
+                        Ok(resp) => {
+                            send_response(&conn, &HarborMessage::PullResponse(resp)).await;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Harbor pull failed");
+                        }
                     }
-                    if let Err(e) = send.finish() {
-                        debug!(error = %e, "failed to finish Harbor response stream");
+                }
+                HarborMessage::Ack(ack) => {
+                    let db_lock = db.lock().await;
+                    if let Err(e) = self.handle_ack(&db_lock, ack, &sender_id) {
+                        warn!(error = %e, "Harbor ack failed");
                     }
-                } else {
-                    debug!("failed to open response stream");
+                }
+                HarborMessage::SyncRequest(req) => {
+                    let db_lock = db.lock().await;
+                    match self.handle_sync(&db_lock, req, &sender_id) {
+                        Ok(resp) => {
+                            send_response(&conn, &HarborMessage::SyncResponse(resp)).await;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Harbor sync failed");
+                        }
+                    }
+                }
+                HarborMessage::StoreResponse(_)
+                | HarborMessage::PullResponse(_)
+                | HarborMessage::SyncResponse(_) => {
+                    debug!("Harbor: ignoring response message from peer");
                 }
             }
         }

@@ -5,7 +5,8 @@
 //! The implementation is split across:
 //! - `service.rs` (this file): Core struct, constructors, error types
 //! - `incoming.rs`: Incoming request handlers (store, pull, ack, sync)
-//! - `outgoing.rs`: Outgoing operations (create requests, process responses, network sends)
+//! - `client.rs`: Client-side operations (request builders, response processors, maintenance)
+//! - `network.rs`: Network send operations (store, pull, ack, sync to remote Harbor Nodes)
 //!
 //! See root README for `RUST_LOG` configuration.
 

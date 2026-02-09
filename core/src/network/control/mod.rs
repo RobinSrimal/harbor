@@ -25,12 +25,16 @@
 //! # Module Structure
 //!
 //! - `protocol.rs` - ALPN constant, message types, RPC definition
-//! - `service.rs` - ControlService struct
-//! - `incoming.rs` - Handle incoming control messages
-//! - `outgoing.rs` - Send control messages
+//! - `service.rs` - ControlService struct, shared utilities
+//! - `peers.rs` - Peer connection lifecycle (request/accept/decline/block)
+//! - `membership.rs` - Topic invite/join/leave/remove
+//! - `lifecycle.rs` - Topic create/join/list/get_invite
+//! - `introductions.rs` - Peer suggestions
 
-pub mod incoming;
-pub mod outgoing;
+pub mod introductions;
+pub mod lifecycle;
+pub mod membership;
+pub mod peers;
 pub mod protocol;
 pub mod service;
 pub mod types;

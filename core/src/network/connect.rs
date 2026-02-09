@@ -4,12 +4,17 @@
 //! resolve the peer's address, based on how recently the relay URL was
 //! confirmed working.
 
-use iroh::endpoint::{Connection, Endpoint};
-use iroh::{EndpointAddr, EndpointId, RelayUrl};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::data::dht::peer::current_timestamp;
+use iroh::endpoint::{Connection, Endpoint};
+use iroh::{EndpointAddr, EndpointId, RelayUrl};
+use rusqlite::Connection as DbConnection;
+use tokio::sync::Mutex;
+use tracing::debug;
+
+use crate::data::dht::peer::{current_timestamp, get_peer_relay_info, update_peer_relay_url};
 
 /// How long a relay URL is considered fresh (1 week).
 /// If the relay URL was last confirmed working within this period,
@@ -113,5 +118,85 @@ fn is_relay_fresh(relay_url: Option<&RelayUrl>, last_success: Option<i64>) -> bo
             now - ts < RELAY_URL_FRESHNESS_SECS
         }
         _ => false,
+    }
+}
+
+/// Smart connector that handles relay URL lookup and connection establishment.
+///
+/// Centralizes the relay-lookup → connect → relay-confirm pattern so services
+/// just call `connect_to_peer(peer_id, alpn, timeout)`.
+#[derive(Clone)]
+pub struct Connector {
+    endpoint: Endpoint,
+    db: Arc<Mutex<DbConnection>>,
+}
+
+impl Connector {
+    /// Create a new Connector.
+    pub fn new(endpoint: Endpoint, db: Arc<Mutex<DbConnection>>) -> Self {
+        Self { endpoint, db }
+    }
+
+    /// Get the underlying endpoint for non-connect operations.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// Connect to a peer by ID.
+    ///
+    /// Looks up the peer's relay URL from the database, uses it if fresh,
+    /// otherwise falls back to DNS discovery. On success with a relay URL,
+    /// updates the relay timestamp in the database.
+    pub async fn connect_to_peer(
+        &self,
+        peer_id: &[u8; 32],
+        alpn: &'static [u8],
+        timeout: Duration,
+    ) -> Result<Connection, ConnectError> {
+        let node_id = EndpointId::from_bytes(peer_id)
+            .map_err(|e| ConnectError::Failed(format!("invalid node id: {}", e)))?;
+
+        // Look up relay info from DB
+        let relay_info = {
+            let db = self.db.lock().await;
+            get_peer_relay_info(&db, peer_id).unwrap_or(None)
+        };
+        let (relay_url_str, relay_last_success) = match &relay_info {
+            Some((url, ts)) => (Some(url.as_str()), *ts),
+            None => (None, None),
+        };
+        let parsed_relay: Option<RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
+
+        // Smart connect: relay-first if fresh, DNS fallback
+        let result = connect(
+            &self.endpoint,
+            node_id,
+            parsed_relay.as_ref(),
+            relay_last_success,
+            alpn,
+            timeout,
+        )
+        .await?;
+
+        // Update relay URL timestamp if confirmed working
+        if result.relay_url_confirmed {
+            if let Some(url) = &parsed_relay {
+                let db = self.db.lock().await;
+                let _ = update_peer_relay_url(
+                    &db,
+                    peer_id,
+                    &url.to_string(),
+                    current_timestamp(),
+                );
+            }
+        }
+
+        debug!(
+            peer = %hex::encode(&peer_id[..8]),
+            relay_confirmed = result.relay_url_confirmed,
+            "connection established"
+        );
+
+        Ok(result.connection)
     }
 }

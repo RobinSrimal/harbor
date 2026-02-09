@@ -1,4 +1,4 @@
-//! Outgoing Harbor operations (client side)
+//! Harbor client-side operations
 //!
 //! Handles operations when acting as a client to Harbor Nodes:
 //! - Creating store requests (replicating packets to Harbor Nodes)
@@ -6,33 +6,31 @@
 //! - Processing pull responses
 //! - Creating acknowledgments
 //! - Creating and applying sync requests/responses (Harbor-to-Harbor)
-//! - Network send operations (store, pull, ack, sync to remote Harbor Nodes)
 //! - Finding Harbor Nodes via DHT
+//! - Packet processing (decrypt + dispatch)
 //! - Maintenance (cleanup)
 
 use std::sync::Arc;
 
-use iroh::EndpointId;
 use rusqlite::Connection;
 use tracing::{debug, info, trace};
-
-use crate::data::dht::peer::{get_peer_relay_info, update_peer_relay_url, current_timestamp};
-use crate::network::connect;
 
 use crate::data::harbor::{
     cache_packet, cleanup_expired, get_active_harbor_ids, get_cached_packet, get_packets_for_sync,
     get_undelivered_recipients, mark_pulled, was_pulled,
 };
 use crate::network::dht::DhtService;
-use crate::network::process::{ProcessContext, ProcessScope, ProcessError, process_packet};
+use crate::network::process::{ProcessContext, ProcessError, ProcessScope, process_packet};
 use crate::network::stream::StreamService;
-use crate::protocol::ProtocolError;
 use crate::resilience::ProofOfWork;
-use crate::security::{SendPacket, EpochKeys, VerificationMode, verify_and_decrypt_with_epoch, verify_and_decrypt_dm_packet};
+use crate::security::{
+    EpochKeys, SendPacket, VerificationMode, verify_and_decrypt_dm_packet,
+    verify_and_decrypt_with_epoch,
+};
 
 use super::protocol::{
-    DeliveryAck, HarborMessage, PacketInfo, PullRequest, PullResponse,
-    StoreRequest, SyncRequest, SyncResponse, HARBOR_ALPN,
+    DeliveryAck, PacketInfo, PullRequest, PullResponse, StoreRequest, SyncRequest,
+    SyncResponse,
 };
 use super::service::{HarborError, HarborService};
 
@@ -230,15 +228,26 @@ impl HarborService {
                     ))
                 })?;
 
-                let epoch_keys = EpochKeys::derive_from_secret(send_packet.epoch, &stored_key.key_data);
+                let epoch_keys =
+                    EpochKeys::derive_from_secret(send_packet.epoch, &stored_key.key_data);
 
                 // Try Full verification first (most common)
-                verify_and_decrypt_with_epoch(&send_packet, topic_id, &epoch_keys, VerificationMode::Full)
-                    .or_else(|_| {
-                        // Fall back to MacOnly for TopicJoin packets
-                        verify_and_decrypt_with_epoch(&send_packet, topic_id, &epoch_keys, VerificationMode::MacOnly)
-                    })
-                    .map_err(|e| ProcessError::Decode(format!("topic decryption failed: {}", e)))?
+                verify_and_decrypt_with_epoch(
+                    &send_packet,
+                    topic_id,
+                    &epoch_keys,
+                    VerificationMode::Full,
+                )
+                .or_else(|_| {
+                    // Fall back to MacOnly for TopicJoin packets
+                    verify_and_decrypt_with_epoch(
+                        &send_packet,
+                        topic_id,
+                        &epoch_keys,
+                        VerificationMode::MacOnly,
+                    )
+                })
+                .map_err(|e| ProcessError::Decode(format!("topic decryption failed: {}", e)))?
             }
         };
 
@@ -387,16 +396,7 @@ impl HarborService {
         Ok(deleted)
     }
 
-    // ============ Network Operations ============
-
-    /// Maximum buffer size for store responses (small, just status)
-    pub const STORE_RESPONSE_MAX_SIZE: usize = 1024;
-
-    /// Maximum buffer size for pull responses (can contain many packets)
-    pub const PULL_RESPONSE_MAX_SIZE: usize = 10 * 1024 * 1024; // 10MB
-
-    /// Maximum buffer size for sync responses
-    pub const SYNC_RESPONSE_MAX_SIZE: usize = 1024 * 1024; // 1MB
+    // ============ Harbor Node Discovery ============
 
     /// Find Harbor Nodes for a given HarborID from cache
     ///
@@ -437,301 +437,6 @@ impl HarborService {
             Err(e) => {
                 debug!(error = %e, "DHT lookup failed");
                 vec![]
-            }
-        }
-    }
-
-    /// Send a StoreRequest to a Harbor Node
-    pub async fn send_harbor_store(
-        &self,
-        harbor_node: &[u8; 32],
-        request: &StoreRequest,
-    ) -> Result<bool, ProtocolError> {
-        let endpoint = self.endpoint();
-        let db = self.db();
-        let connect_timeout = self.connect_timeout;
-        let response_timeout = self.response_timeout;
-
-        let node_id = EndpointId::from_bytes(harbor_node)
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        let relay_info = {
-            let db = db.lock().await;
-            get_peer_relay_info(&db, harbor_node).unwrap_or(None)
-        };
-        let (relay_url_str, relay_last_success) = match &relay_info {
-            Some((url, ts)) => (Some(url.as_str()), *ts),
-            None => (None, None),
-        };
-        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
-
-        let result = connect::connect(
-            endpoint, node_id, parsed_relay.as_ref(), relay_last_success, HARBOR_ALPN, connect_timeout,
-        )
-        .await
-        .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        let conn = result.connection;
-        if result.relay_url_confirmed {
-            if let Some(url) = &parsed_relay {
-                let db = db.lock().await;
-                let _ = update_peer_relay_url(&db, harbor_node, &url.to_string(), current_timestamp());
-            }
-        }
-
-        let message = HarborMessage::Store(request.clone());
-        let encoded = message.encode();
-
-        // Send request
-        let mut send = conn.open_uni().await
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-        tokio::io::AsyncWriteExt::write_all(&mut send, &encoded).await
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-        send.finish()
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        // Wait for response with timeout
-        let mut recv = tokio::time::timeout(
-            response_timeout,
-            conn.accept_uni(),
-        )
-        .await
-        .map_err(|_| ProtocolError::Network("response timeout".to_string()))?
-        .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        let response_bytes = recv.read_to_end(Self::STORE_RESPONSE_MAX_SIZE).await
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        let response = HarborMessage::decode(&response_bytes)
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        match response {
-            HarborMessage::StoreResponse(resp) => Ok(resp.success),
-            _ => Err(ProtocolError::Network("unexpected response".to_string())),
-        }
-    }
-
-    /// Send a PullRequest to a Harbor Node
-    pub async fn send_harbor_pull(
-        &self,
-        harbor_node: &[u8; 32],
-        request: &PullRequest,
-    ) -> Result<Vec<PacketInfo>, ProtocolError> {
-        let endpoint = self.endpoint();
-        let db = self.db();
-        let connect_timeout = self.connect_timeout;
-        let response_timeout = self.response_timeout;
-
-        let node_id = EndpointId::from_bytes(harbor_node)
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        let relay_info = {
-            let db = db.lock().await;
-            get_peer_relay_info(&db, harbor_node).unwrap_or(None)
-        };
-        let (relay_url_str, relay_last_success) = match &relay_info {
-            Some((url, ts)) => (Some(url.as_str()), *ts),
-            None => (None, None),
-        };
-        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
-
-        let result = connect::connect(
-            endpoint, node_id, parsed_relay.as_ref(), relay_last_success, HARBOR_ALPN, connect_timeout,
-        )
-        .await
-        .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        let conn = result.connection;
-        if result.relay_url_confirmed {
-            if let Some(url) = &parsed_relay {
-                let db = db.lock().await;
-                let _ = update_peer_relay_url(&db, harbor_node, &url.to_string(), current_timestamp());
-            }
-        }
-
-        let message = HarborMessage::Pull(request.clone());
-        let encoded = message.encode();
-
-        // Send request
-        let mut send = conn.open_uni().await
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-        tokio::io::AsyncWriteExt::write_all(&mut send, &encoded).await
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-        send.finish()
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        // Wait for response with timeout (larger buffer for packets)
-        let mut recv = tokio::time::timeout(
-            response_timeout,
-            conn.accept_uni(),
-        )
-        .await
-        .map_err(|_| ProtocolError::Network("response timeout".to_string()))?
-        .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        let response_bytes = recv.read_to_end(Self::PULL_RESPONSE_MAX_SIZE).await
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        let response = HarborMessage::decode(&response_bytes)
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        match response {
-            HarborMessage::PullResponse(resp) => Ok(resp.packets),
-            _ => Err(ProtocolError::Network("unexpected response".to_string())),
-        }
-    }
-
-    /// Send a DeliveryAck to a Harbor Node (fire-and-forget)
-    pub async fn send_harbor_ack(
-        &self,
-        harbor_node: &[u8; 32],
-        ack: &DeliveryAck,
-    ) -> Result<(), ProtocolError> {
-        let endpoint = self.endpoint();
-        let db = self.db();
-        let connect_timeout = self.connect_timeout;
-
-        let node_id = EndpointId::from_bytes(harbor_node)
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        let relay_info = {
-            let db = db.lock().await;
-            get_peer_relay_info(&db, harbor_node).unwrap_or(None)
-        };
-        let (relay_url_str, relay_last_success) = match &relay_info {
-            Some((url, ts)) => (Some(url.as_str()), *ts),
-            None => (None, None),
-        };
-        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
-
-        let result = connect::connect(
-            endpoint, node_id, parsed_relay.as_ref(), relay_last_success, HARBOR_ALPN, connect_timeout,
-        )
-        .await
-        .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        let conn = result.connection;
-        if result.relay_url_confirmed {
-            if let Some(url) = &parsed_relay {
-                let db = db.lock().await;
-                let _ = update_peer_relay_url(&db, harbor_node, &url.to_string(), current_timestamp());
-            }
-        }
-
-        let message = HarborMessage::Ack(ack.clone());
-        let encoded = message.encode();
-
-        // Send ack (no response expected)
-        let mut send = conn.open_uni().await
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-        tokio::io::AsyncWriteExt::write_all(&mut send, &encoded).await
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-        send.finish()
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        Ok(())
-    }
-
-    /// Send a SyncRequest to another Harbor Node
-    pub async fn send_harbor_sync(
-        &self,
-        harbor_node: &[u8; 32],
-        request: &SyncRequest,
-    ) -> Result<SyncResponse, ProtocolError> {
-        let endpoint = self.endpoint();
-        let db = self.db();
-        let connect_timeout = self.connect_timeout;
-
-        let node_hex = hex::encode(harbor_node);
-        debug!(partner = %node_hex, "Harbor sync: connecting to partner");
-
-        let node_id = EndpointId::from_bytes(harbor_node)
-            .map_err(|_| ProtocolError::Network("invalid node id".into()))?;
-
-        let relay_info = {
-            let db = db.lock().await;
-            get_peer_relay_info(&db, harbor_node).unwrap_or(None)
-        };
-        let (relay_url_str, relay_last_success) = match &relay_info {
-            Some((url, ts)) => (Some(url.as_str()), *ts),
-            None => (None, None),
-        };
-        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
-
-        let result = connect::connect(
-            endpoint, node_id, parsed_relay.as_ref(), relay_last_success, HARBOR_ALPN, connect_timeout,
-        )
-        .await
-        .map_err(|e| {
-            debug!(partner = %node_hex, error = %e, "Harbor sync: connection failed");
-            ProtocolError::Network(e.to_string())
-        })?;
-
-        let conn = result.connection;
-        if result.relay_url_confirmed {
-            if let Some(url) = &parsed_relay {
-                let db = db.lock().await;
-                let _ = update_peer_relay_url(&db, harbor_node, &url.to_string(), current_timestamp());
-            }
-        }
-
-        debug!(partner = %node_hex, "Harbor sync: connection established, opening stream");
-
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| {
-                debug!(partner = %node_hex, error = %e, "Harbor sync: failed to open stream");
-                ProtocolError::Network(e.to_string())
-            })?;
-
-        // Send request
-        let msg = HarborMessage::SyncRequest(request.clone());
-        let data = postcard::to_allocvec(&msg)
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        debug!(
-            partner = %node_hex,
-            request_size = data.len(),
-            packets_we_have = request.have_packets.len(),
-            "Harbor sync: sending request"
-        );
-
-        send.write_all(&data).await
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-        send.finish()
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        // Read response
-        let response_data = recv.read_to_end(Self::SYNC_RESPONSE_MAX_SIZE)
-            .await
-            .map_err(|e| {
-                debug!(partner = %node_hex, error = %e, "Harbor sync: failed to read response");
-                ProtocolError::Network(e.to_string())
-            })?;
-
-        debug!(
-            partner = %node_hex,
-            response_size = response_data.len(),
-            "Harbor sync: received response"
-        );
-
-        let response: HarborMessage = postcard::from_bytes(&response_data)
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        match response {
-            HarborMessage::SyncResponse(resp) => {
-                debug!(
-                    partner = %node_hex,
-                    missing_packets = resp.missing_packets.len(),
-                    delivery_updates = resp.delivery_updates.len(),
-                    "Harbor sync: parsed response"
-                );
-                Ok(resp)
-            },
-            other => {
-                debug!(partner = %node_hex, "Harbor sync: unexpected response type");
-                Err(ProtocolError::Network(format!("unexpected response: {:?}", std::mem::discriminant(&other))))
             }
         }
     }

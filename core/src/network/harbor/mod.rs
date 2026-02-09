@@ -38,8 +38,9 @@
 //! - `Harbor SYNC:` - Harbor-to-Harbor sync
 //! - `Harbor CLIENT:` - outgoing operations
 
+pub mod client;
 pub mod incoming;
-pub mod outgoing;
+pub mod network;
 pub mod protocol;
 pub mod service;
 

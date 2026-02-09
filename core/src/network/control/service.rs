@@ -3,18 +3,23 @@
 //! Handles peer connections, topic invitations, and membership management.
 //! One-off exchanges: open connection, send message, get response, close.
 //! Does not maintain a connection pool.
+//!
+//! Business logic is split by domain:
+//! - `peers.rs` — peer connection lifecycle
+//! - `membership.rs` — topic invite/join/leave/remove
+//! - `lifecycle.rs` — topic create/join/list/get_invite
+//! - `introductions.rs` — suggest peer
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use iroh::{Endpoint, EndpointId};
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{mpsc, Mutex};
 use tracing::debug;
 
-use crate::data::dht::peer::get_peer_relay_info;
 use crate::data::LocalIdentity;
-use crate::network::connect;
+use crate::data::send::store_outgoing_packet;
+use crate::network::connect::Connector;
 use crate::network::gate::ConnectionGate;
 use crate::protocol::ProtocolEvent;
 use crate::resilience::{PoWConfig, PoWResult, PoWVerifier, ProofOfWork, build_context};
@@ -72,8 +77,8 @@ pub type ControlResult<T> = Result<T, ControlError>;
 /// - Key rotation (member removal)
 /// - Peer introductions (suggest)
 pub struct ControlService {
-    /// Iroh endpoint for QUIC connections
-    endpoint: Endpoint,
+    /// Connector for outgoing QUIC connections
+    connector: Arc<Connector>,
     /// Local identity
     identity: Arc<LocalIdentity>,
     /// Database connection
@@ -95,14 +100,14 @@ impl std::fmt::Debug for ControlService {
 impl ControlService {
     /// Create a new ControlService
     pub fn new(
-        endpoint: Endpoint,
+        connector: Arc<Connector>,
         identity: Arc<LocalIdentity>,
         db: Arc<Mutex<DbConnection>>,
         event_tx: mpsc::Sender<ProtocolEvent>,
         connection_gate: Option<Arc<ConnectionGate>>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            endpoint,
+            connector,
             identity,
             db,
             event_tx,
@@ -137,8 +142,8 @@ impl ControlService {
     }
 
     /// Get a reference to the endpoint
-    pub fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
+    pub fn endpoint(&self) -> &iroh::Endpoint {
+        self.connector.endpoint()
     }
 
     // === PoW Verification ===
@@ -178,191 +183,84 @@ impl ControlService {
     pub(crate) async fn dial_peer(
         &self,
         peer_id: &[u8; 32],
-        relay_url: Option<&str>,
     ) -> ControlResult<irpc::Client<ControlRpcProtocol>> {
-        // Try to get relay info from DB if not provided
-        let (parsed_relay, relay_last_success) = if let Some(url) = relay_url {
-            (url.parse::<iroh::RelayUrl>().ok(), None)
-        } else {
-            let relay_info = {
-                let db = self.db.lock().await;
-                get_peer_relay_info(&db, peer_id)
-                    .map_err(|e| ControlError::Database(e.to_string()))?
-            };
-            match relay_info {
-                Some((url, last_success)) => (url.parse::<iroh::RelayUrl>().ok(), last_success),
-                None => (None, None),
-            }
-        };
-
-        let node_id = EndpointId::from_bytes(peer_id)
+        let conn = self.connector
+            .connect_to_peer(peer_id, CONTROL_ALPN, Duration::from_secs(10))
+            .await
             .map_err(|e| ControlError::Connection(e.to_string()))?;
 
-        let connect_result = connect::connect(
-            &self.endpoint,
-            node_id,
-            parsed_relay.as_ref(),
-            relay_last_success,
-            CONTROL_ALPN,
-            Duration::from_secs(10),
-        )
-        .await
-        .map_err(|e| ControlError::Connection(e.to_string()))?;
-
-        debug!(
-            peer = %hex::encode(&peer_id[..8]),
-            relay_confirmed = connect_result.relay_url_confirmed,
-            "control connection established"
-        );
-
-        // Wrap connection for irpc client
         let rpc_client = irpc::Client::<ControlRpcProtocol>::boxed(
-            crate::network::rpc::ExistingConnection::new(&connect_result.connection),
+            crate::network::rpc::ExistingConnection::new(&conn),
         );
         Ok(rpc_client)
     }
 
-    // =========================================================================
-    // Connection operations (implemented in outgoing.rs)
-    // =========================================================================
-
-    /// Request a connection to a peer
-    ///
-    /// Sends a ConnectRequest message. If a token is provided, it's for the
-    /// QR code / invite string flow where the recipient auto-accepts valid tokens.
-    pub async fn request_connection(
+    /// Store a control packet for harbor replication
+    pub(crate) async fn store_control_packet(
         &self,
-        peer_id: &[u8; 32],
-        relay_url: Option<&str>,
-        display_name: Option<&str>,
-        token: Option<[u8; 32]>,
-    ) -> ControlResult<[u8; 32]> {
-        super::outgoing::request_connection(self, peer_id, relay_url, display_name, token).await
-    }
-
-    /// Accept a connection request
-    pub async fn accept_connection(
-        &self,
-        request_id: &[u8; 32],
+        packet_id: &[u8; 32],
+        harbor_id: &[u8; 32],
+        recipients: &[[u8; 32]],
+        packet_data: &[u8],
+        packet_type: ControlPacketType,
     ) -> ControlResult<()> {
-        super::outgoing::accept_connection(self, request_id).await
+        let mut db = self.db.lock().await;
+
+        // For point-to-point control packets, use harbor_id as topic_id
+        // so the replication task seals them as DM packets (topic_id == harbor_id check).
+        // For topic-scoped packets (TopicJoin/TopicLeave), harbor_id is hash(topic_id),
+        // so they won't match and will be sealed as topic packets.
+        let topic_id = *harbor_id;
+
+        // Prepend type byte to packet data so receiver can identify Control packets.
+        // DM packets use 0x80+ range, Control packets use their ControlPacketType value.
+        let mut prefixed_data = Vec::with_capacity(1 + packet_data.len());
+        prefixed_data.push(packet_type as u8);
+        prefixed_data.extend_from_slice(packet_data);
+
+        store_outgoing_packet(
+            &mut db,
+            packet_id,
+            &topic_id,
+            harbor_id,
+            &prefixed_data,
+            recipients,
+            packet_type as u8,
+        )
+        .map_err(|e| ControlError::Database(e.to_string()))?;
+
+        debug!(
+            packet_id = %hex::encode(&packet_id[..8]),
+            harbor_id = %hex::encode(&harbor_id[..8]),
+            packet_type = ?packet_type,
+            recipients = recipients.len(),
+            "stored control packet for harbor replication"
+        );
+
+        Ok(())
     }
+}
 
-    /// Decline a connection request
-    pub async fn decline_connection(
-        &self,
-        request_id: &[u8; 32],
-        reason: Option<&str>,
-    ) -> ControlResult<()> {
-        super::outgoing::decline_connection(self, request_id, reason).await
-    }
+/// Compute PoW for a control message
+/// Context: sender_id || message_type_byte
+pub(super) fn compute_control_pow(sender_id: &[u8; 32], message_type: ControlPacketType) -> ControlResult<ProofOfWork> {
+    let context = build_context(&[sender_id, &[message_type as u8]]);
+    let difficulty = PoWConfig::control().base_difficulty;
+    ProofOfWork::compute(&context, difficulty)
+        .ok_or_else(|| ControlError::Rpc("failed to compute PoW".to_string()))
+}
 
-    /// Generate a connect token (for QR code / invite string)
-    pub async fn generate_connect_token(&self) -> ControlResult<ConnectInvite> {
-        super::outgoing::generate_connect_token(self).await
-    }
+/// Verify sender_id matches the QUIC connection peer
+pub(super) fn verify_sender(claimed_sender: &[u8; 32], quic_sender: &[u8; 32]) -> bool {
+    claimed_sender == quic_sender
+}
 
-    /// Block a peer
-    pub async fn block_peer(&self, peer_id: &[u8; 32]) -> ControlResult<()> {
-        super::outgoing::block_peer(self, peer_id).await
-    }
-
-    /// Unblock a peer
-    pub async fn unblock_peer(&self, peer_id: &[u8; 32]) -> ControlResult<()> {
-        super::outgoing::unblock_peer(self, peer_id).await
-    }
-
-    // =========================================================================
-    // Topic operations (implemented in outgoing.rs)
-    // =========================================================================
-
-    /// Invite a peer to a topic
-    pub async fn invite_to_topic(
-        &self,
-        peer_id: &[u8; 32],
-        topic_id: &[u8; 32],
-    ) -> ControlResult<[u8; 32]> {
-        super::outgoing::invite_to_topic(self, peer_id, topic_id).await
-    }
-
-    /// Accept a topic invite
-    pub async fn accept_topic_invite(
-        &self,
-        message_id: &[u8; 32],
-    ) -> ControlResult<()> {
-        super::outgoing::accept_topic_invite(self, message_id).await
-    }
-
-    /// Decline a topic invite
-    pub async fn decline_topic_invite(
-        &self,
-        message_id: &[u8; 32],
-    ) -> ControlResult<()> {
-        super::outgoing::decline_topic_invite(self, message_id).await
-    }
-
-    /// Leave a topic
-    pub async fn leave_topic(&self, topic_id: &[u8; 32]) -> ControlResult<()> {
-        super::outgoing::leave_topic(self, topic_id).await
-    }
-
-    // =========================================================================
-    // Topic lifecycle operations (implemented in outgoing.rs)
-    // =========================================================================
-
-    /// Create a new topic
-    ///
-    /// Creates a new topic with this node as the only member.
-    /// Returns an invite that can be shared with others.
-    pub async fn create_topic(&self) -> ControlResult<super::types::TopicInvite> {
-        super::outgoing::create_topic(self).await
-    }
-
-    /// Join an existing topic
-    ///
-    /// Joins a topic using an invite received from another member.
-    /// The invite contains all current topic members.
-    /// Announces our presence to other members.
-    pub async fn join_topic(&self, invite: super::types::TopicInvite) -> ControlResult<()> {
-        super::outgoing::join_topic(self, invite).await
-    }
-
-    /// List all topics we're subscribed to
-    pub async fn list_topics(&self) -> ControlResult<Vec<[u8; 32]>> {
-        super::outgoing::list_topics(self).await
-    }
-
-    /// Get an invite for an existing topic
-    ///
-    /// Returns a fresh invite containing ALL current topic members.
-    pub async fn get_invite(&self, topic_id: &[u8; 32]) -> ControlResult<super::types::TopicInvite> {
-        super::outgoing::get_invite(self, topic_id).await
-    }
-
-    /// Remove a member from a topic (admin only)
-    ///
-    /// Generates a new epoch key and sends it to all remaining members.
-    pub async fn remove_topic_member(
-        &self,
-        topic_id: &[u8; 32],
-        member_id: &[u8; 32],
-    ) -> ControlResult<()> {
-        super::outgoing::remove_topic_member(self, topic_id, member_id).await
-    }
-
-    // =========================================================================
-    // Introduction operations (implemented in outgoing.rs)
-    // =========================================================================
-
-    /// Suggest a peer to another peer
-    pub async fn suggest_peer(
-        &self,
-        to_peer: &[u8; 32],
-        suggested_peer: &[u8; 32],
-        note: Option<&str>,
-    ) -> ControlResult<[u8; 32]> {
-        super::outgoing::suggest_peer(self, to_peer, suggested_peer, note).await
-    }
+/// Generate a random 32-byte ID
+pub fn generate_id() -> [u8; 32] {
+    use rand::RngCore;
+    let mut id = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut id);
+    id
 }
 
 /// A connect invite (QR code / invite string data)
@@ -417,14 +315,6 @@ impl ConnectInvite {
             token: tk,
         })
     }
-}
-
-/// Generate a random 32-byte ID
-pub fn generate_id() -> [u8; 32] {
-    use rand::RngCore;
-    let mut id = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut id);
-    id
 }
 
 #[cfg(test)]

@@ -233,9 +233,12 @@ impl Protocol {
             dht_service.clone(),
         ));
 
+        // Create shared Connector for outgoing connections
+        let connector = Arc::new(crate::network::Connector::new(endpoint.clone(), db.clone()));
+
         // Initialize Control service
         let control_service = ControlService::new(
-            endpoint.clone(),
+            connector.clone(),
             identity.clone(),
             db.clone(),
             event_tx.clone(),

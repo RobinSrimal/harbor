@@ -5,7 +5,6 @@
 //! - Pull requests (retrieving missed packets)
 //! - Acknowledgments (marking packets as delivered)
 //! - Sync requests (Harbor-to-Harbor synchronization)
-//! - Connection handler (accepts QUIC connections, dispatches to handlers)
 
 use rusqlite::Connection;
 use tracing::{debug, info, warn};
@@ -18,7 +17,7 @@ use crate::resilience::{RateLimitResult, StorageCheckResult};
 use crate::security::send::packet::{verify_for_storage, PacketError};
 
 use super::protocol::{
-    DeliveryAck, DeliveryUpdate, HarborMessage, PacketInfo, PullRequest,
+    DeliveryAck, DeliveryUpdate, PacketInfo, PullRequest,
     PullResponse, StoreRequest, StoreResponse, SyncRequest, SyncResponse,
 };
 use super::service::{HarborError, HarborService};
@@ -521,43 +520,6 @@ impl HarborService {
         Ok(updates)
     }
 
-    /// Process incoming harbor message and return response
-    ///
-    /// The `authenticated_node_id` is the verified NodeId from the iroh connection
-    /// (obtained via `connection.remote_id()`). This is used to verify that
-    /// Pull and Ack requests come from the claimed recipient.
-    pub fn handle_message(
-        &self,
-        conn: &mut Connection,
-        message: HarborMessage,
-        authenticated_node_id: &[u8; 32],
-    ) -> Result<Option<HarborMessage>, HarborError> {
-        match message {
-            HarborMessage::Store(req) => {
-                let resp = self.handle_store(conn, req)?;
-                Ok(Some(HarborMessage::StoreResponse(resp)))
-            }
-            HarborMessage::Pull(req) => {
-                let resp = self.handle_pull(conn, req, authenticated_node_id)?;
-                Ok(Some(HarborMessage::PullResponse(resp)))
-            }
-            HarborMessage::Ack(ack) => {
-                self.handle_ack(conn, ack, authenticated_node_id)?;
-                Ok(None) // No response needed
-            }
-            HarborMessage::SyncRequest(req) => {
-                let resp = self.handle_sync(conn, req, authenticated_node_id)?;
-                Ok(Some(HarborMessage::SyncResponse(resp)))
-            }
-            HarborMessage::StoreResponse(_)
-            | HarborMessage::PullResponse(_)
-            | HarborMessage::SyncResponse(_) => {
-                // These are responses, not requests - shouldn't be handled here
-                Ok(None)
-            }
-        }
-    }
-
 }
 
 #[cfg(test)]
@@ -942,107 +904,6 @@ mod tests {
         let undelivered = get_undelivered_recipients(&conn, &test_id(10)).unwrap();
         assert_eq!(undelivered.len(), 1);
         assert_eq!(undelivered[0], test_id(41)); // Only 41 remaining
-    }
-
-    #[test]
-    fn test_handle_message_routing() {
-        let mut conn = setup_db();
-        let service = HarborService::without_rate_limiting(test_id(1));
-
-        // Test store request (authenticated_node_id not checked for Store)
-        let store_msg = HarborMessage::Store(StoreRequest {
-            packet_data: b"data".to_vec(),
-            packet_id: test_id(10),
-            harbor_id: test_id(20),
-            sender_id: test_id(30),
-            recipients: vec![test_id(40)],
-            pow: test_pow(),
-        });
-
-        // Authenticated node ID is test_id(40)
-        let response = service
-            .handle_message(&mut conn, store_msg, &test_id(40))
-            .unwrap();
-        assert!(matches!(response, Some(HarborMessage::StoreResponse(_))));
-
-        // Test pull request - authenticated as test_id(40) which matches recipient_id
-        let pull_msg = HarborMessage::Pull(PullRequest {
-            harbor_id: test_id(20),
-            recipient_id: test_id(40),
-            since_timestamp: 0,
-            already_have: vec![],
-            relay_url: None,
-        });
-
-        let response = service
-            .handle_message(&mut conn, pull_msg, &test_id(40))
-            .unwrap();
-        assert!(matches!(response, Some(HarborMessage::PullResponse(_))));
-    }
-
-    #[test]
-    fn test_handle_message_pull_unauthorized() {
-        let mut conn = setup_db();
-        let service = HarborService::without_rate_limiting(test_id(1));
-
-        // Store a packet first
-        cache_packet(
-            &mut conn,
-            &test_id(10),
-            &test_id(20),
-            &test_id(30),
-            b"packet",
-            &[test_id(40)],
-            false,
-        )
-        .unwrap();
-
-        // Try to pull as test_id(40) but authenticated as test_id(99)
-        let pull_msg = HarborMessage::Pull(PullRequest {
-            harbor_id: test_id(20),
-            recipient_id: test_id(40), // Claims to be 40
-            since_timestamp: 0,
-            already_have: vec![],
-            relay_url: None,
-        });
-
-        let result = service.handle_message(&mut conn, pull_msg, &test_id(99)); // But authenticated as 99
-        assert!(matches!(result, Err(HarborError::Unauthorized)));
-    }
-
-    #[test]
-    fn test_handle_sync_message_routing() {
-        let mut conn = setup_db();
-        let service = HarborService::without_rate_limiting(test_id(1));
-
-        // Store a packet
-        cache_packet(
-            &mut conn,
-            &test_id(10),
-            &test_id(20),
-            &test_id(30),
-            b"packet",
-            &[test_id(40)],
-            false,
-        )
-        .unwrap();
-
-        let sync_msg = HarborMessage::SyncRequest(SyncRequest {
-            harbor_id: test_id(20),
-            have_packets: vec![],
-            delivery_updates: vec![],
-            member_entries: vec![],
-        });
-
-        // Sync requests don't need authentication (any Harbor Node can sync)
-        let response = service
-            .handle_message(&mut conn, sync_msg, &test_id(99))
-            .unwrap();
-        assert!(matches!(response, Some(HarborMessage::SyncResponse(_))));
-
-        if let Some(HarborMessage::SyncResponse(resp)) = response {
-            assert_eq!(resp.missing_packets.len(), 1);
-        }
     }
 
     #[test]
