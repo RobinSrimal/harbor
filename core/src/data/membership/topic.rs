@@ -112,7 +112,8 @@ pub fn subscribe_topic_with_admin(
 
     // Use INSERT OR IGNORE to preserve original created_at on rejoin
     conn.execute(
-        "INSERT OR IGNORE INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+        "INSERT OR IGNORE INTO topics (topic_id, harbor_id, admin_peer_id)
+         VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
         params![topic_id.as_slice(), subscription.harbor_id.as_slice(), admin_id.as_slice()],
     )?;
 
@@ -147,7 +148,8 @@ pub fn subscribe_dm_topic(
     // For DMs, harbor_id = endpoint_id (raw, NOT hashed)
     // This matches how DM packets are stored in Harbor (harbor_id = recipient's endpoint_id)
     conn.execute(
-        "INSERT OR IGNORE INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+        "INSERT OR IGNORE INTO topics (topic_id, harbor_id, admin_peer_id)
+         VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
         params![endpoint_id.as_slice(), endpoint_id.as_slice(), endpoint_id.as_slice()],
     )?;
 
@@ -178,7 +180,10 @@ pub fn is_subscribed(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result
 /// Get the admin ID for a topic
 pub fn get_topic_admin(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<Option<[u8; 32]>> {
     conn.query_row(
-        "SELECT admin_id FROM topics WHERE topic_id = ?1",
+        "SELECT p.endpoint_id
+         FROM topics t
+         JOIN peers p ON t.admin_peer_id = p.id
+         WHERE t.topic_id = ?1",
         [topic_id.as_slice()],
         |row| {
             let admin_vec: Vec<u8> = row.get(0)?;
@@ -204,7 +209,9 @@ pub fn is_topic_admin(
     peer_id: &[u8; 32],
 ) -> rusqlite::Result<bool> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM topics WHERE topic_id = ?1 AND admin_id = ?2",
+        "SELECT COUNT(*) FROM topics
+         WHERE topic_id = ?1
+           AND admin_peer_id = (SELECT id FROM peers WHERE endpoint_id = ?2)",
         params![topic_id.as_slice(), peer_id.as_slice()],
         |row| row.get(0),
     )?;
@@ -290,7 +297,8 @@ pub fn add_topic_member(
     ensure_peer_exists(conn, endpoint_id)?;
 
     conn.execute(
-        "INSERT OR REPLACE INTO topic_members (topic_id, endpoint_id) VALUES (?1, ?2)",
+        "INSERT OR REPLACE INTO topic_members (topic_id, peer_id)
+         VALUES (?1, (SELECT id FROM peers WHERE endpoint_id = ?2))",
         params![topic_id.as_slice(), endpoint_id.as_slice()],
     )?;
     Ok(())
@@ -303,7 +311,9 @@ pub fn remove_topic_member(
     endpoint_id: &[u8; 32],
 ) -> rusqlite::Result<bool> {
     let rows = conn.execute(
-        "DELETE FROM topic_members WHERE topic_id = ?1 AND endpoint_id = ?2",
+        "DELETE FROM topic_members
+         WHERE topic_id = ?1
+           AND peer_id = (SELECT id FROM peers WHERE endpoint_id = ?2)",
         params![topic_id.as_slice(), endpoint_id.as_slice()],
     )?;
     Ok(rows > 0)
@@ -316,7 +326,9 @@ pub fn is_topic_member(
     endpoint_id: &[u8; 32],
 ) -> rusqlite::Result<bool> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM topic_members WHERE topic_id = ?1 AND endpoint_id = ?2",
+        "SELECT COUNT(*) FROM topic_members
+         WHERE topic_id = ?1
+           AND peer_id = (SELECT id FROM peers WHERE endpoint_id = ?2)",
         params![topic_id.as_slice(), endpoint_id.as_slice()],
         |row| row.get(0),
     )?;
@@ -326,7 +338,11 @@ pub fn is_topic_member(
 /// Get all members of a topic (endpoint IDs only)
 pub fn get_topic_members(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut stmt = conn.prepare(
-        "SELECT endpoint_id FROM topic_members WHERE topic_id = ?1 ORDER BY joined_at",
+        "SELECT p.endpoint_id
+         FROM topic_members tm
+         JOIN peers p ON tm.peer_id = p.id
+         WHERE tm.topic_id = ?1
+         ORDER BY tm.joined_at",
     )?;
     
     let members = stmt
@@ -370,7 +386,8 @@ pub fn set_topic_members(
         // Ensure member exists in peers table (for FK constraint)
         ensure_peer_exists(&tx, member)?;
         tx.execute(
-            "INSERT OR REPLACE INTO topic_members (topic_id, endpoint_id) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO topic_members (topic_id, peer_id)
+             VALUES (?1, (SELECT id FROM peers WHERE endpoint_id = ?2))",
             params![topic_id.as_slice(), member.as_slice()],
         )?;
     }
@@ -381,7 +398,10 @@ pub fn set_topic_members(
 /// Get topics that a specific endpoint is a member of
 pub fn get_topics_for_member(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut stmt = conn.prepare(
-        "SELECT topic_id FROM topic_members WHERE endpoint_id = ?1",
+        "SELECT tm.topic_id
+         FROM topic_members tm
+         JOIN peers p ON tm.peer_id = p.id
+         WHERE p.endpoint_id = ?1",
     )?;
     
     let topics = stmt
@@ -632,4 +652,3 @@ mod tests {
         assert!(!debug_output.contains(&k_enc_hex), "Debug should NOT contain k_enc");
     }
 }
-

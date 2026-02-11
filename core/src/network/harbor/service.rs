@@ -19,6 +19,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
 
 use crate::data::LocalIdentity;
+use crate::network::connect::Connector;
 use crate::network::dht::DhtService;
 use crate::protocol::ProtocolEvent;
 use crate::resilience::{RateLimitConfig, RateLimiter};
@@ -30,7 +31,7 @@ use crate::resilience::{PoWConfig, PoWResult, PoWVerifier, build_context};
 /// Handles both server-side (acting as Harbor Node) and client-side
 /// (storing to / pulling from Harbor Nodes) operations.
 ///
-/// Owns its resources (endpoint, identity, db, event channel) following
+/// Owns its resources (connector, identity, db, event channel) following
 /// the same pattern as SendService, DhtService, etc.
 ///
 /// Includes abuse protection:
@@ -45,8 +46,8 @@ impl std::fmt::Debug for HarborService {
 
 pub struct HarborService {
     // === Primary resources (shared with other services) ===
-    /// Iroh QUIC endpoint for outgoing connections
-    pub(super) endpoint: Option<Endpoint>,
+    /// Connector for outgoing QUIC connections
+    pub(super) connector: Option<Arc<Connector>>,
     /// Local identity (keypair)
     pub(super) identity: Option<Arc<LocalIdentity>>,
     /// Database connection
@@ -78,7 +79,7 @@ impl HarborService {
     ///
     /// This is the primary constructor, matching the pattern of SendService::new().
     pub fn new(
-        endpoint: Endpoint,
+        connector: Arc<Connector>,
         identity: Arc<LocalIdentity>,
         db: Arc<TokioMutex<DbConnection>>,
         event_tx: mpsc::Sender<ProtocolEvent>,
@@ -89,7 +90,7 @@ impl HarborService {
     ) -> Self {
         let endpoint_id = identity.public_key;
         Self {
-            endpoint: Some(endpoint),
+            connector: Some(connector),
             identity: Some(identity),
             db: Some(db),
             event_tx: Some(event_tx),
@@ -110,7 +111,7 @@ impl HarborService {
         storage_config: StorageConfig,
     ) -> Self {
         Self {
-            endpoint: None,
+            connector: None,
             identity: None,
             db: None,
             event_tx: None,
@@ -163,9 +164,14 @@ impl HarborService {
         self.event_tx.as_ref().expect("HarborService: event_tx not set (test-only instance?)")
     }
 
+    /// Get the connector
+    pub fn connector(&self) -> &Arc<Connector> {
+        self.connector.as_ref().expect("HarborService: connector not set (test-only instance?)")
+    }
+
     /// Get the endpoint
     pub fn endpoint(&self) -> &Endpoint {
-        self.endpoint.as_ref().expect("HarborService: endpoint not set (test-only instance?)")
+        self.connector().endpoint()
     }
 
     /// Get the DHT service
@@ -309,7 +315,7 @@ impl std::error::Error for HarborError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::schema::create_harbor_table;
+    use crate::data::schema::{create_harbor_table, create_peer_table};
     use crate::security::create_key_pair::generate_key_pair;
     use crate::security::send::packet::{PacketBuilder, generate_packet_id};
     use crate::security::topic_keys::harbor_id_from_topic;
@@ -321,6 +327,7 @@ mod tests {
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        create_peer_table(&conn).unwrap();
         create_harbor_table(&conn).unwrap();
         conn
     }

@@ -21,15 +21,12 @@
 //! - `topic.rs` - Topic send + process + handler dispatch
 //! - `dm.rs` - DM send + process + handler dispatch
 //! - `protocol.rs` - irpc wire protocol (SendRpcProtocol, DeliverTopic, DeliverDm, Receipt)
-//! - `pool.rs` - Connection pooling
 
 pub mod dm;
-pub mod pool;
 pub mod protocol;
 pub mod service;
 pub mod topic;
 
-pub use pool::{SendPool, SendPoolConfig, SendPoolError, SendConnectionRef, SendPoolStats, SEND_ALPN as SEND_ALPN_FROM_POOL};
 pub use protocol::{SEND_ALPN, Receipt};
 pub use service::{
     SendConfig, SendService, SendResult, SendError, SendOptions,

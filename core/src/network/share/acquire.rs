@@ -13,12 +13,9 @@ use crate::data::{
     get_blob, get_section_peer_suggestion, get_section_traces, mark_blob_complete,
     record_section_received, BlobMetadata, BlobState, CHUNK_SIZE,
 };
-use crate::data::dht::peer::{current_timestamp, get_peer_relay_info, update_peer_relay_url};
-use crate::network::connect;
-
 use super::protocol::{
     ChunkMapRequest, ChunkMapResponse, ChunkRequest, ChunkResponse, PeerChunks, PeerSuggestion,
-    ShareMessage, SHARE_ALPN,
+    ShareMessage,
 };
 use super::service::{ChunkProcessResult, PeerAssignment, PullPlan, ShareError, ShareService};
 
@@ -522,40 +519,9 @@ impl ShareService {
         node_id: EndpointId,
     ) -> Result<iroh::endpoint::Connection, ShareError> {
         let endpoint_id_bytes: [u8; 32] = *node_id.as_bytes();
-        let relay_info = {
-            let db = self.db.lock().await;
-            get_peer_relay_info(&db, &endpoint_id_bytes).unwrap_or(None)
-        };
-        let (relay_url_str, relay_last_success) = match &relay_info {
-            Some((url, ts)) => (Some(url.as_str()), *ts),
-            None => (None, None),
-        };
-        let parsed_relay: Option<iroh::RelayUrl> =
-            relay_url_str.and_then(|u| u.parse().ok());
-
-        let result = connect::connect(
-            &self.endpoint,
-            node_id,
-            parsed_relay.as_ref(),
-            relay_last_success,
-            SHARE_ALPN,
-            self.config.connect_timeout,
-        )
-        .await
-        .map_err(|e| ShareError::Connection(e.to_string()))?;
-
-        if result.relay_url_confirmed {
-            if let Some(url) = &parsed_relay {
-                let db = self.db.lock().await;
-                let _ = update_peer_relay_url(
-                    &db,
-                    &endpoint_id_bytes,
-                    &url.to_string(),
-                    current_timestamp(),
-                );
-            }
-        }
-
-        Ok(result.connection)
+        self.connector
+            .connect_with_timeout(&endpoint_id_bytes, self.config.connect_timeout)
+            .await
+            .map_err(|e| ShareError::Connection(e.to_string()))
     }
 }

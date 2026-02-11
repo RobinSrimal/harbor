@@ -12,24 +12,22 @@
 //! - `topic.rs` — topic send + process + handler
 //! - `dm.rs` — DM send + process + handler
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use iroh::{Endpoint, EndpointId};
+use iroh::EndpointId;
 use iroh::endpoint::Connection;
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use crate::data::dht::peer::{get_peer_relay_info, update_peer_relay_url, current_timestamp};
 use crate::data::send::acknowledge_receipt as db_acknowledge_receipt;
 use crate::data::LocalIdentity;
-use crate::network::connect;
+use crate::network::connect::Connector;
 use crate::network::gate::ConnectionGate;
 use crate::protocol::ProtocolEvent;
 use crate::resilience::{ProofOfWork, PoWConfig, PoWResult, PoWVerifier, build_context};
 use crate::security::PacketError;
-use super::protocol::{SEND_ALPN, Receipt};
+use super::protocol::Receipt;
 
 // =============================================================================
 // Configuration
@@ -228,7 +226,7 @@ impl From<PacketError> for ReceiveError {
 
 /// Send service - single entry point for all send operations
 ///
-/// Owns connection cache, identity, and provides both outgoing
+/// Owns connector, identity, and provides both outgoing
 /// (send_to_topic) and incoming (handle_deliver_topic) operations.
 impl std::fmt::Debug for SendService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -237,18 +235,14 @@ impl std::fmt::Debug for SendService {
 }
 
 pub struct SendService {
-    /// Iroh endpoint
-    endpoint: Endpoint,
+    /// Connector for outgoing QUIC connections
+    connector: Arc<Connector>,
     /// Local identity
     identity: Arc<LocalIdentity>,
     /// Database connection
     db: Arc<Mutex<DbConnection>>,
     /// Event sender (for incoming packet processing)
     event_tx: mpsc::Sender<ProtocolEvent>,
-    /// Connection timeout
-    send_timeout: Duration,
-    /// Active connections cache
-    connections: Arc<RwLock<HashMap<EndpointId, Connection>>>,
     /// Stream service for stream signaling routing (set after construction)
     stream_service: RwLock<Option<Arc<crate::network::stream::StreamService>>>,
     /// Connection gate for peer authorization
@@ -260,19 +254,17 @@ pub struct SendService {
 impl SendService {
     /// Create a new Send service
     pub fn new(
-        endpoint: Endpoint,
+        connector: Arc<Connector>,
         identity: Arc<LocalIdentity>,
         db: Arc<Mutex<DbConnection>>,
         event_tx: mpsc::Sender<ProtocolEvent>,
         connection_gate: Option<Arc<ConnectionGate>>,
     ) -> Self {
         Self {
-            endpoint,
+            connector,
             identity,
             db,
             event_tx,
-            send_timeout: Duration::from_secs(5),
-            connections: Arc::new(RwLock::new(HashMap::new())),
             stream_service: RwLock::new(None),
             connection_gate,
             pow_verifier: StdMutex::new(PoWVerifier::new(PoWConfig::send())),
@@ -360,65 +352,17 @@ impl SendService {
 
     /// Get or create a connection to a node
     pub(crate) async fn get_connection(&self, node_id: EndpointId) -> Result<Connection, SendError> {
-        // Check cache
-        {
-            let connections = self.connections.read().await;
-            if let Some(conn) = connections.get(&node_id) {
-                if conn.close_reason().is_none() {
-                    return Ok(conn.clone());
-                }
-            }
-        }
-
-        // Look up relay info from peers table
         let endpoint_id_bytes: [u8; 32] = *node_id.as_bytes();
-        let relay_info = {
-            let db = self.db.lock().await;
-            get_peer_relay_info(&db, &endpoint_id_bytes).unwrap_or(None)
-        };
-        let (relay_url_str, relay_last_success) = match &relay_info {
-            Some((url, ts)) => (Some(url.as_str()), *ts),
-            None => (None, None),
-        };
-        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
-
-        // Create new connection via smart connect
-        let result = connect::connect(
-            &self.endpoint,
-            node_id,
-            parsed_relay.as_ref(),
-            relay_last_success,
-            SEND_ALPN,
-            self.send_timeout,
-        )
-        .await
-        .map_err(|e| SendError::Connection(e.to_string()))?;
-
-        let conn = result.connection;
-
-        // Update relay URL timestamp if confirmed
-        if result.relay_url_confirmed {
-            if let Some(url) = &parsed_relay {
-                let db = self.db.lock().await;
-                let _ = update_peer_relay_url(&db, &endpoint_id_bytes, &url.to_string(), current_timestamp());
-            }
-        }
-
-        // Cache it
-        {
-            let mut connections = self.connections.write().await;
-            connections.insert(node_id, conn.clone());
-        }
-
-        Ok(conn)
+        self.connector
+            .connect(&endpoint_id_bytes)
+            .await
+            .map_err(|e| SendError::Connection(e.to_string()))
     }
 
     /// Close connection to a node
     pub async fn close_connection(&self, node_id: EndpointId) {
-        let mut connections = self.connections.write().await;
-        if let Some(conn) = connections.remove(&node_id) {
-            conn.close(0u32.into(), b"close");
-        }
+        let endpoint_id_bytes: [u8; 32] = *node_id.as_bytes();
+        self.connector.close(&endpoint_id_bytes).await;
     }
 
     // ========== Receipt Processing ==========

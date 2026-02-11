@@ -526,7 +526,7 @@ impl HarborService {
 mod tests {
     use super::*;
     use crate::data::harbor::{cache_packet, get_cached_packet, get_undelivered_recipients};
-    use crate::data::schema::create_harbor_table;
+    use crate::data::schema::{create_harbor_table, create_peer_table};
     use crate::resilience::ProofOfWork;
     use crate::security::create_key_pair::generate_key_pair;
     use crate::security::send::packet::{PacketBuilder, generate_packet_id};
@@ -535,6 +535,7 @@ mod tests {
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        create_peer_table(&conn).unwrap();
         create_harbor_table(&conn).unwrap();
         conn
     }

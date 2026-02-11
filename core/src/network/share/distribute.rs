@@ -15,12 +15,10 @@ use crate::data::{
     add_blob_recipient, get_topic_members, init_blob_sections, insert_blob, mark_blob_complete,
     CHUNK_SIZE,
 };
-use crate::data::dht::peer::{current_timestamp, get_peer_relay_info, update_peer_relay_url};
-use crate::network::connect;
 use crate::network::send::SendOptions;
 use crate::protocol::MemberInfo;
 
-use super::protocol::{ChunkResponse, FileAnnouncement, InitialRecipient, ShareMessage, SHARE_ALPN};
+use super::protocol::{ChunkResponse, FileAnnouncement, InitialRecipient, ShareMessage};
 use super::service::{ActiveTransfer, AnnouncementPlan, SectionPush, ShareError, ShareService};
 
 /// Helper to calculate number of sections based on chunk count
@@ -450,63 +448,25 @@ impl ShareService {
         // 4. Spawn section pushes to initial recipients
         for push in plan.section_pushes {
             let service = self.blob_store.clone();
-            let endpoint = self.endpoint.clone();
-            let db = self.db.clone();
+            let connector = self.connector.clone();
             let hash_copy = hash;
 
             tokio::spawn(async move {
-                let node_id = match EndpointId::from_bytes(&push.peer_id) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        warn!(error = %e, "Invalid peer ID for section push");
-                        return;
-                    }
-                };
-
-                let relay_info = {
-                    let db = db.lock().await;
-                    get_peer_relay_info(&db, &push.peer_id).unwrap_or(None)
-                };
-                let (relay_url_str, relay_last_success) = match &relay_info {
-                    Some((url, ts)) => (Some(url.clone()), *ts),
-                    None => (None, None),
-                };
-                let parsed_relay: Option<iroh::RelayUrl> =
-                    relay_url_str.as_deref().and_then(|u| u.parse().ok());
-
-                let result = match connect::connect(
-                    &endpoint,
-                    node_id,
-                    parsed_relay.as_ref(),
-                    relay_last_success,
-                    SHARE_ALPN,
-                    std::time::Duration::from_secs(15),
-                )
-                .await
+                let conn = match connector
+                    .connect_with_timeout(&push.peer_id, std::time::Duration::from_secs(15))
+                    .await
                 {
-                    Ok(r) => r,
-                    Err(_) => {
+                    Ok(conn) => conn,
+                    Err(e) => {
                         warn!(
                             peer = hex::encode(&push.peer_id[..8]),
                             section = push.section_id,
+                            error = %e,
                             "Failed to connect for section push"
                         );
                         return;
                     }
                 };
-
-                let conn = result.connection;
-                if result.relay_url_confirmed {
-                    if let Some(url) = &parsed_relay {
-                        let db = db.lock().await;
-                        let _ = update_peer_relay_url(
-                            &db,
-                            &push.peer_id,
-                            &url.to_string(),
-                            current_timestamp(),
-                        );
-                    }
-                }
 
                 for chunk_index in push.chunk_start..push.chunk_end {
                     let data = match service.read_chunk(&hash_copy, chunk_index) {

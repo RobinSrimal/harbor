@@ -11,8 +11,6 @@
 //! - `introductions.rs` — suggest peer
 
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
-
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{mpsc, Mutex};
 use tracing::debug;
@@ -24,7 +22,7 @@ use crate::network::gate::ConnectionGate;
 use crate::protocol::ProtocolEvent;
 use crate::resilience::{PoWConfig, PoWResult, PoWVerifier, ProofOfWork, build_context};
 
-use super::protocol::{ControlPacketType, ControlRpcProtocol, CONTROL_ALPN};
+use super::protocol::{ControlPacketType, ControlRpcProtocol};
 
 /// Error type for control operations
 #[derive(Debug)]
@@ -185,7 +183,7 @@ impl ControlService {
         peer_id: &[u8; 32],
     ) -> ControlResult<irpc::Client<ControlRpcProtocol>> {
         let conn = self.connector
-            .connect_to_peer(peer_id, CONTROL_ALPN, Duration::from_secs(10))
+            .connect(peer_id)
             .await
             .map_err(|e| ControlError::Connection(e.to_string()))?;
 

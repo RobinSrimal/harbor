@@ -11,7 +11,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::Endpoint;
 use iroh::endpoint::Connection;
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{Mutex, RwLock};
@@ -23,6 +22,7 @@ use crate::data::{
 };
 use crate::network::gate::ConnectionGate;
 use crate::network::send::SendService;
+use crate::network::connect::Connector;
 use crate::protocol::MemberInfo;
 
 use super::protocol::BitfieldMessage;
@@ -217,8 +217,8 @@ impl std::fmt::Debug for ShareService {
 }
 
 pub struct ShareService {
-    /// Iroh endpoint
-    pub(super) endpoint: Endpoint,
+    /// Connector for outgoing QUIC connections
+    pub(super) connector: Arc<Connector>,
     /// Local identity (shared with Protocol)
     pub(super) identity: Arc<LocalIdentity>,
     /// Database connection (shared with Protocol)
@@ -240,7 +240,7 @@ pub struct ShareService {
 impl ShareService {
     /// Create a new Share service
     pub fn new(
-        endpoint: Endpoint,
+        connector: Arc<Connector>,
         identity: Arc<LocalIdentity>,
         db: Arc<Mutex<DbConnection>>,
         blob_store: Arc<BlobStore>,
@@ -249,7 +249,7 @@ impl ShareService {
         connection_gate: Option<Arc<ConnectionGate>>,
     ) -> Self {
         Self {
-            endpoint,
+            connector,
             identity,
             db,
             blob_store,

@@ -6,7 +6,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::data::dht::current_timestamp;
+use crate::data::dht::{current_timestamp, ensure_peer_exists};
 
 /// Outgoing packet record
 #[derive(Debug, Clone)]
@@ -105,9 +105,10 @@ pub fn store_outgoing_packet(
 
     // Insert recipients
     for recipient in recipients {
+        ensure_peer_exists(&tx, recipient)?;
         tx.execute(
-            "INSERT INTO outgoing_recipients (packet_id, endpoint_id)
-             VALUES (?1, ?2)",
+            "INSERT INTO outgoing_recipients (packet_id, peer_id)
+             VALUES (?1, (SELECT id FROM peers WHERE endpoint_id = ?2))",
             params![packet_id.as_slice(), recipient.as_slice()],
         )?;
     }
@@ -139,7 +140,9 @@ pub fn acknowledge_receipt(
     let rows = conn.execute(
         "UPDATE outgoing_recipients 
          SET acknowledged = 1, acknowledged_at = ?1
-         WHERE packet_id = ?2 AND endpoint_id = ?3 AND acknowledged = 0",
+         WHERE packet_id = ?2
+           AND peer_id = (SELECT id FROM peers WHERE endpoint_id = ?3)
+           AND acknowledged = 0",
         params![now, packet_id.as_slice(), endpoint_id.as_slice()],
     )?;
     Ok(rows > 0)
@@ -215,8 +218,10 @@ pub fn get_unacknowledged_recipients(
     packet_id: &[u8; 32],
 ) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut stmt = conn.prepare(
-        "SELECT endpoint_id FROM outgoing_recipients 
-         WHERE packet_id = ?1 AND acknowledged = 0",
+        "SELECT p.endpoint_id
+         FROM outgoing_recipients r
+         JOIN peers p ON r.peer_id = p.id
+         WHERE r.packet_id = ?1 AND r.acknowledged = 0",
     )?;
 
     let recipients = stmt
@@ -271,6 +276,14 @@ mod tests {
         conn
     }
 
+    fn ensure_test_peer(conn: &Connection, endpoint_id: &[u8; 32]) {
+        conn.execute(
+            "INSERT OR IGNORE INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            rusqlite::params![endpoint_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
+    }
+
     fn test_packet_id() -> [u8; 32] {
         [1u8; 32]
     }
@@ -295,6 +308,10 @@ mod tests {
         let harbor_id = test_harbor_id();
         let packet_data = b"encrypted packet data";
         let recipients = test_recipients();
+
+        for r in &recipients {
+            ensure_test_peer(&conn, r);
+        }
 
         store_outgoing_packet(
             &mut conn,
@@ -322,6 +339,10 @@ mod tests {
         let mut conn = setup_db();
         let packet_id = test_packet_id();
         let recipients = test_recipients();
+
+        for r in &recipients {
+            ensure_test_peer(&conn, r);
+        }
 
         store_outgoing_packet(
             &mut conn,
@@ -384,6 +405,7 @@ mod tests {
         
         // Packet with unacked recipients
         let packet1 = [1u8; 32];
+        ensure_test_peer(&conn, &[10u8; 32]);
         store_outgoing_packet(
             &mut conn,
             &packet1,
@@ -397,6 +419,7 @@ mod tests {
 
         // Packet with all acked
         let packet2 = [2u8; 32];
+        ensure_test_peer(&conn, &[20u8; 32]);
         store_outgoing_packet(
             &mut conn,
             &packet2,
@@ -418,6 +441,7 @@ mod tests {
     fn test_mark_replicated() {
         let mut conn = setup_db();
         let packet_id = test_packet_id();
+        ensure_test_peer(&conn, &[10u8; 32]);
 
         store_outgoing_packet(
             &mut conn,
@@ -448,6 +472,10 @@ mod tests {
         let mut conn = setup_db();
         let packet_id = test_packet_id();
         let recipients = test_recipients();
+
+        for r in &recipients {
+            ensure_test_peer(&conn, r);
+        }
 
         store_outgoing_packet(
             &mut conn,
@@ -483,6 +511,7 @@ mod tests {
 
         // Old packet, all acknowledged
         let old_acked = [1u8; 32];
+        ensure_test_peer(&conn, &[10u8; 32]);
         conn.execute(
             "INSERT INTO outgoing_packets (packet_id, topic_id, harbor_id, packet_data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -496,14 +525,15 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO outgoing_recipients (packet_id, endpoint_id, acknowledged)
-             VALUES (?1, ?2, 1)",
+            "INSERT INTO outgoing_recipients (packet_id, peer_id, acknowledged)
+             VALUES (?1, (SELECT id FROM peers WHERE endpoint_id = ?2), 1)",
             params![old_acked.as_slice(), [10u8; 32].as_slice()],
         )
         .unwrap();
 
         // Old packet, not acknowledged - should NOT be cleaned
         let old_unacked = [2u8; 32];
+        ensure_test_peer(&conn, &[20u8; 32]);
         conn.execute(
             "INSERT INTO outgoing_packets (packet_id, topic_id, harbor_id, packet_data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -517,8 +547,8 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO outgoing_recipients (packet_id, endpoint_id, acknowledged)
-             VALUES (?1, ?2, 0)",
+            "INSERT INTO outgoing_recipients (packet_id, peer_id, acknowledged)
+             VALUES (?1, (SELECT id FROM peers WHERE endpoint_id = ?2), 0)",
             params![old_unacked.as_slice(), [20u8; 32].as_slice()],
         )
         .unwrap();
@@ -534,4 +564,3 @@ mod tests {
         assert!(get_outgoing_packet(&conn, &old_unacked).unwrap().is_some());
     }
 }
-

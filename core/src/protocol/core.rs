@@ -20,15 +20,17 @@ use crate::data::{
     add_topic_member, ensure_self_in_peers, get_or_create_identity, start_db,
     subscribe_dm_topic, LocalIdentity,
 };
-use crate::network::control::ControlService;
+use crate::network::control::{ControlService, CONTROL_ALPN};
+use crate::network::connect::Connector;
 use crate::network::dht::DhtService;
 use crate::data::BlobStore;
 use crate::network::gate::ConnectionGate;
-use crate::network::harbor::HarborService;
-use crate::network::stream::StreamService;
-use crate::network::send::SendService;
-use crate::network::share::{ShareConfig, ShareService};
-use crate::network::sync::SyncService;
+use crate::network::harbor::{HarborService, HARBOR_ALPN};
+use crate::network::stream::{StreamService, STREAM_ALPN};
+use crate::network::send::{SendService, SEND_ALPN};
+use crate::network::share::{ShareConfig, ShareService, SHARE_ALPN};
+use crate::network::sync::{SyncService, SYNC_ALPN};
+use crate::network::pool::PoolConfig;
 
 use super::config::ProtocolConfig;
 use super::error::ProtocolError;
@@ -154,9 +156,55 @@ impl Protocol {
 
         let dht_service = Some(dht_service);
 
+        // Service-specific connectors (only Send uses pooling)
+        let send_connector = Arc::new(Connector::new(
+            endpoint.clone(),
+            db.clone(),
+            SEND_ALPN,
+            Duration::from_secs(5),
+            Some(PoolConfig::default()),
+        ));
+        let harbor_connect_timeout = Duration::from_secs(config.harbor_connect_timeout_secs);
+        let harbor_connector = Arc::new(Connector::new(
+            endpoint.clone(),
+            db.clone(),
+            HARBOR_ALPN,
+            harbor_connect_timeout,
+            None,
+        ));
+        let share_config = ShareConfig::default();
+        let share_connector = Arc::new(Connector::new(
+            endpoint.clone(),
+            db.clone(),
+            SHARE_ALPN,
+            share_config.connect_timeout,
+            None,
+        ));
+        let sync_connector = Arc::new(Connector::new(
+            endpoint.clone(),
+            db.clone(),
+            SYNC_ALPN,
+            Duration::from_secs(30),
+            None,
+        ));
+        let stream_connector = Arc::new(Connector::new(
+            endpoint.clone(),
+            db.clone(),
+            STREAM_ALPN,
+            Duration::from_secs(10),
+            None,
+        ));
+        let control_connector = Arc::new(Connector::new(
+            endpoint.clone(),
+            db.clone(),
+            CONTROL_ALPN,
+            Duration::from_secs(10),
+            None,
+        ));
+
         // Initialize Send service
         let send_service = Arc::new(SendService::new(
-            endpoint.clone(),
+            send_connector.clone(),
             identity.clone(),
             db.clone(),
             event_tx.clone(),
@@ -169,13 +217,13 @@ impl Protocol {
             ..crate::resilience::StorageConfig::default()
         };
         let harbor_service = Arc::new(HarborService::new(
-            endpoint.clone(),
+            harbor_connector.clone(),
             identity.clone(),
             db.clone(),
             event_tx.clone(),
             dht_service.clone(),
             storage_config,
-            Duration::from_secs(config.harbor_connect_timeout_secs),
+            harbor_connect_timeout,
             Duration::from_secs(config.harbor_response_timeout_secs),
         ));
 
@@ -193,18 +241,18 @@ impl Protocol {
             .map_err(|e| ProtocolError::StartFailed(format!("failed to create blob store: {}", e)))?);
 
         let share_service = Arc::new(ShareService::new(
-            endpoint.clone(),
+            share_connector.clone(),
             identity.clone(),
             db.clone(),
             blob_store,
-            ShareConfig::default(),
+            share_config,
             Some(send_service.clone()),
             Some(connection_gate.clone()),
         ));
 
         // Initialize Sync service
         let sync_service = Arc::new(SyncService::new(
-            endpoint.clone(),
+            sync_connector.clone(),
             identity.clone(),
             db.clone(),
             event_tx.clone(),
@@ -214,7 +262,7 @@ impl Protocol {
 
         // Initialize Stream service
         let stream_service = StreamService::new(
-            endpoint.clone(),
+            stream_connector.clone(),
             identity.clone(),
             db.clone(),
             event_tx.clone(),
@@ -233,12 +281,9 @@ impl Protocol {
             dht_service.clone(),
         ));
 
-        // Create shared Connector for outgoing connections
-        let connector = Arc::new(crate::network::Connector::new(endpoint.clone(), db.clone()));
-
         // Initialize Control service
         let control_service = ControlService::new(
-            connector.clone(),
+            control_connector.clone(),
             identity.clone(),
             db.clone(),
             event_tx.clone(),

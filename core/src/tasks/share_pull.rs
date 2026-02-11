@@ -777,18 +777,29 @@ mod tests {
             )",
             [],
         ).unwrap();
+
+        conn.execute(
+            "CREATE TABLE peers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint_id BLOB UNIQUE NOT NULL,
+                last_seen INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
         
         conn.execute(
             "CREATE TABLE blobs (
                 hash BLOB PRIMARY KEY,
                 scope_id BLOB NOT NULL,
-                source_id BLOB NOT NULL,
+                source_peer_id INTEGER NOT NULL,
                 display_name TEXT NOT NULL,
                 total_size INTEGER NOT NULL,
                 total_chunks INTEGER NOT NULL,
                 num_sections INTEGER NOT NULL DEFAULT 1,
                 state INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (source_peer_id) REFERENCES peers(id)
             )",
             [],
         ).unwrap();
@@ -802,11 +813,18 @@ mod tests {
             "INSERT INTO topics (topic_id, harbor_id) VALUES (?1, ?2)",
             rusqlite::params![topic_id.as_slice(), [0u8; 32].as_slice()],
         ).unwrap();
+
+        // Insert source peer
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, 0)",
+            rusqlite::params![source_id.as_slice()],
+        )
+        .unwrap();
         
         // Insert partial blob (state = 0 = Partial)
         conn.execute(
-            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
-             VALUES (?1, ?2, ?3, 'test.bin', 1048576, 2, 0)",
+            "INSERT INTO blobs (hash, scope_id, source_peer_id, display_name, total_size, total_chunks, state)
+             VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3), 'test.bin', 1048576, 2, 0)",
             rusqlite::params![hash.as_slice(), topic_id.as_slice(), source_id.as_slice()],
         ).unwrap();
         
@@ -832,18 +850,29 @@ mod tests {
             )",
             [],
         ).unwrap();
+
+        conn.execute(
+            "CREATE TABLE peers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint_id BLOB UNIQUE NOT NULL,
+                last_seen INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
         
         conn.execute(
             "CREATE TABLE blobs (
                 hash BLOB PRIMARY KEY,
                 scope_id BLOB NOT NULL,
-                source_id BLOB NOT NULL,
+                source_peer_id INTEGER NOT NULL,
                 display_name TEXT NOT NULL,
                 total_size INTEGER NOT NULL,
                 total_chunks INTEGER NOT NULL,
                 num_sections INTEGER NOT NULL DEFAULT 1,
                 state INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (source_peer_id) REFERENCES peers(id)
             )",
             [],
         ).unwrap();
@@ -857,11 +886,18 @@ mod tests {
             "INSERT INTO topics (topic_id, harbor_id) VALUES (?1, ?2)",
             rusqlite::params![topic_id.as_slice(), [0u8; 32].as_slice()],
         ).unwrap();
+
+        // Insert source peer
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, 0)",
+            rusqlite::params![source_id.as_slice()],
+        )
+        .unwrap();
         
         // Insert complete blob (state = 1 = Complete)
         conn.execute(
-            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
-             VALUES (?1, ?2, ?3, 'test.bin', 1048576, 2, 1)",
+            "INSERT INTO blobs (hash, scope_id, source_peer_id, display_name, total_size, total_chunks, state)
+             VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3), 'test.bin', 1048576, 2, 1)",
             rusqlite::params![hash.as_slice(), topic_id.as_slice(), source_id.as_slice()],
         ).unwrap();
         
@@ -883,18 +919,29 @@ mod tests {
             )",
             [],
         ).unwrap();
+
+        conn.execute(
+            "CREATE TABLE peers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint_id BLOB UNIQUE NOT NULL,
+                last_seen INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
         
         conn.execute(
             "CREATE TABLE blobs (
                 hash BLOB PRIMARY KEY,
                 scope_id BLOB NOT NULL,
-                source_id BLOB NOT NULL,
+                source_peer_id INTEGER NOT NULL,
                 display_name TEXT NOT NULL,
                 total_size INTEGER NOT NULL,
                 total_chunks INTEGER NOT NULL,
                 num_sections INTEGER NOT NULL DEFAULT 1,
                 state INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (source_peer_id) REFERENCES peers(id)
             )",
             [],
         ).unwrap();
@@ -915,21 +962,28 @@ mod tests {
             "INSERT INTO topics (topic_id, harbor_id) VALUES (?1, ?2)",
             rusqlite::params![topic2.as_slice(), [0u8; 32].as_slice()],
         ).unwrap();
+
+        // Insert source peer
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, 0)",
+            rusqlite::params![source.as_slice()],
+        )
+        .unwrap();
         
         // Insert partial blobs in both topics
         conn.execute(
-            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
-             VALUES (?1, ?2, ?3, 'file1.bin', 1048576, 2, 0)",
+            "INSERT INTO blobs (hash, scope_id, source_peer_id, display_name, total_size, total_chunks, state)
+             VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3), 'file1.bin', 1048576, 2, 0)",
             rusqlite::params![hash1.as_slice(), topic1.as_slice(), source.as_slice()],
         ).unwrap();
         conn.execute(
-            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
-             VALUES (?1, ?2, ?3, 'file2.bin', 2097152, 4, 0)",
+            "INSERT INTO blobs (hash, scope_id, source_peer_id, display_name, total_size, total_chunks, state)
+             VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3), 'file2.bin', 2097152, 4, 0)",
             rusqlite::params![hash2.as_slice(), topic1.as_slice(), source.as_slice()],
         ).unwrap();
         conn.execute(
-            "INSERT INTO blobs (hash, scope_id, source_id, display_name, total_size, total_chunks, state)
-             VALUES (?1, ?2, ?3, 'file3.bin', 3145728, 6, 0)",
+            "INSERT INTO blobs (hash, scope_id, source_peer_id, display_name, total_size, total_chunks, state)
+             VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3), 'file3.bin', 3145728, 6, 0)",
             rusqlite::params![hash3.as_slice(), topic2.as_slice(), source.as_slice()],
         ).unwrap();
         
@@ -1016,4 +1070,3 @@ mod tests {
         }
     }
 }
-

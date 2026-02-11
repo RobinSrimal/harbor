@@ -13,7 +13,7 @@
 
 use rusqlite::Connection;
 
-use super::schema::{create_all_tables, run_migrations};
+use super::schema::create_all_tables;
 
 /// Error type for database startup
 #[derive(Debug)]
@@ -91,8 +91,6 @@ pub fn start_db(db_path: &str, passphrase: &str) -> Result<Connection, StartErro
     }
     
     // Run migrations for existing databases
-    run_migrations(&conn)?;
-
     Ok(conn)
 }
 

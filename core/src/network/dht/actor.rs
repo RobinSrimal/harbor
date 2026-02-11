@@ -251,7 +251,7 @@ impl DhtActor {
         };
         let relay_url = self.pool.home_relay_url();
 
-        DhtService::send_find_node_on_conn(conn.connection(), random_target, requester, relay_url).await?;
+        DhtService::send_find_node_on_conn(&conn, random_target, requester, relay_url).await?;
 
         Ok(())
     }
@@ -323,7 +323,7 @@ impl DhtActor {
                             Some(*local_id.as_bytes())
                         };
 
-                        match DhtService::send_find_node_on_conn(conn.connection(), random_target, requester, home_relay_url.clone()).await {
+                        match DhtService::send_find_node_on_conn(&conn, random_target, requester, home_relay_url.clone()).await {
                             Ok(_) => {
                                 trace!(node = %id, relay_confirmed = relay_confirmed, "candidate verified - FindNode RPC succeeded");
                                 verified.push(*id.as_bytes());
@@ -1121,4 +1121,3 @@ mod tests {
         assert_eq!(config.k, 0);
     }
 }
-

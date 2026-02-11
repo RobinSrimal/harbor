@@ -7,14 +7,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::{Endpoint, EndpointId};
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::data::dht::peer::get_peer_relay_info;
 use crate::data::{get_topic_members, LocalIdentity};
-use crate::network::connect;
+use crate::network::connect::Connector;
 use crate::network::gate::ConnectionGate;
 use crate::network::send::{SendService, SendOptions};
 use crate::network::packet::{
@@ -24,7 +22,7 @@ use crate::network::packet::{
 };
 use super::{ZERO_TOPIC_ID, optional_topic_id};
 use crate::protocol::{MemberInfo, ProtocolEvent, StreamConnectedEvent};
-use super::protocol::{STREAM_ALPN, STREAM_SIGNAL_TTL, StreamError};
+use super::protocol::{STREAM_SIGNAL_TTL, StreamError};
 use super::session::StreamSession;
 
 /// A pending stream request awaiting accept/reject
@@ -85,9 +83,8 @@ enum StreamActorMessage {
 /// 2. Destination accepts/rejects
 /// 3. On accept, MOQ connection is established for media transport
 pub struct StreamService {
-    /// Iroh endpoint for QUIC connections (used for MOQ transport)
-    #[allow(dead_code)]
-    endpoint: Endpoint,
+    /// Connector for outgoing QUIC connections (used for MOQ transport)
+    connector: Arc<Connector>,
     /// Local identity
     identity: Arc<LocalIdentity>,
     /// Database connection
@@ -121,7 +118,7 @@ impl std::fmt::Debug for StreamService {
 impl StreamService {
     /// Create a new StreamService
     pub fn new(
-        endpoint: Endpoint,
+        connector: Arc<Connector>,
         identity: Arc<LocalIdentity>,
         db: Arc<Mutex<DbConnection>>,
         event_tx: mpsc::Sender<ProtocolEvent>,
@@ -136,7 +133,7 @@ impl StreamService {
         let sessions = Arc::new(RwLock::new(HashMap::new()));
 
         let service = Arc::new(Self {
-            endpoint,
+            connector,
             identity,
             db,
             event_tx,
@@ -413,41 +410,20 @@ impl StreamService {
         let active = self.active_streams.read().await.get(request_id).map(|a| (a.peer_id, a.topic_id));
         let (peer_id, topic_id) = active.ok_or(StreamError::RequestNotFound)?;
 
-        // 2. Get relay URL from DB for smart connect
-        let relay_info = {
-            let db = self.db.lock().await;
-            get_peer_relay_info(&db, &peer_id)
-                .map_err(|e| StreamError::Database(e.to_string()))?
-        };
-        let (parsed_relay, relay_last_success) = match relay_info {
-            Some((url, last_success)) => (url.parse::<iroh::RelayUrl>().ok(), last_success),
-            None => (None, None),
-        };
-
-        // 3. Dial the peer with STREAM_ALPN
-        let node_id = EndpointId::from_bytes(&peer_id)
+        // 2. Dial the peer with STREAM_ALPN
+        let conn = self.connector
+            .connect_with_timeout(&peer_id, Duration::from_secs(10))
+            .await
             .map_err(|e| StreamError::Connection(e.to_string()))?;
-
-        let connect_result = connect::connect(
-            &self.endpoint,
-            node_id,
-            parsed_relay.as_ref(),
-            relay_last_success,
-            STREAM_ALPN,
-            Duration::from_secs(10),
-        )
-        .await
-        .map_err(|e| StreamError::Connection(e.to_string()))?;
 
         info!(
             peer = %hex::encode(&peer_id[..8]),
             request_id = %hex::encode(&request_id[..8]),
-            relay_confirmed = connect_result.relay_url_confirmed,
             "MOQ connection established to destination"
         );
 
         // 4. Wrap as WebTransport (raw QUIC, no HTTP/3)
-        let wt_session = web_transport_iroh::Session::raw(connect_result.connection);
+        let wt_session = web_transport_iroh::Session::raw(conn);
 
         // 5. Create Origin and perform MOQ Client handshake
         //    Source only publishes — no .with_consume() to avoid bidirectional subscribe loops

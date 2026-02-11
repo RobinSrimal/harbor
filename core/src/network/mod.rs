@@ -7,7 +7,7 @@
 //! - Share: P2P file sharing for files ≥512 KB
 //! - Sync: CRDT synchronization for collaborative documents
 //!
-//! Each protocol has its own ALPN and connection pool.
+//! Each protocol has its own ALPN; only Send and DHT use connection pools.
 
 pub mod connect;
 pub mod control;

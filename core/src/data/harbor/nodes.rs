@@ -11,7 +11,11 @@ pub fn get_cached_harbor_nodes(
     harbor_id: &[u8; 32],
 ) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut stmt = conn.prepare(
-        "SELECT node_id FROM harbor_nodes_cache WHERE harbor_id = ?1 ORDER BY updated_at DESC",
+        "SELECT p.endpoint_id
+         FROM harbor_nodes_cache h
+         JOIN peers p ON h.peer_id = p.id
+         WHERE h.harbor_id = ?1
+         ORDER BY h.updated_at DESC",
     )?;
 
     let nodes = stmt
@@ -43,8 +47,8 @@ pub fn replace_harbor_nodes(
 
     // Insert new nodes
     let mut stmt = conn.prepare(
-        "INSERT OR REPLACE INTO harbor_nodes_cache (harbor_id, node_id, updated_at)
-         VALUES (?1, ?2, strftime('%s', 'now'))",
+        "INSERT OR REPLACE INTO harbor_nodes_cache (harbor_id, peer_id, updated_at)
+         VALUES (?1, (SELECT id FROM peers WHERE endpoint_id = ?2), strftime('%s', 'now'))",
     )?;
 
     for node_id in nodes {
@@ -157,13 +161,15 @@ mod tests {
         let harbor2 = [21u8; 32];
 
         conn.execute(
-            "INSERT INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+            "INSERT INTO topics (topic_id, harbor_id, admin_peer_id)
+             VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
             params![topic1.as_slice(), harbor1.as_slice(), admin_id.as_slice()],
         )
         .unwrap();
 
         conn.execute(
-            "INSERT INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+            "INSERT INTO topics (topic_id, harbor_id, admin_peer_id)
+             VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
             params![topic2.as_slice(), harbor2.as_slice(), admin_id.as_slice()],
         )
         .unwrap();

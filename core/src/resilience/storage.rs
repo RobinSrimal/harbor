@@ -487,12 +487,13 @@ impl fmt::Display for StorageCheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::schema::create_harbor_table;
+    use crate::data::schema::{create_harbor_table, create_peer_table};
     use crate::data::harbor::cache_packet;
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        create_peer_table(&conn).unwrap();
         create_harbor_table(&conn).unwrap();
         conn
     }
@@ -876,4 +877,3 @@ mod tests {
         assert_eq!(evicted, 0);
     }
 }
-

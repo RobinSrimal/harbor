@@ -18,54 +18,6 @@ pub fn create_all_tables(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Run database migrations for existing databases
-///
-/// This should be called after tables exist to add new columns, indexes, etc.
-/// Each migration checks if it's already been applied before making changes.
-pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
-    // Migration 1: Add packet_type column to outgoing_packets (v0.2)
-    let has_packet_type: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM pragma_table_info('outgoing_packets') WHERE name = 'packet_type'",
-        [],
-        |row| row.get(0),
-    )?;
-
-    if !has_packet_type {
-        conn.execute(
-            "ALTER TABLE outgoing_packets ADD COLUMN packet_type INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
-
-    // Migration 2: Add harbor_nodes_cache table
-    let has_harbor_nodes_cache: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='harbor_nodes_cache'",
-        [],
-        |row| row.get(0),
-    )?;
-
-    if !has_harbor_nodes_cache {
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS harbor_nodes_cache (
-                harbor_id BLOB NOT NULL CHECK (length(harbor_id) = 32),
-                node_id BLOB NOT NULL CHECK (length(node_id) = 32),
-                relay_url TEXT,
-                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-                PRIMARY KEY (harbor_id, node_id),
-                FOREIGN KEY (node_id) REFERENCES peers(endpoint_id)
-            )",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_harbor_nodes_harbor_id ON harbor_nodes_cache(harbor_id)",
-            [],
-        )?;
-    }
-
-    Ok(())
-}
-
 /// Local node table: stores this node's identity (key pair)
 ///
 /// Only one row should exist - the local node's identity.
@@ -84,22 +36,19 @@ pub fn create_local_node_table(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Peer table: stores EndpointID, EndpointAddress, and latency measurements
-///
-/// EndpointAddress is stored with a timestamp to enable direct dialing
-/// when the address is less than 24 hours old.
+/// Peer table: stores EndpointID, latency measurements, and relay info
 /// EndpointID is 32 bytes (256-bit identifier).
 pub fn create_peer_table(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS peers (
-            endpoint_id BLOB PRIMARY KEY NOT NULL CHECK (length(endpoint_id) = 32),
-            endpoint_address TEXT,
-            address_timestamp INTEGER,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            endpoint_id BLOB UNIQUE NOT NULL CHECK (length(endpoint_id) = 32),
             last_latency_ms INTEGER,
             latency_timestamp INTEGER,
             last_seen INTEGER NOT NULL,
             relay_url TEXT,
             relay_url_last_success INTEGER,
+            verified INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
         )",
         [],
@@ -114,6 +63,7 @@ pub fn create_peer_table(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+
 /// DHT table: stores routing table buckets
 ///
 /// Each peer is assigned to a bucket based on XOR distance from local node.
@@ -122,10 +72,10 @@ pub fn create_peer_table(conn: &Connection) -> rusqlite::Result<()> {
 pub fn create_dht_table(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS dht_routing (
-            endpoint_id BLOB PRIMARY KEY NOT NULL CHECK (length(endpoint_id) = 32),
+            peer_id INTEGER PRIMARY KEY,
             bucket_index INTEGER NOT NULL,
             added_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            FOREIGN KEY (endpoint_id) REFERENCES peers(endpoint_id) ON DELETE CASCADE
+            FOREIGN KEY (peer_id) REFERENCES peers(id) ON DELETE CASCADE
         )",
         [],
     )?;
@@ -142,16 +92,16 @@ pub fn create_dht_table(conn: &Connection) -> rusqlite::Result<()> {
 /// Topic table: stores subscribed topics with their HarborID, admin, and members
 ///
 /// All BLOB fields are 32 bytes (256-bit identifiers).
-/// The admin_id references the peers table - the topic creator is the initial admin.
+/// The admin_peer_id references the peers table - the topic creator is the initial admin.
 /// Note: Our own endpoint ID is inserted into peers table on init, so we can be admin.
 pub fn create_topic_table(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS topics (
             topic_id BLOB PRIMARY KEY NOT NULL CHECK (length(topic_id) = 32),
             harbor_id BLOB NOT NULL CHECK (length(harbor_id) = 32),
-            admin_id BLOB NOT NULL CHECK (length(admin_id) = 32),
+            admin_peer_id INTEGER NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            FOREIGN KEY (admin_id) REFERENCES peers(endpoint_id)
+            FOREIGN KEY (admin_peer_id) REFERENCES peers(id)
         )",
         [],
     )?;
@@ -160,11 +110,11 @@ pub fn create_topic_table(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS topic_members (
             topic_id BLOB NOT NULL CHECK (length(topic_id) = 32),
-            endpoint_id BLOB NOT NULL CHECK (length(endpoint_id) = 32),
+            peer_id INTEGER NOT NULL,
             joined_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            PRIMARY KEY (topic_id, endpoint_id),
+            PRIMARY KEY (topic_id, peer_id),
             FOREIGN KEY (topic_id) REFERENCES topics(topic_id) ON DELETE CASCADE,
-            FOREIGN KEY (endpoint_id) REFERENCES peers(endpoint_id)
+            FOREIGN KEY (peer_id) REFERENCES peers(id)
         )",
         [],
     )?;
@@ -202,11 +152,12 @@ pub fn create_outgoing_table(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS outgoing_recipients (
             packet_id BLOB NOT NULL CHECK (length(packet_id) = 32),
-            endpoint_id BLOB NOT NULL CHECK (length(endpoint_id) = 32),
+            peer_id INTEGER NOT NULL,
             acknowledged INTEGER NOT NULL DEFAULT 0,
             acknowledged_at INTEGER,
-            PRIMARY KEY (packet_id, endpoint_id),
-            FOREIGN KEY (packet_id) REFERENCES outgoing_packets(packet_id) ON DELETE CASCADE
+            PRIMARY KEY (packet_id, peer_id),
+            FOREIGN KEY (packet_id) REFERENCES outgoing_packets(packet_id) ON DELETE CASCADE,
+            FOREIGN KEY (peer_id) REFERENCES peers(id)
         )",
         [],
     )?;
@@ -246,11 +197,12 @@ pub fn create_harbor_table(conn: &Connection) -> rusqlite::Result<()> {
         "CREATE TABLE IF NOT EXISTS harbor_cache (
             packet_id BLOB PRIMARY KEY NOT NULL CHECK (length(packet_id) = 32),
             harbor_id BLOB NOT NULL CHECK (length(harbor_id) = 32),
-            sender_id BLOB NOT NULL CHECK (length(sender_id) = 32),
+            sender_peer_id INTEGER NOT NULL,
             packet_data BLOB NOT NULL,
             synced INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            expires_at INTEGER NOT NULL
+            expires_at INTEGER NOT NULL,
+            FOREIGN KEY (sender_peer_id) REFERENCES peers(id)
         )",
         [],
     )?;
@@ -259,11 +211,12 @@ pub fn create_harbor_table(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS harbor_recipients (
             packet_id BLOB NOT NULL CHECK (length(packet_id) = 32),
-            recipient_id BLOB NOT NULL CHECK (length(recipient_id) = 32),
+            peer_id INTEGER NOT NULL,
             delivered INTEGER NOT NULL DEFAULT 0,
             delivered_at INTEGER,
-            PRIMARY KEY (packet_id, recipient_id),
-            FOREIGN KEY (packet_id) REFERENCES harbor_cache(packet_id) ON DELETE CASCADE
+            PRIMARY KEY (packet_id, peer_id),
+            FOREIGN KEY (packet_id) REFERENCES harbor_cache(packet_id) ON DELETE CASCADE,
+            FOREIGN KEY (peer_id) REFERENCES peers(id)
         )",
         [],
     )?;
@@ -303,11 +256,10 @@ pub fn create_harbor_table(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS harbor_nodes_cache (
             harbor_id BLOB NOT NULL CHECK (length(harbor_id) = 32),
-            node_id BLOB NOT NULL CHECK (length(node_id) = 32),
-            relay_url TEXT,
+            peer_id INTEGER NOT NULL,
             updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            PRIMARY KEY (harbor_id, node_id),
-            FOREIGN KEY (node_id) REFERENCES peers(endpoint_id)
+            PRIMARY KEY (harbor_id, peer_id),
+            FOREIGN KEY (peer_id) REFERENCES peers(id)
         )",
         [],
     )?;
@@ -329,7 +281,7 @@ pub fn create_harbor_table(conn: &Connection) -> rusqlite::Result<()> {
 /// - Transfer admin role
 ///
 /// Current tables used:
-/// - `topics` table (subscriptions, admin_id)
+/// - `topics` table (subscriptions, admin_peer_id)
 /// - `topic_members` table (member list from invite + Join/Leave messages)
 /// - `epoch_keys` table (epoch keys per topic for decryption)
 /// - `pending_decryption` table (packets awaiting epoch keys)
@@ -356,11 +308,12 @@ pub fn create_membership_tables(conn: &Connection) -> rusqlite::Result<()> {
             packet_id BLOB PRIMARY KEY NOT NULL CHECK (length(packet_id) = 32),
             topic_id BLOB NOT NULL CHECK (length(topic_id) = 32),
             harbor_id BLOB NOT NULL CHECK (length(harbor_id) = 32),
-            sender_id BLOB NOT NULL CHECK (length(sender_id) = 32),
+            sender_peer_id INTEGER NOT NULL,
             epoch INTEGER NOT NULL,
             packet_data BLOB NOT NULL,
             received_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            FOREIGN KEY (topic_id) REFERENCES topics(topic_id) ON DELETE CASCADE
+            FOREIGN KEY (topic_id) REFERENCES topics(topic_id) ON DELETE CASCADE,
+            FOREIGN KEY (sender_peer_id) REFERENCES peers(id)
         )",
         [],
     )?;
@@ -395,13 +348,14 @@ pub fn create_share_tables(conn: &Connection) -> rusqlite::Result<()> {
         "CREATE TABLE IF NOT EXISTS blobs (
             hash BLOB PRIMARY KEY NOT NULL CHECK (length(hash) = 32),
             scope_id BLOB NOT NULL CHECK (length(scope_id) = 32),
-            source_id BLOB NOT NULL CHECK (length(source_id) = 32),
+            source_peer_id INTEGER NOT NULL,
             display_name TEXT NOT NULL,
             total_size INTEGER NOT NULL,
             total_chunks INTEGER NOT NULL,
             num_sections INTEGER NOT NULL,
             state INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY (source_peer_id) REFERENCES peers(id)
         )",
         [],
     )?;
@@ -410,11 +364,12 @@ pub fn create_share_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS blob_recipients (
             hash BLOB NOT NULL CHECK (length(hash) = 32),
-            endpoint_id BLOB NOT NULL CHECK (length(endpoint_id) = 32),
+            peer_id INTEGER NOT NULL,
             received INTEGER NOT NULL DEFAULT 0,
             received_at INTEGER,
-            PRIMARY KEY (hash, endpoint_id),
-            FOREIGN KEY (hash) REFERENCES blobs(hash) ON DELETE CASCADE
+            PRIMARY KEY (hash, peer_id),
+            FOREIGN KEY (hash) REFERENCES blobs(hash) ON DELETE CASCADE,
+            FOREIGN KEY (peer_id) REFERENCES peers(id)
         )",
         [],
     )?;
@@ -427,10 +382,11 @@ pub fn create_share_tables(conn: &Connection) -> rusqlite::Result<()> {
             section_id INTEGER NOT NULL,
             chunk_start INTEGER NOT NULL,
             chunk_end INTEGER NOT NULL,
-            received_from BLOB CHECK (length(received_from) = 32),
+            received_from_peer_id INTEGER,
             received_at INTEGER,
             PRIMARY KEY (hash, section_id),
-            FOREIGN KEY (hash) REFERENCES blobs(hash) ON DELETE CASCADE
+            FOREIGN KEY (hash) REFERENCES blobs(hash) ON DELETE CASCADE,
+            FOREIGN KEY (received_from_peer_id) REFERENCES peers(id)
         )",
         [],
     )?;
@@ -468,13 +424,13 @@ pub fn create_control_tables(conn: &Connection) -> rusqlite::Result<()> {
     // States: pending_outgoing, pending_incoming, connected, declined, blocked
     conn.execute(
         "CREATE TABLE IF NOT EXISTS connection_list (
-            peer_id BLOB PRIMARY KEY NOT NULL CHECK (length(peer_id) = 32),
+            peer_id INTEGER PRIMARY KEY,
             state TEXT NOT NULL CHECK (state IN ('pending_outgoing', 'pending_incoming', 'connected', 'declined', 'blocked')),
             display_name TEXT,
-            relay_url TEXT,
             request_id BLOB CHECK (length(request_id) = 32),
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY (peer_id) REFERENCES peers(id)
         )",
         [],
     )?;
@@ -500,13 +456,15 @@ pub fn create_control_tables(conn: &Connection) -> rusqlite::Result<()> {
         "CREATE TABLE IF NOT EXISTS pending_topic_invites (
             message_id BLOB PRIMARY KEY NOT NULL CHECK (length(message_id) = 32),
             topic_id BLOB NOT NULL CHECK (length(topic_id) = 32),
-            sender_id BLOB NOT NULL CHECK (length(sender_id) = 32),
+            sender_peer_id INTEGER NOT NULL,
             topic_name TEXT,
             epoch INTEGER NOT NULL,
             epoch_key BLOB NOT NULL CHECK (length(epoch_key) = 32),
-            admin_id BLOB NOT NULL CHECK (length(admin_id) = 32),
+            admin_peer_id INTEGER NOT NULL,
             members_blob BLOB NOT NULL,
-            received_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            received_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY (sender_peer_id) REFERENCES peers(id),
+            FOREIGN KEY (admin_peer_id) REFERENCES peers(id)
         )",
         [],
     )?;
@@ -569,28 +527,25 @@ mod tests {
         // Insert a test peer
         let endpoint_id = [0u8; 32];
         conn.execute(
-            "INSERT INTO peers (endpoint_id, endpoint_address, address_timestamp, last_seen) 
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO peers (endpoint_id, last_seen) 
+             VALUES (?1, ?2)",
             rusqlite::params![
                 endpoint_id.as_slice(),
-                "192.168.1.1:4433",
-                1704067200i64, // 2024-01-01
                 1704067200i64,
             ],
         )
         .unwrap();
 
         // Query it back
-        let (retrieved_id, addr): (Vec<u8>, String) = conn
+        let retrieved_id: Vec<u8> = conn
             .query_row(
-                "SELECT endpoint_id, endpoint_address FROM peers WHERE endpoint_id = ?1",
+                "SELECT endpoint_id FROM peers WHERE endpoint_id = ?1",
                 [endpoint_id.as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .unwrap();
 
         assert_eq!(retrieved_id, endpoint_id.to_vec());
-        assert_eq!(addr, "192.168.1.1:4433");
     }
 
     #[test]
@@ -609,7 +564,8 @@ mod tests {
 
         // Insert into DHT routing
         conn.execute(
-            "INSERT INTO dht_routing (endpoint_id, bucket_index) VALUES (?1, ?2)",
+            "INSERT INTO dht_routing (peer_id, bucket_index)
+             VALUES ((SELECT id FROM peers WHERE endpoint_id = ?1), ?2)",
             rusqlite::params![endpoint_id.as_slice(), 42],
         )
         .unwrap();
@@ -644,7 +600,8 @@ mod tests {
         .unwrap();
 
         conn.execute(
-            "INSERT INTO dht_routing (endpoint_id, bucket_index) VALUES (?1, ?2)",
+            "INSERT INTO dht_routing (peer_id, bucket_index)
+             VALUES ((SELECT id FROM peers WHERE endpoint_id = ?1), ?2)",
             rusqlite::params![endpoint_id.as_slice(), 10],
         )
         .unwrap();
@@ -720,7 +677,8 @@ mod tests {
         let topic_id = [1u8; 32];
         let harbor_id = [2u8; 32];
         conn.execute(
-            "INSERT INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+            "INSERT INTO topics (topic_id, harbor_id, admin_peer_id)
+             VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
             rusqlite::params![topic_id.as_slice(), harbor_id.as_slice(), admin_id.as_slice()],
         )
         .unwrap();
@@ -728,7 +686,8 @@ mod tests {
         // Wrong size harbor_id should fail
         let bad_harbor = [3u8; 16];
         let result = conn.execute(
-            "INSERT INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+            "INSERT INTO topics (topic_id, harbor_id, admin_peer_id)
+             VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
             rusqlite::params![[4u8; 32].as_slice(), bad_harbor.as_slice(), admin_id.as_slice()],
         );
         assert!(result.is_err(), "Should reject harbor_id with wrong size");
@@ -777,7 +736,8 @@ mod tests {
 
         // Insert topic
         conn.execute(
-            "INSERT INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+            "INSERT INTO topics (topic_id, harbor_id, admin_peer_id)
+             VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
             rusqlite::params![topic_id.as_slice(), harbor_id.as_slice(), admin_id.as_slice()],
         )
         .unwrap();
@@ -823,18 +783,25 @@ mod tests {
             rusqlite::params![admin_id.as_slice(), 1704067200i64],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            rusqlite::params![sender_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
 
         // Insert topic
         conn.execute(
-            "INSERT INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+            "INSERT INTO topics (topic_id, harbor_id, admin_peer_id)
+             VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
             rusqlite::params![topic_id.as_slice(), harbor_id.as_slice(), admin_id.as_slice()],
         )
         .unwrap();
 
         // Insert pending packet
         conn.execute(
-            "INSERT INTO pending_decryption (packet_id, topic_id, harbor_id, sender_id, epoch, packet_data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO pending_decryption
+             (packet_id, topic_id, harbor_id, sender_peer_id, epoch, packet_data)
+             VALUES (?1, ?2, ?3, (SELECT id FROM peers WHERE endpoint_id = ?4), ?5, ?6)",
             rusqlite::params![
                 packet_id.as_slice(),
                 topic_id.as_slice(),
@@ -881,20 +848,26 @@ mod tests {
     #[test]
     fn test_connection_list_schema() {
         let conn = in_memory_db();
+        create_peer_table(&conn).unwrap();
         create_control_tables(&conn).unwrap();
 
         let peer_id = [1u8; 32];
         let request_id = [2u8; 32];
 
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            rusqlite::params![peer_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
+
         // Insert a connection
         conn.execute(
-            "INSERT INTO connection_list (peer_id, state, display_name, relay_url, request_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO connection_list (peer_id, state, display_name, request_id)
+             VALUES ((SELECT id FROM peers WHERE endpoint_id = ?1), ?2, ?3, ?4)",
             rusqlite::params![
                 peer_id.as_slice(),
                 "connected",
                 "Alice",
-                "https://relay.example.com",
                 request_id.as_slice()
             ],
         )
@@ -903,7 +876,8 @@ mod tests {
         // Query back
         let (state, name): (String, String) = conn
             .query_row(
-                "SELECT state, display_name FROM connection_list WHERE peer_id = ?1",
+                "SELECT state, display_name FROM connection_list
+                 WHERE peer_id = (SELECT id FROM peers WHERE endpoint_id = ?1)",
                 [peer_id.as_slice()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -913,9 +887,17 @@ mod tests {
         assert_eq!(name, "Alice");
 
         // Invalid state should fail
+        let bad_peer_id = [3u8; 32];
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            rusqlite::params![bad_peer_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
+
         let result = conn.execute(
-            "INSERT INTO connection_list (peer_id, state) VALUES (?1, ?2)",
-            rusqlite::params![[3u8; 32].as_slice(), "invalid_state"],
+            "INSERT INTO connection_list (peer_id, state)
+             VALUES ((SELECT id FROM peers WHERE endpoint_id = ?1), ?2)",
+            rusqlite::params![bad_peer_id.as_slice(), "invalid_state"],
         );
         assert!(result.is_err());
     }
@@ -967,6 +949,7 @@ mod tests {
     #[test]
     fn test_pending_topic_invites_schema() {
         let conn = in_memory_db();
+        create_peer_table(&conn).unwrap();
         create_control_tables(&conn).unwrap();
 
         let message_id = [1u8; 32];
@@ -976,10 +959,26 @@ mod tests {
         let admin_id = [5u8; 32];
         let members_blob: Vec<u8> = vec![]; // Empty member list
 
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            rusqlite::params![sender_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            rusqlite::params![admin_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
+
         // Insert a pending invite
         conn.execute(
-            "INSERT INTO pending_topic_invites (message_id, topic_id, sender_id, topic_name, epoch, epoch_key, admin_id, members_blob)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO pending_topic_invites
+             (message_id, topic_id, sender_peer_id, topic_name, epoch, epoch_key, admin_peer_id, members_blob)
+             VALUES (?1, ?2,
+                     (SELECT id FROM peers WHERE endpoint_id = ?3),
+                     ?4, ?5, ?6,
+                     (SELECT id FROM peers WHERE endpoint_id = ?7),
+                     ?8)",
             rusqlite::params![
                 message_id.as_slice(),
                 topic_id.as_slice(),
@@ -1006,4 +1005,3 @@ mod tests {
         assert_eq!(epoch, 1);
     }
 }
-

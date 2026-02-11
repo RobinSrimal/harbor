@@ -215,9 +215,11 @@ mod tests {
         ).unwrap();
         // Insert topic
         conn.execute(
-            "INSERT OR IGNORE INTO topics (topic_id, harbor_id, admin_id) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO topics (topic_id, harbor_id, admin_peer_id)
+             VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
             rusqlite::params![topic_id.as_slice(), harbor_id.as_slice(), admin_id.as_slice()],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]

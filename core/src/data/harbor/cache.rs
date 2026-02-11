@@ -10,7 +10,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::data::dht::current_timestamp;
+use crate::data::dht::{current_timestamp, ensure_peer_exists};
 
 /// Maximum lifetime for cached packets (3 months in seconds)
 pub const PACKET_LIFETIME_SECS: i64 = 90 * 24 * 60 * 60;
@@ -111,10 +111,12 @@ pub fn cache_packet_with_ttl(
 
     let tx = conn.transaction()?;
 
+    ensure_peer_exists(&tx, sender_id)?;
+
     tx.execute(
         "INSERT OR REPLACE INTO harbor_cache
-         (packet_id, harbor_id, sender_id, packet_data, synced, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (packet_id, harbor_id, sender_peer_id, packet_data, synced, created_at, expires_at)
+         VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3), ?4, ?5, ?6, ?7)",
         params![
             packet_id.as_slice(),
             harbor_id.as_slice(),
@@ -128,9 +130,10 @@ pub fn cache_packet_with_ttl(
 
     // Add recipients who haven't received the packet yet
     for recipient in recipients {
+        ensure_peer_exists(&tx, recipient)?;
         tx.execute(
-            "INSERT OR IGNORE INTO harbor_recipients (packet_id, recipient_id, delivered)
-             VALUES (?1, ?2, 0)",
+            "INSERT OR IGNORE INTO harbor_recipients (packet_id, peer_id, delivered)
+             VALUES (?1, (SELECT id FROM peers WHERE endpoint_id = ?2), 0)",
             params![packet_id.as_slice(), recipient.as_slice()],
         )?;
     }
@@ -144,8 +147,10 @@ pub fn get_cached_packet(
     packet_id: &[u8; 32],
 ) -> rusqlite::Result<Option<CachedPacket>> {
     conn.query_row(
-        "SELECT packet_id, harbor_id, sender_id, packet_data, synced, created_at, expires_at
-         FROM harbor_cache WHERE packet_id = ?1",
+        "SELECT c.packet_id, c.harbor_id, p.endpoint_id, c.packet_data, c.synced, c.created_at, c.expires_at
+         FROM harbor_cache c
+         JOIN peers p ON c.sender_peer_id = p.id
+         WHERE c.packet_id = ?1",
         [packet_id.as_slice()],
         parse_cached_packet_row,
     )
@@ -167,15 +172,20 @@ pub fn get_packets_for_recipient(
     recipient_id: &[u8; 32],
     since_timestamp: i64,
 ) -> rusqlite::Result<Vec<CachedPacket>> {
+    ensure_peer_exists(conn, &WILDCARD_RECIPIENT)?;
+    ensure_peer_exists(conn, recipient_id)?;
+
     // Query packets where recipient is either:
     // 1. The specific recipient_id, OR
     // 2. The wildcard recipient (catch-up mode packets available to all members)
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT c.packet_id, c.harbor_id, c.sender_id, c.packet_data, c.synced, c.created_at, c.expires_at
+        "SELECT DISTINCT c.packet_id, c.harbor_id, p.endpoint_id, c.packet_data, c.synced, c.created_at, c.expires_at
          FROM harbor_cache c
          JOIN harbor_recipients r ON c.packet_id = r.packet_id
+         JOIN peers p ON c.sender_peer_id = p.id
          WHERE c.harbor_id = ?1
-           AND (r.recipient_id = ?2 OR r.recipient_id = ?5)
+           AND (r.peer_id = (SELECT id FROM peers WHERE endpoint_id = ?2)
+                OR r.peer_id = (SELECT id FROM peers WHERE endpoint_id = ?5))
            AND r.delivered = 0
            AND c.created_at >= ?3
            AND c.expires_at > ?4
@@ -201,7 +211,8 @@ pub fn mark_delivered(
 ) -> rusqlite::Result<bool> {
     let rows = conn.execute(
         "UPDATE harbor_recipients SET delivered = 1, delivered_at = ?1
-         WHERE packet_id = ?2 AND recipient_id = ?3",
+         WHERE packet_id = ?2
+           AND peer_id = (SELECT id FROM peers WHERE endpoint_id = ?3)",
         params![current_timestamp(), packet_id.as_slice(), recipient_id.as_slice()],
     )?;
     Ok(rows > 0)
@@ -227,8 +238,10 @@ pub fn get_undelivered_recipients(
     packet_id: &[u8; 32],
 ) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut stmt = conn.prepare(
-        "SELECT recipient_id FROM harbor_recipients 
-         WHERE packet_id = ?1 AND delivered = 0",
+        "SELECT p.endpoint_id
+         FROM harbor_recipients r
+         JOIN peers p ON r.peer_id = p.id
+         WHERE r.packet_id = ?1 AND r.delivered = 0",
     )?;
 
     let recipients = stmt
@@ -249,8 +262,10 @@ pub fn get_delivered_recipients(
     packet_id: &[u8; 32],
 ) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut stmt = conn.prepare(
-        "SELECT recipient_id FROM harbor_recipients 
-         WHERE packet_id = ?1 AND delivered = 1",
+        "SELECT p.endpoint_id
+         FROM harbor_recipients r
+         JOIN peers p ON r.peer_id = p.id
+         WHERE r.packet_id = ?1 AND r.delivered = 1",
     )?;
 
     let recipients = stmt
@@ -272,10 +287,11 @@ pub fn get_packets_for_sync(
 ) -> rusqlite::Result<Vec<CachedPacket>> {
     let now = current_timestamp();
     let mut stmt = conn.prepare(
-        "SELECT packet_id, harbor_id, sender_id, packet_data, synced, created_at, expires_at
-         FROM harbor_cache
-         WHERE harbor_id = ?1 AND expires_at > ?2
-         ORDER BY created_at ASC",
+        "SELECT c.packet_id, c.harbor_id, p.endpoint_id, c.packet_data, c.synced, c.created_at, c.expires_at
+         FROM harbor_cache c
+         JOIN peers p ON c.sender_peer_id = p.id
+         WHERE c.harbor_id = ?1 AND c.expires_at > ?2
+         ORDER BY c.created_at ASC",
     )?;
 
     let packets = stmt
@@ -423,6 +439,7 @@ mod tests {
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        crate::data::schema::create_peer_table(&conn).unwrap();
         create_harbor_table(&conn).unwrap();
         conn
     }
@@ -809,4 +826,3 @@ mod tests {
         assert!(!was_pulled(&conn, &topic, &old_packet).unwrap());
     }
 }
-

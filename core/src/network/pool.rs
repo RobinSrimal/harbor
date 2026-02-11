@@ -146,24 +146,8 @@ impl ConnectionPool {
         relay_url: Option<&RelayUrl>,
         relay_url_last_success: Option<i64>,
     ) -> Result<(ConnectionRef, bool), PoolError> {
-        // Check for cached connection
-        {
-            let connections = self.connections.read().await;
-            if let Some(cached) = connections.get(&node_id) {
-                // Check if connection is still alive
-                if cached.connection.close_reason().is_none() {
-                    trace!(
-                        alpn = ?std::str::from_utf8(self.alpn),
-                        target = %node_id,
-                        "reusing cached connection"
-                    );
-                    return Ok((ConnectionRef {
-                        connection: cached.connection.clone(),
-                        node_id,
-                        _drop_notify: None,
-                    }, false));
-                }
-            }
+        if let Some(cached) = self.try_get_cached(node_id).await {
+            return Ok((cached, false));
         }
 
         // Need to establish new connection
@@ -218,13 +202,62 @@ impl ConnectionPool {
 
         let relay_url_confirmed = result.relay_url_confirmed;
 
-        // Cache the connection
+        let conn_ref = self.cache_connection(node_id, result.connection).await?;
+        Ok((conn_ref, relay_url_confirmed))
+    }
+
+    /// Try to get a cached connection without creating a new one.
+    pub async fn try_get_cached(&self, node_id: EndpointId) -> Option<ConnectionRef> {
+        let connections = self.connections.read().await;
+        if let Some(cached) = connections.get(&node_id) {
+            // Check if connection is still alive
+            if cached.connection.close_reason().is_none() {
+                trace!(
+                    alpn = ?std::str::from_utf8(self.alpn),
+                    target = %node_id,
+                    "reusing cached connection"
+                );
+                return Some(ConnectionRef {
+                    connection: cached.connection.clone(),
+                    node_id,
+                    _drop_notify: None,
+                });
+            }
+        }
+        None
+    }
+
+    /// Cache an established connection.
+    pub async fn cache_connection(
+        &self,
+        node_id: EndpointId,
+        connection: Connection,
+    ) -> Result<ConnectionRef, PoolError> {
+        // Check connection limit
+        {
+            let connections = self.connections.read().await;
+            if connections.len() >= self.config.max_connections {
+                // Try to evict idle connection
+                drop(connections);
+                self.evict_idle().await;
+
+                let connections = self.connections.read().await;
+                if connections.len() >= self.config.max_connections {
+                    warn!(
+                        alpn = ?std::str::from_utf8(self.alpn),
+                        "connection pool full"
+                    );
+                    return Err(PoolError::TooManyConnections);
+                }
+            }
+        }
+
         {
             let mut connections = self.connections.write().await;
             let mut lru = self.lru_order.write().await;
 
             connections.insert(node_id, CachedConnection {
-                connection: result.connection.clone(),
+                connection: connection.clone(),
                 last_used: std::time::Instant::now(),
             });
 
@@ -233,11 +266,11 @@ impl ConnectionPool {
             lru.push_back(node_id);
         }
 
-        Ok((ConnectionRef {
-            connection: result.connection,
+        Ok(ConnectionRef {
+            connection,
             node_id,
             _drop_notify: None,
-        }, relay_url_confirmed))
+        })
     }
 
     /// Evict the least recently used idle connection

@@ -9,21 +9,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::{Endpoint, EndpointId};
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::data::dht::peer::{get_peer_relay_info, update_peer_relay_url, current_timestamp};
 use crate::data::{get_topic_members, LocalIdentity};
 use crate::data::membership::get_topic_by_harbor_id;
-use crate::network::connect;
+use crate::network::connect::Connector;
 use crate::network::gate::ConnectionGate;
 use crate::network::send::{SendService, SendOptions};
 use crate::network::packet::{DmMessage, TopicMessage, SyncUpdateMessage};
 use crate::protocol::{MemberInfo, ProtocolError, ProtocolEvent, SyncRequestEvent, SyncResponseEvent, DmSyncResponseEvent};
 
-use super::protocol::SYNC_ALPN;
 
 /// Message type bytes for sync protocol
 pub mod sync_message_type {
@@ -100,8 +97,8 @@ impl std::fmt::Debug for SyncService {
 }
 
 pub struct SyncService {
-    /// Iroh endpoint (for outgoing SYNC_ALPN connections)
-    endpoint: Endpoint,
+    /// Connector for outgoing SYNC_ALPN connections
+    connector: Arc<Connector>,
     /// Local identity
     identity: Arc<LocalIdentity>,
     /// Database connection
@@ -119,7 +116,7 @@ pub struct SyncService {
 impl SyncService {
     /// Create a new Sync service
     pub fn new(
-        endpoint: Endpoint,
+        connector: Arc<Connector>,
         identity: Arc<LocalIdentity>,
         db: Arc<Mutex<DbConnection>>,
         event_tx: mpsc::Sender<ProtocolEvent>,
@@ -127,7 +124,7 @@ impl SyncService {
         connection_gate: Option<Arc<ConnectionGate>>,
     ) -> Self {
         Self {
-            endpoint,
+            connector,
             identity,
             db,
             event_tx,
@@ -268,32 +265,10 @@ impl SyncService {
         let message = encode_sync_response(topic_id, &self.identity.public_key, &data);
 
         // Connect to requester via SYNC_ALPN
-        let node_id = EndpointId::from_bytes(requester_id)
-            .map_err(|e| ProtocolError::Network(format!("invalid node id: {}", e)))?;
-
-        let relay_info = {
-            let db = self.db.lock().await;
-            get_peer_relay_info(&db, requester_id).unwrap_or(None)
-        };
-        let (relay_url_str, relay_last_success) = match &relay_info {
-            Some((url, ts)) => (Some(url.as_str()), *ts),
-            None => (None, None),
-        };
-        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
-
-        let result = connect::connect(
-            &self.endpoint, node_id, parsed_relay.as_ref(), relay_last_success, SYNC_ALPN, self.config.connect_timeout,
-        )
-        .await
-        .map_err(|e| ProtocolError::Network(format!("connection failed: {}", e)))?;
-
-        let conn = result.connection;
-        if result.relay_url_confirmed {
-            if let Some(url) = &parsed_relay {
-                let db = self.db.lock().await;
-                let _ = update_peer_relay_url(&db, requester_id, &url.to_string(), current_timestamp());
-            }
-        }
+        let conn = self.connector
+            .connect_with_timeout(requester_id, self.config.connect_timeout)
+            .await
+            .map_err(|e| ProtocolError::Network(format!("connection failed: {}", e)))?;
 
         // Open unidirectional stream and send
         let mut send = conn
@@ -377,32 +352,10 @@ impl SyncService {
     ) -> Result<(), ProtocolError> {
         let message = encode_dm_sync_response(&self.identity.public_key, &data);
 
-        let node_id = EndpointId::from_bytes(recipient_id)
-            .map_err(|e| ProtocolError::Network(format!("invalid node id: {}", e)))?;
-
-        let relay_info = {
-            let db = self.db.lock().await;
-            get_peer_relay_info(&db, recipient_id).unwrap_or(None)
-        };
-        let (relay_url_str, relay_last_success) = match &relay_info {
-            Some((url, ts)) => (Some(url.as_str()), *ts),
-            None => (None, None),
-        };
-        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
-
-        let result = connect::connect(
-            &self.endpoint, node_id, parsed_relay.as_ref(), relay_last_success, SYNC_ALPN, self.config.connect_timeout,
-        )
-        .await
-        .map_err(|e| ProtocolError::Network(format!("connection failed: {}", e)))?;
-
-        let conn = result.connection;
-        if result.relay_url_confirmed {
-            if let Some(url) = &parsed_relay {
-                let db = self.db.lock().await;
-                let _ = update_peer_relay_url(&db, recipient_id, &url.to_string(), current_timestamp());
-            }
-        }
+        let conn = self.connector
+            .connect_with_timeout(recipient_id, self.config.connect_timeout)
+            .await
+            .map_err(|e| ProtocolError::Network(format!("connection failed: {}", e)))?;
 
         let mut send = conn
             .open_uni()

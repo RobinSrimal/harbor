@@ -5,6 +5,8 @@
 
 use rusqlite::{Connection, params};
 
+use crate::data::dht::peer::ensure_peer_exists;
+
 /// DHT routing entry stored in database
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DhtEntry {
@@ -40,9 +42,10 @@ fn parse_dht_row(row: &rusqlite::Row) -> rusqlite::Result<DhtEntry> {
 
 /// Insert a DHT routing entry
 pub fn insert_dht_entry(conn: &Connection, entry: &DhtEntry) -> rusqlite::Result<()> {
+    ensure_peer_exists(conn, &entry.endpoint_id)?;
     conn.execute(
-        "INSERT OR REPLACE INTO dht_routing (endpoint_id, bucket_index, added_at)
-         VALUES (?1, ?2, ?3)",
+        "INSERT OR REPLACE INTO dht_routing (peer_id, bucket_index, added_at)
+         VALUES ((SELECT id FROM peers WHERE endpoint_id = ?1), ?2, ?3)",
         params![
             entry.endpoint_id.as_slice(),
             entry.bucket_index as i32,
@@ -55,7 +58,8 @@ pub fn insert_dht_entry(conn: &Connection, entry: &DhtEntry) -> rusqlite::Result
 /// Remove a DHT routing entry
 pub fn remove_dht_entry(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite::Result<bool> {
     let rows = conn.execute(
-        "DELETE FROM dht_routing WHERE endpoint_id = ?1",
+        "DELETE FROM dht_routing
+         WHERE peer_id = (SELECT id FROM peers WHERE endpoint_id = ?1)",
         [endpoint_id.as_slice()],
     )?;
     Ok(rows > 0)
@@ -64,10 +68,11 @@ pub fn remove_dht_entry(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite::
 /// Get all entries in a specific bucket
 pub fn get_bucket_entries(conn: &Connection, bucket_index: u8) -> rusqlite::Result<Vec<DhtEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT endpoint_id, bucket_index, added_at
-         FROM dht_routing
-         WHERE bucket_index = ?1
-         ORDER BY added_at DESC",
+        "SELECT p.endpoint_id, r.bucket_index, r.added_at
+         FROM dht_routing r
+         JOIN peers p ON r.peer_id = p.id
+         WHERE r.bucket_index = ?1
+         ORDER BY r.added_at DESC",
     )?;
 
     let entries = stmt
@@ -80,9 +85,10 @@ pub fn get_bucket_entries(conn: &Connection, bucket_index: u8) -> rusqlite::Resu
 /// Get all DHT routing entries, grouped by bucket
 pub fn get_all_entries(conn: &Connection) -> rusqlite::Result<Vec<DhtEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT endpoint_id, bucket_index, added_at
-         FROM dht_routing
-         ORDER BY bucket_index, added_at DESC",
+        "SELECT p.endpoint_id, r.bucket_index, r.added_at
+         FROM dht_routing r
+         JOIN peers p ON r.peer_id = p.id
+         ORDER BY r.bucket_index, r.added_at DESC",
     )?;
 
     let entries = stmt
@@ -140,7 +146,7 @@ pub fn load_routing_table_relay_urls(conn: &Connection) -> rusqlite::Result<Vec<
     let mut stmt = conn.prepare(
         "SELECT p.endpoint_id, p.relay_url, p.relay_url_last_success
          FROM dht_routing r
-         JOIN peers p ON r.endpoint_id = p.endpoint_id
+         JOIN peers p ON r.peer_id = p.id
          WHERE p.relay_url IS NOT NULL",
     )?;
 
@@ -183,8 +189,6 @@ mod tests {
         let endpoint_id = [seed; 32];
         let peer = PeerInfo {
             endpoint_id,
-            endpoint_address: None,
-            address_timestamp: None,
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: current_timestamp(),
@@ -358,8 +362,6 @@ mod tests {
         let endpoint_id = [1u8; 32];
         let peer = PeerInfo {
             endpoint_id,
-            endpoint_address: None,
-            address_timestamp: None,
             last_latency_ms: None,
             latency_timestamp: None,
             last_seen: current_timestamp(),

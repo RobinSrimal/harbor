@@ -5,7 +5,7 @@
 
 use rusqlite::{Connection, params};
 
-use crate::data::dht::current_timestamp;
+use crate::data::dht::{current_timestamp, ensure_peer_exists};
 
 /// Chunk size for file sharing (512 KB)
 pub const CHUNK_SIZE: u64 = 512 * 1024;
@@ -65,10 +65,12 @@ pub fn insert_blob(
 ) -> rusqlite::Result<()> {
     let total_chunks = total_size.div_ceil(CHUNK_SIZE) as u32;
 
+    ensure_peer_exists(conn, source_id)?;
+
     conn.execute(
         "INSERT OR REPLACE INTO blobs
-         (hash, scope_id, source_id, display_name, total_size, total_chunks, num_sections, state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+         (hash, scope_id, source_peer_id, display_name, total_size, total_chunks, num_sections, state)
+         VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3), ?4, ?5, ?6, ?7, 0)",
         params![
             hash.as_slice(),
             scope_id.as_slice(),
@@ -85,9 +87,11 @@ pub fn insert_blob(
 /// Get blob metadata by hash
 pub fn get_blob(conn: &Connection, hash: &[u8; 32]) -> rusqlite::Result<Option<BlobMetadata>> {
     let mut stmt = conn.prepare(
-        "SELECT hash, scope_id, source_id, display_name, total_size, total_chunks,
-                num_sections, state, created_at
-         FROM blobs WHERE hash = ?1"
+        "SELECT b.hash, b.scope_id, p.endpoint_id, b.display_name, b.total_size, b.total_chunks,
+                b.num_sections, b.state, b.created_at
+         FROM blobs b
+         JOIN peers p ON b.source_peer_id = p.id
+         WHERE b.hash = ?1"
     )?;
 
     let result = stmt.query_row([hash.as_slice()], |row| {
@@ -167,9 +171,10 @@ pub fn record_section_received(
     received_from: &[u8; 32],
 ) -> rusqlite::Result<()> {
     let now = current_timestamp();
+    ensure_peer_exists(conn, received_from)?;
     conn.execute(
         "UPDATE blob_sections 
-         SET received_from = ?1, received_at = ?2
+         SET received_from_peer_id = (SELECT id FROM peers WHERE endpoint_id = ?1), received_at = ?2
          WHERE hash = ?3 AND section_id = ?4",
         params![
             received_from.as_slice(),
@@ -187,8 +192,10 @@ pub fn get_section_traces(
     hash: &[u8; 32],
 ) -> rusqlite::Result<Vec<SectionTrace>> {
     let mut stmt = conn.prepare(
-        "SELECT section_id, chunk_start, chunk_end, received_from, received_at
-         FROM blob_sections WHERE hash = ?1 ORDER BY section_id"
+        "SELECT s.section_id, s.chunk_start, s.chunk_end, p.endpoint_id, s.received_at
+         FROM blob_sections s
+         LEFT JOIN peers p ON s.received_from_peer_id = p.id
+         WHERE s.hash = ?1 ORDER BY s.section_id"
     )?;
     
     let rows = stmt.query_map([hash.as_slice()], |row| {
@@ -218,8 +225,10 @@ pub fn get_section_peer_suggestion(
     section_id: u8,
 ) -> rusqlite::Result<Option<[u8; 32]>> {
     let result: rusqlite::Result<Vec<u8>> = conn.query_row(
-        "SELECT received_from FROM blob_sections 
-         WHERE hash = ?1 AND section_id = ?2 AND received_from IS NOT NULL",
+        "SELECT p.endpoint_id
+         FROM blob_sections s
+         JOIN peers p ON s.received_from_peer_id = p.id
+         WHERE s.hash = ?1 AND s.section_id = ?2 AND s.received_from_peer_id IS NOT NULL",
         params![hash.as_slice(), section_id as i64],
         |row| row.get(0),
     );
@@ -241,9 +250,10 @@ pub fn add_blob_recipient(
     hash: &[u8; 32],
     endpoint_id: &[u8; 32],
 ) -> rusqlite::Result<()> {
+    ensure_peer_exists(conn, endpoint_id)?;
     conn.execute(
-        "INSERT OR IGNORE INTO blob_recipients (hash, endpoint_id, received)
-         VALUES (?1, ?2, 0)",
+        "INSERT OR IGNORE INTO blob_recipients (hash, peer_id, received)
+         VALUES (?1, (SELECT id FROM peers WHERE endpoint_id = ?2), 0)",
         params![hash.as_slice(), endpoint_id.as_slice()],
     )?;
     Ok(())
@@ -258,7 +268,7 @@ pub fn mark_recipient_complete(
     let now = current_timestamp();
     conn.execute(
         "UPDATE blob_recipients SET received = 1, received_at = ?1
-         WHERE hash = ?2 AND endpoint_id = ?3",
+         WHERE hash = ?2 AND peer_id = (SELECT id FROM peers WHERE endpoint_id = ?3)",
         params![now, hash.as_slice(), endpoint_id.as_slice()],
     )?;
     Ok(())
@@ -282,6 +292,8 @@ pub fn record_peer_can_seed(
     hash: &[u8; 32],
     peer_id: &[u8; 32],
 ) -> rusqlite::Result<()> {
+    ensure_peer_exists(conn, peer_id)?;
+
     // Get the blob metadata to know how many sections
     let num_sections: i64 = match conn.query_row(
         "SELECT num_sections FROM blobs WHERE hash = ?1",
@@ -299,8 +311,8 @@ pub fn record_peer_can_seed(
         // Use INSERT OR REPLACE to upsert the trace
         conn.execute(
             "INSERT OR REPLACE INTO blob_sections 
-             (hash, section_id, chunk_start, chunk_end, received_from, received_at)
-             SELECT hash, section_id, chunk_start, chunk_end, ?1, ?2
+             (hash, section_id, chunk_start, chunk_end, received_from_peer_id, received_at)
+             SELECT hash, section_id, chunk_start, chunk_end, (SELECT id FROM peers WHERE endpoint_id = ?1), ?2
              FROM blob_sections WHERE hash = ?3 AND section_id = ?4",
             params![
                 peer_id.as_slice(),
@@ -321,9 +333,11 @@ pub fn record_peer_can_seed(
 /// Get blobs for a scope (topic_id or endpoint_id)
 pub fn get_blobs_for_scope(conn: &Connection, scope_id: &[u8; 32]) -> rusqlite::Result<Vec<BlobMetadata>> {
     let mut stmt = conn.prepare(
-        "SELECT hash, scope_id, source_id, display_name, total_size, total_chunks,
-                num_sections, state, created_at
-         FROM blobs WHERE scope_id = ?1"
+        "SELECT b.hash, b.scope_id, p.endpoint_id, b.display_name, b.total_size, b.total_chunks,
+                b.num_sections, b.state, b.created_at
+         FROM blobs b
+         JOIN peers p ON b.source_peer_id = p.id
+         WHERE b.scope_id = ?1"
     )?;
 
     let rows = stmt.query_map([scope_id.as_slice()], |row| {
@@ -600,4 +614,3 @@ mod tests {
         assert_eq!(count, 1);
     }
 }
-

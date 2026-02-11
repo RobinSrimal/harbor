@@ -15,7 +15,7 @@
 //! - `config`: DHT configuration and factory functions
 //! - `distance`: XOR distance metric implementation
 //! - `lookup`: Kademlia iterative lookup algorithm
-//! - `pool`: Connection pool with direct-dial fallback
+//! - `pool`: Connection pool with relay/DNS fallback
 //! - `routing`: In-memory routing table with K-buckets
 //!
 //! # Example

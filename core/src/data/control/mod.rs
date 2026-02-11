@@ -7,6 +7,8 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::data::dht::ensure_peer_exists;
+
 // ============ Connection State Types ============
 
 /// Connection state with a peer
@@ -70,31 +72,38 @@ pub fn upsert_connection(
     relay_url: Option<&str>,
     request_id: Option<&[u8; 32]>,
 ) -> rusqlite::Result<()> {
+    ensure_peer_exists(conn, peer_id)?;
+
     conn.execute(
-        "INSERT INTO connection_list (peer_id, state, display_name, relay_url, request_id, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s', 'now'))
+        "INSERT INTO connection_list (peer_id, state, display_name, request_id, updated_at)
+         VALUES ((SELECT id FROM peers WHERE endpoint_id = ?1), ?2, ?3, ?4, strftime('%s', 'now'))
          ON CONFLICT(peer_id) DO UPDATE SET
              state = excluded.state,
              display_name = COALESCE(excluded.display_name, connection_list.display_name),
-             relay_url = COALESCE(excluded.relay_url, connection_list.relay_url),
              request_id = COALESCE(excluded.request_id, connection_list.request_id),
              updated_at = strftime('%s', 'now')",
         params![
             peer_id.as_slice(),
             state.as_str(),
             display_name,
-            relay_url,
             request_id.map(|r| r.as_slice()),
         ],
     )?;
+
+    if let Some(relay) = relay_url {
+        crate::data::update_peer_relay_url(conn, peer_id, relay, crate::data::current_timestamp())?;
+    }
+
     Ok(())
 }
 
 /// Get connection info for a peer
 pub fn get_connection(conn: &Connection, peer_id: &[u8; 32]) -> rusqlite::Result<Option<ConnectionInfo>> {
     conn.query_row(
-        "SELECT peer_id, state, display_name, relay_url, request_id, created_at, updated_at
-         FROM connection_list WHERE peer_id = ?1",
+        "SELECT p.endpoint_id, c.state, c.display_name, p.relay_url, c.request_id, c.created_at, c.updated_at
+         FROM connection_list c
+         JOIN peers p ON c.peer_id = p.id
+         WHERE p.endpoint_id = ?1",
         [peer_id.as_slice()],
         |row| {
             let peer_id_vec: Vec<u8> = row.get(0)?;
@@ -123,7 +132,7 @@ pub fn update_connection_state(
 ) -> rusqlite::Result<bool> {
     let rows = conn.execute(
         "UPDATE connection_list SET state = ?1, updated_at = strftime('%s', 'now')
-         WHERE peer_id = ?2",
+         WHERE peer_id = (SELECT id FROM peers WHERE endpoint_id = ?2)",
         params![state.as_str(), peer_id.as_slice()],
     )?;
     Ok(rows > 0)
@@ -135,8 +144,11 @@ pub fn list_connections_by_state(
     state: ConnectionState,
 ) -> rusqlite::Result<Vec<ConnectionInfo>> {
     let mut stmt = conn.prepare(
-        "SELECT peer_id, state, display_name, relay_url, request_id, created_at, updated_at
-         FROM connection_list WHERE state = ?1 ORDER BY updated_at DESC",
+        "SELECT p.endpoint_id, c.state, c.display_name, p.relay_url, c.request_id, c.created_at, c.updated_at
+         FROM connection_list c
+         JOIN peers p ON c.peer_id = p.id
+         WHERE c.state = ?1
+         ORDER BY c.updated_at DESC",
     )?;
 
     let rows = stmt.query_map([state.as_str()], |row| {
@@ -161,8 +173,10 @@ pub fn list_connections_by_state(
 /// List all connections
 pub fn list_all_connections(conn: &Connection) -> rusqlite::Result<Vec<ConnectionInfo>> {
     let mut stmt = conn.prepare(
-        "SELECT peer_id, state, display_name, relay_url, request_id, created_at, updated_at
-         FROM connection_list ORDER BY updated_at DESC",
+        "SELECT p.endpoint_id, c.state, c.display_name, p.relay_url, c.request_id, c.created_at, c.updated_at
+         FROM connection_list c
+         JOIN peers p ON c.peer_id = p.id
+         ORDER BY c.updated_at DESC",
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -187,7 +201,7 @@ pub fn list_all_connections(conn: &Connection) -> rusqlite::Result<Vec<Connectio
 /// Delete a connection from the list
 pub fn delete_connection(conn: &Connection, peer_id: &[u8; 32]) -> rusqlite::Result<bool> {
     let rows = conn.execute(
-        "DELETE FROM connection_list WHERE peer_id = ?1",
+        "DELETE FROM connection_list WHERE peer_id = (SELECT id FROM peers WHERE endpoint_id = ?1)",
         [peer_id.as_slice()],
     )?;
     Ok(rows > 0)
@@ -196,7 +210,9 @@ pub fn delete_connection(conn: &Connection, peer_id: &[u8; 32]) -> rusqlite::Res
 /// Check if a peer is connected (state = 'connected')
 pub fn is_peer_connected(conn: &Connection, peer_id: &[u8; 32]) -> rusqlite::Result<bool> {
     conn.query_row(
-        "SELECT COUNT(*) > 0 FROM connection_list WHERE peer_id = ?1 AND state = 'connected'",
+        "SELECT COUNT(*) > 0 FROM connection_list
+         WHERE peer_id = (SELECT id FROM peers WHERE endpoint_id = ?1)
+           AND state = 'connected'",
         [peer_id.as_slice()],
         |row| row.get(0),
     )
@@ -205,7 +221,9 @@ pub fn is_peer_connected(conn: &Connection, peer_id: &[u8; 32]) -> rusqlite::Res
 /// Check if a peer is blocked
 pub fn is_peer_blocked(conn: &Connection, peer_id: &[u8; 32]) -> rusqlite::Result<bool> {
     conn.query_row(
-        "SELECT COUNT(*) > 0 FROM connection_list WHERE peer_id = ?1 AND state = 'blocked'",
+        "SELECT COUNT(*) > 0 FROM connection_list
+         WHERE peer_id = (SELECT id FROM peers WHERE endpoint_id = ?1)
+           AND state = 'blocked'",
         [peer_id.as_slice()],
         |row| row.get(0),
     )
@@ -281,10 +299,17 @@ pub fn store_pending_invite(
     // Serialize members as concatenated 32-byte IDs
     let members_blob: Vec<u8> = members.iter().flat_map(|m| m.iter()).copied().collect();
 
+    ensure_peer_exists(conn, sender_id)?;
+    ensure_peer_exists(conn, admin_id)?;
+
     conn.execute(
         "INSERT OR REPLACE INTO pending_topic_invites
-         (message_id, topic_id, sender_id, topic_name, epoch, epoch_key, admin_id, members_blob)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (message_id, topic_id, sender_peer_id, topic_name, epoch, epoch_key, admin_peer_id, members_blob)
+         VALUES (?1, ?2,
+                 (SELECT id FROM peers WHERE endpoint_id = ?3),
+                 ?4, ?5, ?6,
+                 (SELECT id FROM peers WHERE endpoint_id = ?7),
+                 ?8)",
         params![
             message_id.as_slice(),
             topic_id.as_slice(),
@@ -316,8 +341,12 @@ pub fn get_pending_invite(
     message_id: &[u8; 32],
 ) -> rusqlite::Result<Option<PendingTopicInvite>> {
     conn.query_row(
-        "SELECT message_id, topic_id, sender_id, topic_name, epoch, epoch_key, admin_id, members_blob, received_at
-         FROM pending_topic_invites WHERE message_id = ?1",
+        "SELECT i.message_id, i.topic_id, s.endpoint_id, i.topic_name, i.epoch, i.epoch_key,
+                a.endpoint_id, i.members_blob, i.received_at
+         FROM pending_topic_invites i
+         JOIN peers s ON i.sender_peer_id = s.id
+         JOIN peers a ON i.admin_peer_id = a.id
+         WHERE i.message_id = ?1",
         [message_id.as_slice()],
         |row| {
             let message_id_vec: Vec<u8> = row.get(0)?;
@@ -346,8 +375,12 @@ pub fn get_pending_invite(
 /// List all pending invites
 pub fn list_pending_invites(conn: &Connection) -> rusqlite::Result<Vec<PendingTopicInvite>> {
     let mut stmt = conn.prepare(
-        "SELECT message_id, topic_id, sender_id, topic_name, epoch, epoch_key, admin_id, members_blob, received_at
-         FROM pending_topic_invites ORDER BY received_at DESC",
+        "SELECT i.message_id, i.topic_id, s.endpoint_id, i.topic_name, i.epoch, i.epoch_key,
+                a.endpoint_id, i.members_blob, i.received_at
+         FROM pending_topic_invites i
+         JOIN peers s ON i.sender_peer_id = s.id
+         JOIN peers a ON i.admin_peer_id = a.id
+         ORDER BY i.received_at DESC",
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -399,6 +432,8 @@ mod tests {
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        crate::data::schema::create_peer_table(&conn).unwrap();
         create_control_tables(&conn).unwrap();
         conn
     }

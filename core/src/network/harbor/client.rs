@@ -448,12 +448,13 @@ mod tests {
     use super::super::protocol::DeliveryUpdate;
     use crate::data::dht::current_timestamp;
     use crate::data::harbor::{cache_packet, get_cached_packet, mark_delivered};
-    use crate::data::schema::create_harbor_table;
+    use crate::data::schema::{create_harbor_table, create_peer_table};
     use crate::resilience::ProofOfWork;
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        create_peer_table(&conn).unwrap();
         create_harbor_table(&conn).unwrap();
         conn
     }

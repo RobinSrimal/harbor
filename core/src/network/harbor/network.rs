@@ -9,16 +9,12 @@
 //! All send methods use a shared connection helper to avoid duplicating
 //! relay lookup, connection establishment, and relay URL confirmation.
 
-use iroh::EndpointId;
 use tracing::debug;
 
-use crate::data::dht::peer::{current_timestamp, get_peer_relay_info, update_peer_relay_url};
-use crate::network::connect;
 use crate::protocol::ProtocolError;
 
 use super::protocol::{
     DeliveryAck, HarborMessage, PacketInfo, StoreRequest, PullRequest, SyncRequest, SyncResponse,
-    HARBOR_ALPN,
 };
 use super::service::HarborService;
 
@@ -36,50 +32,18 @@ impl HarborService {
     ///
     /// This is the shared connection helper used by all `send_harbor_*` methods.
     /// It handles:
-    /// 1. EndpointId resolution
-    /// 2. Relay info lookup from DB
-    /// 3. QUIC connection via `connect::connect()`
-    /// 4. Relay URL confirmation update
+    /// 1. Relay info lookup from DB
+    /// 2. QUIC connection via Connector
+    /// 3. Relay URL confirmation update
     async fn connect_to_harbor_node(
         &self,
         harbor_node: &[u8; 32],
     ) -> Result<iroh::endpoint::Connection, ProtocolError> {
-        let endpoint = self.endpoint();
-        let db = self.db();
-
-        let node_id = EndpointId::from_bytes(harbor_node)
-            .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        let relay_info = {
-            let db = db.lock().await;
-            get_peer_relay_info(&db, harbor_node).unwrap_or(None)
-        };
-        let (relay_url_str, relay_last_success) = match &relay_info {
-            Some((url, ts)) => (Some(url.as_str()), *ts),
-            None => (None, None),
-        };
-        let parsed_relay: Option<iroh::RelayUrl> = relay_url_str.and_then(|u| u.parse().ok());
-
-        let result = connect::connect(
-            endpoint,
-            node_id,
-            parsed_relay.as_ref(),
-            relay_last_success,
-            HARBOR_ALPN,
-            self.connect_timeout,
-        )
-        .await
-        .map_err(|e| ProtocolError::Network(e.to_string()))?;
-
-        if result.relay_url_confirmed {
-            if let Some(url) = &parsed_relay {
-                let db = db.lock().await;
-                let _ =
-                    update_peer_relay_url(&db, harbor_node, &url.to_string(), current_timestamp());
-            }
-        }
-
-        Ok(result.connection)
+        let connector = self.connector();
+        connector
+            .connect_with_timeout(harbor_node, self.connect_timeout)
+            .await
+            .map_err(|e| ProtocolError::Network(e.to_string()))
     }
 
     /// Send a StoreRequest to a Harbor Node

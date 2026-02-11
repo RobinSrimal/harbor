@@ -21,10 +21,11 @@ use super::internal::api::{
 use super::internal::bootstrap::{bootstrap_dial_info, bootstrap_node_ids};
 use super::internal::config::{create_dht_actor_with_buckets, DhtConfig};
 use super::internal::distance::{Distance, Id};
-use super::internal::pool::{DhtPool, DhtPoolConfig, DhtPoolError as PoolError, DialInfo};
+use super::internal::pool::{DhtPool, DhtPoolConfig, DhtPoolError as PoolError, DialInfo, DHT_ALPN};
 use super::internal::routing::Buckets;
 use super::protocol::{FindNode, FindNodeResponse, NodeInfo, RpcProtocol};
 use crate::data::dht::{clear_all_entries, current_timestamp, insert_dht_entry, store_peer_relay_url_unverified, update_peer_relay_url, upsert_peer, DhtEntry, PeerInfo};
+use crate::network::connect::Connector;
 use crate::network::rpc::ExistingConnection;
 use crate::resilience::{ProofOfWork, PoWConfig, PoWResult, PoWVerifier, build_context};
 
@@ -78,7 +79,15 @@ impl DhtService {
         our_id: [u8; 32],
     ) -> Arc<Self> {
         let local_dht_id = Id::new(our_id);
-        let dht_pool = DhtPool::new(endpoint.clone(), DhtPoolConfig::default());
+        let pool_config = DhtPoolConfig::default();
+        let dht_connector = Arc::new(Connector::new(
+            endpoint.clone(),
+            db.clone(),
+            DHT_ALPN,
+            pool_config.connect_timeout,
+            Some(pool_config),
+        ));
+        let dht_pool = DhtPool::new(dht_connector);
 
         // Parse and register bootstrap nodes from config
         let mut bootstrap_ids: Vec<Id> = Vec::new();
@@ -292,7 +301,7 @@ impl DhtService {
         requester_relay_url: Option<String>,
     ) -> Result<FindNodeResponse, PoolError> {
         let (conn, _relay_confirmed) = self.pool.get_connection(dial_info).await?;
-        Self::send_find_node_on_conn(conn.connection(), target, requester, requester_relay_url).await
+        Self::send_find_node_on_conn(&conn, target, requester, requester_relay_url).await
     }
 
     // ========== API: Actor Commands ==========
@@ -401,8 +410,6 @@ impl DhtService {
             for endpoint_id in entries {
                 let peer = PeerInfo {
                     endpoint_id: *endpoint_id,
-                    endpoint_address: None,
-                    address_timestamp: None,
                     last_latency_ms: None,
                     latency_timestamp: None,
                     last_seen: timestamp,
@@ -517,7 +524,7 @@ impl DhtService {
                     match pool.get_connection(&dial_info).await {
                         Ok((conn, _relay_confirmed)) => {
                             // Send actual FindNode RPC over the connection
-                            match DhtService::send_find_node_on_conn(conn.connection(), target_for_rpc, requester_for_rpc, relay_url_for_rpc).await {
+                            match DhtService::send_find_node_on_conn(&conn, target_for_rpc, requester_for_rpc, relay_url_for_rpc).await {
                                 Ok(response) => {
                                     // Return full NodeInfo so caller can extract relay URLs
                                     trace!(
