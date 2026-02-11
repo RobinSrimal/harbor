@@ -8,29 +8,39 @@
 - [Running a Node](./getting-started/running-node.md)
 - [Configuration](./getting-started/configuration.md)
 
-# Concepts
+# Network Foundations
 
-- [Topics & Membership](./concepts/topics.md)
-- [Direct Messages](./concepts/direct-messages.md)
-- [Protocol Overview](./concepts/protocols.md)
+- [Harbor & Offline Delivery](./network-foundations/harbor-nodes.md)
+- [DHT for Discovery](./network-foundations/dht.md)
+- [Control & Data Planes](./network-foundations/planes.md)
 
-# Architecture
+# Control Plane
 
-- [Services & Protocols](./architecture/services.md)
-- [Harbor Nodes](./architecture/harbor-nodes.md)
-- [DHT & Discovery](./architecture/dht.md)
+- [Topics](./control-plane/topics.md)
+- [Direct Connections](./control-plane/direct-connections.md)
 
-# Security & Privacy
+# Data Plane
 
-- [Encryption](./security/encryption.md)
-- [Database & Keyring](./security/database.md)
-- [Harbor Node Privacy](./security/harbor-privacy.md)
-- [Proof of Work](./security/proof-of-work.md)
+- [Send (Messages)](./data-plane/send.md)
+- [Stream (Live Media)](./data-plane/stream.md)
+- [Sync (CRDT)](./data-plane/sync.md)
+- [Share (Files)](./data-plane/share.md)
+
+# Security
+
+- [Harbor Security & Privacy](./security/harbor-privacy.md)
+- [Data Plane Security](./security/encryption.md)
+- [Local Data & Keys](./security/database.md)
+
+# Resilience
+
+- [Harbor, DHT, Control](./resilience/harbor-control.md)
+- [Data Plane](./resilience/data-plane.md)
 
 # Building Apps
 
-- [Simple Messaging App](./tutorials/messaging-app.md)
-- [API Reference](./tutorials/api-reference.md)
+- [Simple Messaging App](./building-apps/messaging-app.md)
+- [API Reference](./building-apps/api-reference.md)
 
 # Operating
 

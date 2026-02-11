@@ -69,7 +69,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## What's Next?
 
 - [Configuration](./configuration.md) - All configuration options
-- [Topics & Membership](../concepts/topics.md) - Group communication
-- [Direct Messages](../concepts/direct-messages.md) - 1:1 messaging
-- [Simple Messaging App](../tutorials/messaging-app.md) - Complete example
-- [API Reference](../tutorials/api-reference.md) - Full API documentation
+- [Topics](../control-plane/topics.md) - Group membership and invites
+- [Direct Connections](../control-plane/direct-connections.md) - 1:1 relationships
+- [Send (Messages)](../data-plane/send.md) - The default messaging path
+- [Share (Files)](../data-plane/share.md) - Large file transfer
+- [Sync (CRDT)](../data-plane/sync.md) - Collaboration primitives
+- [Stream (Live Media)](../data-plane/stream.md) - Low-latency data
+- [Simple Messaging App](../building-apps/messaging-app.md) - Complete example
+- [API Reference](../building-apps/api-reference.md) - Full API documentation

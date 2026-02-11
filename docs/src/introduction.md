@@ -1,63 +1,40 @@
 # Harbor Protocol
 
-Harbor is a decentralized peer-to-peer communication protocol designed for **offline-first messaging** with strong privacy guarantees.
+Harbor is a decentralized peer-to-peer communication protocol for **offline-first apps**. It lets your users communicate directly when they're online and keeps delivery working when they're not.
 
-## What is Harbor?
+## What Harbor Gives You
 
-Harbor enables secure communication between peers without relying on centralized servers. Messages are delivered directly when peers are online, and stored on distributed **Harbor Nodes** when recipients are offline.
+- **Offline delivery** without centralized servers
+- **Direct peer-to-peer** when possible
+- **Topics and 1:1 connections** as the core relationship model
+- **Data-plane primitives** for messaging, streaming, sync, and file sharing
 
-**Key features:**
+## Mental Model
 
-- **Offline-first**: Messages reach recipients even when they're not online
-- **End-to-end encrypted**: Only participants can read message content
-- **Decentralized**: No central servers, no single point of failure
-- **Topic-based**: Organize communication into invite-only groups
-- **CRDT-ready**: Built-in primitives for collaborative applications
+Think of Harbor as three layers:
 
-## How It Works
+1. **Harbor (offline delivery)**
+   Any node can **act as a Harbor node** if it opts in to store packets.
+
+2. **DHT (discovery)**
+   The DHT exists mainly to **find Harbor nodes** (and peers). It is a support system, not your app API.
+
+3. **Planes**
+   - **Control plane**: who can talk to whom (connections, topics)
+   - **Data plane**: what you do once connected (send, stream, sync, share)
+
+## Quick Flow
 
 ```
-┌─────────────┐         ┌─────────────┐
-│   Alice     │◄───────►│    Bob      │
-│   (online)  │  direct │  (online)   │
-└─────────────┘         └─────────────┘
-       │
-       │ Bob goes offline...
-       ▼
-┌─────────────┐         ┌─────────────┐
-│   Alice     │────────►│ Harbor Node │
-│   (online)  │  store  │  (storage)  │
-└─────────────┘         └─────────────┘
-                               │
-       Bob comes back online...│
-                               ▼
-┌─────────────┐         ┌─────────────┐
-│    Bob      │◄────────│ Harbor Node │
-│   (online)  │  pull   │  (storage)  │
-└─────────────┘         └─────────────┘
+Sender online -> direct delivery
+Recipient offline -> Harbor storage
+Recipient online -> pull from Harbor nodes
 ```
 
-1. **Direct delivery**: When both peers are online, messages are sent directly via QUIC
-2. **Harbor storage**: If a recipient is offline, messages are stored on Harbor Nodes
-3. **Pull on reconnect**: When the recipient comes online, they pull missed messages
+Harbor handles the routing and storage automatically. Your app just uses the protocol APIs.
 
-## Privacy by Design
+## Where to Start
 
-Harbor Nodes store messages but **cannot read them**:
-
-- Messages are encrypted with topic keys that Harbor Nodes don't have
-- Harbor Nodes only know the `HarborID` (a hash), not the actual topic or participants
-- Messages are signed, so tampering is detectable
-
-See [Harbor Node Privacy](./security/harbor-privacy.md) for details.
-
-## Use Cases
-
-- **Private messaging**: 1:1 and group chat with offline delivery
-- **Collaborative apps**: Real-time collaboration with CRDT support
-- **File sharing**: P2P file distribution (BitTorrent-style)
-- **Live streaming**: Real-time audio/video between peers
-
-## Getting Started
-
-Ready to dive in? Start with the [Quick Start](./getting-started/quick-start.md) guide.
+- [Quick Start](./getting-started/quick-start.md)
+- [Harbor & Offline Delivery](./network-foundations/harbor-nodes.md)
+- [Control & Data Planes](./network-foundations/planes.md)

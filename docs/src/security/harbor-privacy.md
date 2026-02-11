@@ -1,89 +1,35 @@
-# Harbor Node Privacy
+# Harbor Security & Privacy
 
-A critical design goal of Harbor is that **Harbor Nodes cannot read the messages they store**. However, they do see some metadata. This page explains what Harbor Nodes can and cannot see.
+Harbor nodes provide offline delivery, but they are **untrusted storage**. The design assumes that any Harbor node may be malicious.
 
-## What Harbor Nodes CAN See
+## What Harbor Nodes Can and Can't See
 
-| Information | Why |
-|-------------|-----|
-| **HarborID** | Needed for routing (but this is a hash, not the TopicID) |
-| **Sender EndpointID** | Public key in the packet (proves authenticity) |
-| **Recipient EndpointIDs** | Needed for per-recipient delivery tracking |
-| **Packet size** | Can't be hidden |
-| **Timing** | When packets arrive |
-| **Encrypted ciphertext** | Opaque blob they store |
+Harbor nodes **cannot read message contents**. They only see what they need to route and deliver packets:
 
-## What Harbor Nodes CANNOT See
+Can see:
 
-| Information | Why |
-|-------------|-----|
-| **TopicID** | They only see `BLAKE3(TopicID)`, a one-way hash |
-| **Message content** | Encrypted with topic key they don't have |
-| **Topic membership** | Can't map HarborID back to full member list |
-| **Message type** | Encrypted inside the payload |
+- Harbor routing IDs
+- Sender and recipient endpoint IDs
+- Packet size and timing
 
-## Why This Matters
+Cannot see:
 
-```
-Alice sends "Hello Bob!" to TopicXYZ
-              │
-              ▼
-┌─────────────────────────────────────────┐
-│            Harbor Node sees:             │
-│                                          │
-│  HarborID: 7f3a2b...  (hash, not topic) │
-│  Sender: a1b2c3...    (Alice's pubkey)  │
-│  Recipients: [d4e5f6..., g7h8i9...]     │
-│  Size: 156 bytes                        │
-│  Ciphertext: [encrypted blob]           │
-│                                          │
-│  CANNOT see:                            │
-│  - "Hello Bob!"                         │
-│  - What topic it belongs to             │
-└─────────────────────────────────────────┘
-```
+- Message contents
+- Topic membership lists
+- Topic identifiers
 
-## How Privacy is Achieved
+## How This Works
 
-### 1. HarborID for Routing
+You don't need to handle any extra encryption yourself. Harbor automatically:
 
-The Harbor Node routes by HarborID:
+- Encrypts payloads before storage
+- Verifies sender identity
+- Ensures only intended recipients can pull packets
 
-- **Topics**: `HarborID = BLAKE3(TopicID)` - a one-way hash, so Harbor Nodes cannot derive the TopicID or encryption keys
-- **DMs**: `HarborID = recipient's EndpointID` - this is already public (the recipient's public key)
+## What This Means for Your App
 
-### 2. Encryption Keys
+- Harbor storage is safe for sensitive content.
+- Metadata (who talked to whom, roughly when, and how much) is still visible to Harbor nodes.
+- If you need stronger metadata privacy, add your own application-layer padding or batching.
 
-- **Topics**: `encryption_key = BLAKE3(TopicID || "topic-key")` - Harbor Nodes don't know the TopicID
-- **DMs**: ECDH shared secret from sender + recipient keypairs - Harbor Nodes don't have the private keys
-
-### 3. Recipient Tracking for Delivery
-
-Packets include recipient EndpointIDs so Harbor Nodes can:
-- Track per-recipient delivery status
-- Only serve packets to the intended recipients
-
-Recipients prove they're authorized via the QUIC connection - the authenticated node ID from the connection handshake must match the stored recipient.
-
-## Metadata Considerations
-
-While content is private, some metadata is visible:
-
-### Traffic Analysis
-
-An observer could potentially correlate:
-- Timing of stores and pulls
-- Packet sizes
-- Frequency of access
-
-## Trust Model
-
-You don't need to trust Harbor Nodes with your message content:
-
-- They **cannot** read your messages
-- They **can** see sender and recipient EndpointIDs (metadata)
-- They **cannot** see the full topic membership list
-- They **can** refuse to store your packets (mitigated by redundancy)
-- They **can** delete your packets (mitigated by replication)
-
-The worst a malicious Harbor Node can do is refuse service or observe communication metadata - they cannot read message content.
+See [Data Plane Security](./encryption.md) for direct-connection security.

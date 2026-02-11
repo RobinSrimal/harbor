@@ -12,3 +12,6 @@ default-theme = "light"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/RobinSrimal/harbor"
 edit-url-template = "https://github.com/RobinSrimal/harbor/edit/docs/docs/{path}"
+
+[output.html.playground]
+runnable = false
