@@ -4,22 +4,21 @@
 //! This module provides flat dispatch on PacketType, with context-aware handling.
 //!
 //! Used by:
-//! - HarborService (handles harbor pull)
-//! - SendService (handles direct delivery)
+//! - HarborService / HarborClient (handles harbor pull)
 
 use std::sync::Arc;
 
 use rusqlite::Connection;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::network::packet::{PacketType, EncryptionKeyType};
-use crate::network::membership::verify_membership_proof;
-use crate::security::harbor_id_from_topic;
 use crate::data::membership::get_topic_by_harbor_id;
-use crate::network::stream::StreamService;
+use crate::network::membership::verify_membership_proof;
+use crate::network::packet::{EncryptionKeyType, PacketType};
 use crate::network::send::PacketSource;
+use crate::network::stream::StreamService;
 use crate::protocol::ProtocolEvent;
+use crate::security::harbor_id_from_topic;
 
 /// Context for packet processing
 ///
@@ -59,6 +58,8 @@ pub enum ProcessError {
     MissingTopicContext,
     /// Packet type doesn't match the processing scope
     UnexpectedScope(PacketType, &'static str),
+    /// Sender is not authorized for the requested operation
+    NotAuthorized(String),
 }
 
 impl std::fmt::Display for ProcessError {
@@ -73,6 +74,7 @@ impl std::fmt::Display for ProcessError {
             Self::UnexpectedScope(pt, scope) => {
                 write!(f, "unexpected packet type {:?} in scope {}", pt, scope)
             }
+            Self::NotAuthorized(msg) => write!(f, "not authorized: {}", msg),
         }
     }
 }
@@ -102,8 +104,9 @@ pub async fn process_packet(
     let type_byte = plaintext[0];
     let payload = &plaintext[1..];
 
-    let packet_type = PacketType::from_byte(type_byte)
-        .ok_or_else(|| ProcessError::Decode(format!("unknown packet type byte: 0x{:02x}", type_byte)))?;
+    let packet_type = PacketType::from_byte(type_byte).ok_or_else(|| {
+        ProcessError::Decode(format!("unknown packet type byte: 0x{:02x}", type_byte))
+    })?;
 
     // Validate scope matches packet type's expected encryption key
     match (packet_type.encryption_key_type(), &ctx.scope) {
@@ -126,21 +129,11 @@ pub async fn process_packet(
         // =========================================================================
         // Topic-scoped messages (0x00-0x05)
         // =========================================================================
-        PacketType::TopicContent => {
-            process_topic_content(payload, sender_id, timestamp, ctx).await
-        }
-        PacketType::TopicFileAnnounce => {
-            process_topic_file_announce(payload, sender_id, ctx).await
-        }
-        PacketType::TopicCanSeed => {
-            process_topic_can_seed(payload, sender_id, ctx).await
-        }
-        PacketType::TopicSyncUpdate => {
-            process_topic_sync_update(payload, sender_id, ctx).await
-        }
-        PacketType::TopicSyncRequest => {
-            process_topic_sync_request(sender_id, ctx).await
-        }
+        PacketType::TopicContent => process_topic_content(payload, sender_id, timestamp, ctx).await,
+        PacketType::TopicFileAnnounce => process_topic_file_announce(payload, sender_id, ctx).await,
+        PacketType::TopicCanSeed => process_topic_can_seed(payload, sender_id, ctx).await,
+        PacketType::TopicSyncUpdate => process_topic_sync_update(payload, sender_id, ctx).await,
+        PacketType::TopicSyncRequest => process_topic_sync_request(sender_id, ctx).await,
         PacketType::TopicStreamRequest => {
             process_topic_stream_request(plaintext, sender_id, ctx).await
         }
@@ -148,21 +141,13 @@ pub async fn process_packet(
         // =========================================================================
         // DM-scoped messages (0x40-0x44)
         // =========================================================================
-        PacketType::DmContent => {
-            process_dm_content(payload, sender_id, timestamp, ctx).await
-        }
+        PacketType::DmContent => process_dm_content(payload, sender_id, timestamp, ctx).await,
         PacketType::DmFileAnnounce => {
             process_dm_file_announce(payload, sender_id, timestamp, ctx).await
         }
-        PacketType::DmSyncUpdate => {
-            process_dm_sync_update(payload, sender_id, ctx).await
-        }
-        PacketType::DmSyncRequest => {
-            process_dm_sync_request(sender_id, ctx).await
-        }
-        PacketType::DmStreamRequest => {
-            process_dm_stream_request(plaintext, sender_id, ctx).await
-        }
+        PacketType::DmSyncUpdate => process_dm_sync_update(payload, sender_id, ctx).await,
+        PacketType::DmSyncRequest => process_dm_sync_request(sender_id, ctx).await,
+        PacketType::DmStreamRequest => process_dm_stream_request(plaintext, sender_id, ctx).await,
 
         // =========================================================================
         // Stream signaling (0x50-0x54)
@@ -171,37 +156,19 @@ pub async fn process_packet(
         | PacketType::StreamReject
         | PacketType::StreamQuery
         | PacketType::StreamActive
-        | PacketType::StreamEnded => {
-            process_stream_signaling(plaintext, sender_id, ctx).await
-        }
+        | PacketType::StreamEnded => process_stream_signaling(plaintext, sender_id, ctx).await,
 
         // =========================================================================
         // Control messages (0x80-0x87)
         // =========================================================================
-        PacketType::ConnectRequest => {
-            process_connect_request(payload, ctx).await
-        }
-        PacketType::ConnectAccept => {
-            process_connect_accept(payload, ctx).await
-        }
-        PacketType::ConnectDecline => {
-            process_connect_decline(payload, ctx).await
-        }
-        PacketType::TopicInvite => {
-            process_topic_invite(payload, sender_id, ctx).await
-        }
-        PacketType::TopicJoin => {
-            process_topic_join(payload, sender_id, ctx).await
-        }
-        PacketType::TopicLeave => {
-            process_topic_leave(payload, sender_id, ctx).await
-        }
-        PacketType::RemoveMember => {
-            process_remove_member(payload, sender_id, ctx).await
-        }
-        PacketType::Suggest => {
-            process_suggest(payload, ctx).await
-        }
+        PacketType::ConnectRequest => process_connect_request(payload, sender_id, ctx).await,
+        PacketType::ConnectAccept => process_connect_accept(payload, sender_id, ctx).await,
+        PacketType::ConnectDecline => process_connect_decline(payload, sender_id, ctx).await,
+        PacketType::TopicInvite => process_topic_invite(payload, sender_id, ctx).await,
+        PacketType::TopicJoin => process_topic_join(payload, sender_id, ctx).await,
+        PacketType::TopicLeave => process_topic_leave(payload, sender_id, ctx).await,
+        PacketType::RemoveMember => process_remove_member(payload, sender_id, ctx).await,
+        PacketType::Suggest => process_suggest(payload, sender_id, ctx).await,
     }
 }
 
@@ -233,8 +200,8 @@ async fn process_topic_file_announce(
     sender_id: [u8; 32],
     ctx: &ProcessContext,
 ) -> Result<(), ProcessError> {
+    use crate::data::{CHUNK_SIZE, get_blob, init_blob_sections, insert_blob};
     use crate::network::packet::FileAnnouncementMessage;
-    use crate::data::{get_blob, insert_blob, init_blob_sections, CHUNK_SIZE};
 
     let topic_id = get_topic_id(ctx)?;
 
@@ -279,8 +246,8 @@ async fn process_topic_can_seed(
     sender_id: [u8; 32],
     ctx: &ProcessContext,
 ) -> Result<(), ProcessError> {
-    use crate::network::packet::CanSeedMessage;
     use crate::data::record_peer_can_seed;
+    use crate::network::packet::CanSeedMessage;
 
     let can_seed: CanSeedMessage = postcard::from_bytes(payload)
         .map_err(|e| ProcessError::Decode(format!("CanSeed: {}", e)))?;
@@ -418,9 +385,7 @@ async fn process_dm_sync_request(
     sender_id: [u8; 32],
     ctx: &ProcessContext,
 ) -> Result<(), ProcessError> {
-    let event = ProtocolEvent::DmSyncRequest(crate::protocol::DmSyncRequestEvent {
-        sender_id,
-    });
+    let event = ProtocolEvent::DmSyncRequest(crate::protocol::DmSyncRequestEvent { sender_id });
     let _ = ctx.event_tx.send(event).await;
 
     Ok(())
@@ -436,7 +401,9 @@ async fn process_dm_stream_request(
     let dm_msg = DmMessage::decode(plaintext)
         .map_err(|e| ProcessError::Decode(format!("DmStreamRequest: {}", e)))?;
 
-    ctx.stream_service.handle_dm_signaling(&dm_msg, sender_id).await;
+    ctx.stream_service
+        .handle_dm_signaling(&dm_msg, sender_id)
+        .await;
 
     Ok(())
 }
@@ -455,7 +422,9 @@ async fn process_stream_signaling(
     let stream_msg = StreamSignalingMessage::decode(plaintext)
         .map_err(|e| ProcessError::Decode(format!("StreamSignaling: {}", e)))?;
 
-    ctx.stream_service.handle_stream_signaling_msg(&stream_msg, sender_id).await;
+    ctx.stream_service
+        .handle_stream_signaling_msg(&stream_msg, sender_id)
+        .await;
 
     Ok(())
 }
@@ -466,6 +435,7 @@ async fn process_stream_signaling(
 
 async fn process_connect_request(
     payload: &[u8],
+    sender_id: [u8; 32],
     ctx: &ProcessContext,
 ) -> Result<(), ProcessError> {
     use crate::network::control::protocol::ConnectRequest;
@@ -473,17 +443,20 @@ async fn process_connect_request(
     let req: ConnectRequest = postcard::from_bytes(payload)
         .map_err(|e| ProcessError::Decode(format!("ConnectRequest: {}", e)))?;
 
+    validate_control_sender(&req.sender_id, &sender_id)?;
+
     // Store connection
     {
         let db_lock = ctx.db.lock().await;
-        let _ = crate::data::upsert_connection(
+        crate::data::upsert_connection(
             &db_lock,
             &req.sender_id,
             crate::data::ConnectionState::PendingIncoming,
             req.display_name.as_deref(),
             req.relay_url.as_deref(),
             Some(&req.request_id),
-        );
+        )
+        .map_err(|e| ProcessError::Database(e.to_string()))?;
     }
 
     let event = ProtocolEvent::ConnectionRequest(crate::protocol::ConnectionRequestEvent {
@@ -499,6 +472,7 @@ async fn process_connect_request(
 
 async fn process_connect_accept(
     payload: &[u8],
+    sender_id: [u8; 32],
     ctx: &ProcessContext,
 ) -> Result<(), ProcessError> {
     use crate::network::control::protocol::ConnectAccept;
@@ -506,13 +480,16 @@ async fn process_connect_accept(
     let accept: ConnectAccept = postcard::from_bytes(payload)
         .map_err(|e| ProcessError::Decode(format!("ConnectAccept: {}", e)))?;
 
+    validate_control_sender(&accept.sender_id, &sender_id)?;
+
     {
         let db_lock = ctx.db.lock().await;
-        let _ = crate::data::update_connection_state(
+        crate::data::update_connection_state(
             &db_lock,
             &accept.sender_id,
             crate::data::ConnectionState::Connected,
-        );
+        )
+        .map_err(|e| ProcessError::Database(e.to_string()))?;
     }
 
     let event = ProtocolEvent::ConnectionAccepted(crate::protocol::ConnectionAcceptedEvent {
@@ -526,6 +503,7 @@ async fn process_connect_accept(
 
 async fn process_connect_decline(
     payload: &[u8],
+    sender_id: [u8; 32],
     ctx: &ProcessContext,
 ) -> Result<(), ProcessError> {
     use crate::network::control::protocol::ConnectDecline;
@@ -533,13 +511,16 @@ async fn process_connect_decline(
     let decline: ConnectDecline = postcard::from_bytes(payload)
         .map_err(|e| ProcessError::Decode(format!("ConnectDecline: {}", e)))?;
 
+    validate_control_sender(&decline.sender_id, &sender_id)?;
+
     {
         let db_lock = ctx.db.lock().await;
-        let _ = crate::data::update_connection_state(
+        crate::data::update_connection_state(
             &db_lock,
             &decline.sender_id,
             crate::data::ConnectionState::Declined,
-        );
+        )
+        .map_err(|e| ProcessError::Database(e.to_string()))?;
     }
 
     let event = ProtocolEvent::ConnectionDeclined(crate::protocol::ConnectionDeclinedEvent {
@@ -562,10 +543,12 @@ async fn process_topic_invite(
     let invite: TopicInvite = postcard::from_bytes(payload)
         .map_err(|e| ProcessError::Decode(format!("TopicInvite: {}", e)))?;
 
+    validate_control_sender(&invite.sender_id, &sender_id)?;
+
     // Store as pending invite
     {
         let db_lock = ctx.db.lock().await;
-        let _ = crate::data::store_pending_invite(
+        crate::data::store_pending_invite(
             &db_lock,
             &invite.message_id,
             &invite.topic_id,
@@ -575,7 +558,8 @@ async fn process_topic_invite(
             &invite.epoch_key,
             &invite.admin_id,
             &invite.members,
-        );
+        )
+        .map_err(|e| ProcessError::Database(e.to_string()))?;
     }
 
     // Emit event
@@ -605,8 +589,8 @@ async fn process_topic_join(
     sender_id: [u8; 32],
     ctx: &ProcessContext,
 ) -> Result<(), ProcessError> {
+    use crate::data::{add_topic_member, current_timestamp, update_peer_relay_url};
     use crate::network::control::protocol::TopicJoin;
-    use crate::data::{add_topic_member, update_peer_relay_url, current_timestamp};
 
     let topic_id = get_topic_id(ctx)?;
 
@@ -626,16 +610,28 @@ async fn process_topic_join(
         return Err(ProcessError::Decode("TopicJoin harbor_id mismatch".into()));
     }
 
-    if !verify_membership_proof(&topic_id, &join.harbor_id, &sender_id, &join.membership_proof) {
-        return Err(ProcessError::Decode("TopicJoin invalid membership proof".into()));
+    if !verify_membership_proof(
+        &topic_id,
+        &join.harbor_id,
+        &sender_id,
+        &join.membership_proof,
+    ) {
+        return Err(ProcessError::Decode(
+            "TopicJoin invalid membership proof".into(),
+        ));
     }
 
     let db_lock = ctx.db.lock().await;
-    let _ = add_topic_member(&db_lock, &topic_id, &join.sender_id);
+    add_topic_member(&db_lock, &topic_id, &join.sender_id)
+        .map_err(|e| ProcessError::Database(e.to_string()))?;
 
     // Store relay URL if provided
     if let Some(ref relay_url) = join.relay_url {
-        let _ = update_peer_relay_url(&db_lock, &join.sender_id, relay_url, current_timestamp());
+        if let Err(e) =
+            update_peer_relay_url(&db_lock, &join.sender_id, relay_url, current_timestamp())
+        {
+            warn!(error = %e, "failed to store relay URL for joined member");
+        }
     }
 
     debug!(
@@ -652,8 +648,8 @@ async fn process_topic_leave(
     sender_id: [u8; 32],
     ctx: &ProcessContext,
 ) -> Result<(), ProcessError> {
-    use crate::network::control::protocol::TopicLeave;
     use crate::data::remove_topic_member;
+    use crate::network::control::protocol::TopicLeave;
 
     let topic_id = get_topic_id(ctx)?;
 
@@ -673,12 +669,20 @@ async fn process_topic_leave(
         return Err(ProcessError::Decode("TopicLeave harbor_id mismatch".into()));
     }
 
-    if !verify_membership_proof(&topic_id, &leave.harbor_id, &sender_id, &leave.membership_proof) {
-        return Err(ProcessError::Decode("TopicLeave invalid membership proof".into()));
+    if !verify_membership_proof(
+        &topic_id,
+        &leave.harbor_id,
+        &sender_id,
+        &leave.membership_proof,
+    ) {
+        return Err(ProcessError::Decode(
+            "TopicLeave invalid membership proof".into(),
+        ));
     }
 
     let db_lock = ctx.db.lock().await;
-    let _ = remove_topic_member(&db_lock, &topic_id, &leave.sender_id);
+    remove_topic_member(&db_lock, &topic_id, &leave.sender_id)
+        .map_err(|e| ProcessError::Database(e.to_string()))?;
 
     debug!(
         topic = %hex::encode(&topic_id[..8]),
@@ -694,6 +698,7 @@ async fn process_remove_member(
     sender_id: [u8; 32],
     ctx: &ProcessContext,
 ) -> Result<(), ProcessError> {
+    use crate::data::is_topic_admin;
     use crate::network::control::protocol::RemoveMember;
 
     let remove: RemoveMember = postcard::from_bytes(payload)
@@ -712,22 +717,38 @@ async fn process_remove_member(
         .map_err(|e| ProcessError::Database(e.to_string()))?;
     let topic_id = match topic {
         Some(topic) => topic.topic_id,
-        None => return Err(ProcessError::Database("unknown topic for RemoveMember".into())),
+        None => {
+            return Err(ProcessError::Database(
+                "unknown topic for RemoveMember".into(),
+            ));
+        }
     };
 
-    if !verify_membership_proof(&topic_id, &remove.harbor_id, &sender_id, &remove.membership_proof) {
-        return Err(ProcessError::Decode("RemoveMember invalid membership proof".into()));
+    if !verify_membership_proof(
+        &topic_id,
+        &remove.harbor_id,
+        &sender_id,
+        &remove.membership_proof,
+    ) {
+        return Err(ProcessError::Decode(
+            "RemoveMember invalid membership proof".into(),
+        ));
+    }
+
+    if !is_topic_admin(&db_lock, &topic_id, &sender_id)
+        .map_err(|e| ProcessError::Database(e.to_string()))?
+    {
+        return Err(ProcessError::NotAuthorized(
+            "RemoveMember sender is not topic admin".into(),
+        ));
     }
 
     // Store new epoch key
-    let _ = crate::data::store_epoch_key(
-        &db_lock,
-        &topic_id,
-        remove.new_epoch,
-        &remove.new_epoch_key,
-    );
+    crate::data::store_epoch_key(&db_lock, &topic_id, remove.new_epoch, &remove.new_epoch_key)
+        .map_err(|e| ProcessError::Database(e.to_string()))?;
     // Remove the member from our local list
-    let _ = crate::data::remove_topic_member(&db_lock, &topic_id, &remove.removed_member);
+    crate::data::remove_topic_member(&db_lock, &topic_id, &remove.removed_member)
+        .map_err(|e| ProcessError::Database(e.to_string()))?;
 
     let event = ProtocolEvent::TopicEpochRotated(crate::protocol::TopicEpochRotatedEvent {
         topic_id,
@@ -741,12 +762,15 @@ async fn process_remove_member(
 
 async fn process_suggest(
     payload: &[u8],
+    sender_id: [u8; 32],
     ctx: &ProcessContext,
 ) -> Result<(), ProcessError> {
     use crate::network::control::protocol::Suggest;
 
     let suggest: Suggest = postcard::from_bytes(payload)
         .map_err(|e| ProcessError::Decode(format!("Suggest: {}", e)))?;
+
+    validate_control_sender(&suggest.sender_id, &sender_id)?;
 
     let event = ProtocolEvent::PeerSuggested(crate::protocol::PeerSuggestedEvent {
         introducer_id: suggest.sender_id,
@@ -775,6 +799,19 @@ fn get_topic_id(ctx: &ProcessContext) -> Result<[u8; 32], ProcessError> {
     }
 }
 
+fn validate_control_sender(
+    claimed_sender: &[u8; 32],
+    sender_id: &[u8; 32],
+) -> Result<(), ProcessError> {
+    if claimed_sender != sender_id {
+        return Err(ProcessError::InvalidSender {
+            expected: hex::encode(&claimed_sender[..8]),
+            actual: hex::encode(&sender_id[..8]),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,5 +825,31 @@ mod tests {
             matches!(scope, ProcessScope::Topic { topic_id: tid } if tid == [1u8; 32]),
             "expected Topic scope with correct id"
         );
+    }
+
+    #[test]
+    fn test_validate_control_sender_ok() {
+        let sender = [7u8; 32];
+        assert!(validate_control_sender(&sender, &sender).is_ok());
+    }
+
+    #[test]
+    fn test_validate_control_sender_mismatch() {
+        let claimed = [7u8; 32];
+        let actual = [8u8; 32];
+        let err = validate_control_sender(&claimed, &actual).unwrap_err();
+        match err {
+            ProcessError::InvalidSender { expected, actual } => {
+                assert_eq!(expected, hex::encode(&claimed[..8]));
+                assert_eq!(actual, hex::encode(&[8u8; 8]));
+            }
+            other => panic!("expected InvalidSender, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_process_error_display_not_authorized() {
+        let err = ProcessError::NotAuthorized("admin required".to_string());
+        assert_eq!(err.to_string(), "not authorized: admin required");
     }
 }

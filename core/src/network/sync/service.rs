@@ -10,17 +10,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::Connection as DbConnection;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::data::{get_topic_members, LocalIdentity};
 use crate::data::membership::get_topic_by_harbor_id;
+use crate::data::{LocalIdentity, get_topic_members};
 use crate::network::connect::Connector;
 use crate::network::gate::ConnectionGate;
-use crate::network::send::{SendService, SendOptions};
-use crate::network::packet::{DmMessage, TopicMessage, SyncUpdateMessage};
-use crate::protocol::{MemberInfo, ProtocolError, ProtocolEvent, SyncRequestEvent, SyncResponseEvent, DmSyncResponseEvent};
-
+use crate::network::packet::{DmMessage, SyncUpdateMessage, TopicMessage};
+use crate::network::send::{SendOptions, SendService};
+use crate::protocol::{
+    DmSyncResponseEvent, MemberInfo, ProtocolError, ProtocolEvent, SyncRequestEvent,
+    SyncResponseEvent,
+};
 
 /// Message type bytes for sync protocol
 pub mod sync_message_type {
@@ -54,7 +56,9 @@ impl std::fmt::Display for ProcessSyncError {
                 write!(f, "message too short: {} bytes (need at least 33)", len)
             }
             ProcessSyncError::EmptyPayload => write!(f, "empty message payload"),
-            ProcessSyncError::UnknownMessageType(t) => write!(f, "unknown message type: 0x{:02x}", t),
+            ProcessSyncError::UnknownMessageType(t) => {
+                write!(f, "unknown message type: 0x{:02x}", t)
+            }
             ProcessSyncError::UnknownTopic(h) => {
                 write!(f, "unknown topic for harbor_id: {}", hex::encode(&h[..8]))
             }
@@ -168,8 +172,7 @@ impl SyncService {
         // Get topic members
         let members = {
             let db = self.db.lock().await;
-            get_topic_members(&db, topic_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?
+            get_topic_members(&db, topic_id).map_err(|e| ProtocolError::Database(e.to_string()))?
         };
 
         if members.is_empty() {
@@ -205,15 +208,11 @@ impl SyncService {
     ///
     /// Broadcasts a sync request to all members. When peers respond,
     /// you'll receive `ProtocolEvent::SyncResponse` events.
-    pub async fn request_sync(
-        &self,
-        topic_id: &[u8; 32],
-    ) -> Result<(), ProtocolError> {
+    pub async fn request_sync(&self, topic_id: &[u8; 32]) -> Result<(), ProtocolError> {
         // Get topic members
         let members = {
             let db = self.db.lock().await;
-            get_topic_members(&db, topic_id)
-                .map_err(|e| ProtocolError::Database(e.to_string()))?
+            get_topic_members(&db, topic_id).map_err(|e| ProtocolError::Database(e.to_string()))?
         };
 
         if members.is_empty() {
@@ -265,7 +264,8 @@ impl SyncService {
         let message = encode_sync_response(topic_id, &self.identity.public_key, &data);
 
         // Connect to requester via SYNC_ALPN
-        let conn = self.connector
+        let conn = self
+            .connector
             .connect_with_timeout(requester_id, self.config.connect_timeout)
             .await
             .map_err(|e| ProtocolError::Network(format!("connection failed: {}", e)))?;
@@ -324,10 +324,7 @@ impl SyncService {
     /// Request DM sync state from a peer
     ///
     /// When the peer responds, you'll receive a `ProtocolEvent::DmSyncResponse` event.
-    pub async fn request_dm_sync(
-        &self,
-        recipient_id: &[u8; 32],
-    ) -> Result<(), ProtocolError> {
+    pub async fn request_dm_sync(&self, recipient_id: &[u8; 32]) -> Result<(), ProtocolError> {
         let encoded = DmMessage::SyncRequest.encode();
 
         info!(
@@ -352,7 +349,8 @@ impl SyncService {
     ) -> Result<(), ProtocolError> {
         let message = encode_dm_sync_response(&self.identity.public_key, &data);
 
-        let conn = self.connector
+        let conn = self
+            .connector
             .connect_with_timeout(recipient_id, self.config.connect_timeout)
             .await
             .map_err(|e| ProtocolError::Network(format!("connection failed: {}", e)))?;
@@ -388,11 +386,7 @@ impl SyncService {
 /// Encode a sync response message for transmission via SYNC_ALPN
 ///
 /// Format: [32 bytes harbor_id][1 byte type = 0x02][32 bytes membership_proof][data]
-pub fn encode_sync_response(
-    topic_id: &[u8; 32],
-    sender_id: &[u8; 32],
-    data: &[u8],
-) -> Vec<u8> {
+pub fn encode_sync_response(topic_id: &[u8; 32], sender_id: &[u8; 32], data: &[u8]) -> Vec<u8> {
     let harbor_id = crate::security::harbor_id_from_topic(topic_id);
     let membership_proof =
         crate::network::membership::create_membership_proof(topic_id, &harbor_id, sender_id);
@@ -481,7 +475,9 @@ impl SyncService {
                     let db = db.lock().await;
                     let topic = get_topic_by_harbor_id(&db, &context_id)
                         .map_err(|_| ProcessSyncError::UnknownTopic(context_id))?;
-                    topic.map(|t| t.topic_id).ok_or(ProcessSyncError::UnknownTopic(context_id))?
+                    topic
+                        .map(|t| t.topic_id)
+                        .ok_or(ProcessSyncError::UnknownTopic(context_id))?
                 };
 
                 // Verify membership proof
@@ -518,7 +514,9 @@ impl SyncService {
                     let db = db.lock().await;
                     let topic = get_topic_by_harbor_id(&db, &context_id)
                         .map_err(|_| ProcessSyncError::UnknownTopic(context_id))?;
-                    topic.map(|t| t.topic_id).ok_or(ProcessSyncError::UnknownTopic(context_id))?
+                    topic
+                        .map(|t| t.topic_id)
+                        .ok_or(ProcessSyncError::UnknownTopic(context_id))?
                 };
 
                 // Verify membership proof
@@ -537,10 +535,7 @@ impl SyncService {
                     data_len = data.len(),
                     "SYNC_SERVICE: received SyncResponse"
                 );
-                ProtocolEvent::SyncResponse(SyncResponseEvent {
-                    topic_id,
-                    data,
-                })
+                ProtocolEvent::SyncResponse(SyncResponseEvent { topic_id, data })
             }
             sync_message_type::DM_SYNC_RESPONSE => {
                 // For DM sync responses, the 32-byte prefix is the sender's peer_id
@@ -552,10 +547,7 @@ impl SyncService {
                     data_len = data.len(),
                     "SYNC_SERVICE: received DmSyncResponse"
                 );
-                ProtocolEvent::DmSyncResponse(DmSyncResponseEvent {
-                    sender_id,
-                    data,
-                })
+                ProtocolEvent::DmSyncResponse(DmSyncResponseEvent { sender_id, data })
             }
             other => {
                 debug!(
@@ -613,7 +605,9 @@ mod tests {
         buf.push(sync_message_type::SYNC_REQUEST);
         buf.extend_from_slice(&proof);
 
-        SyncService::process_sync_message(&buf, test_sender(), &db, &tx).await.unwrap();
+        SyncService::process_sync_message(&buf, test_sender(), &db, &tx)
+            .await
+            .unwrap();
 
         let event = rx.recv().await.unwrap();
         match event {
@@ -643,7 +637,9 @@ mod tests {
         buf.extend_from_slice(&proof);
         buf.extend_from_slice(b"test data");
 
-        SyncService::process_sync_message(&buf, test_sender(), &db, &tx).await.unwrap();
+        SyncService::process_sync_message(&buf, test_sender(), &db, &tx)
+            .await
+            .unwrap();
 
         let event = rx.recv().await.unwrap();
         match event {
@@ -675,7 +671,10 @@ mod tests {
         buf.push(0xFF); // Unknown type
 
         let result = SyncService::process_sync_message(&buf, test_sender(), &db, &tx).await;
-        assert!(matches!(result, Err(ProcessSyncError::UnknownMessageType(0xFF))));
+        assert!(matches!(
+            result,
+            Err(ProcessSyncError::UnknownMessageType(0xFF))
+        ));
     }
 
     #[test]
@@ -708,7 +707,8 @@ mod tests {
 
         let encoded = encode_sync_response(&topic_id, &sender_id, data);
         let harbor_id = crate::security::harbor_id_from_topic(&topic_id);
-        let proof = crate::network::membership::create_membership_proof(&topic_id, &harbor_id, &sender_id);
+        let proof =
+            crate::network::membership::create_membership_proof(&topic_id, &harbor_id, &sender_id);
 
         // Check format: [32 bytes harbor_id][1 byte type][32 bytes proof][data]
         assert_eq!(encoded.len(), 32 + 1 + 32 + data.len());
@@ -726,7 +726,8 @@ mod tests {
 
         let encoded = encode_sync_response(&topic_id, &sender_id, data);
         let harbor_id = crate::security::harbor_id_from_topic(&topic_id);
-        let proof = crate::network::membership::create_membership_proof(&topic_id, &harbor_id, &sender_id);
+        let proof =
+            crate::network::membership::create_membership_proof(&topic_id, &harbor_id, &sender_id);
 
         assert_eq!(encoded.len(), 65); // harbor_id + type + proof
         assert_eq!(&encoded[..32], &harbor_id);

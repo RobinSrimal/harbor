@@ -1,14 +1,20 @@
 //! Control Protocol - Lifecycle and relationship management for Harbor
 //!
 //! The Control protocol handles peer connections, topic invitations,
-//! and membership management via one-off RPC exchanges.
+//! and membership management via direct RPC or Harbor-replicated delivery.
 //!
 //! # Protocol Flow
 //!
+//! Direct RPC:
 //! 1. Open connection on CONTROL_ALPN
 //! 2. Send control message (ConnectRequest, TopicInvite, etc.)
 //! 3. Receive ControlAck response
 //! 4. Close connection
+//!
+//! Harbor replication:
+//! 1. Control payload is stored as an outgoing packet
+//! 2. Harbor delivery path transports packet to recipient
+//! 3. `network::process` decodes and applies control message
 //!
 //! # Message Types
 //!
@@ -30,6 +36,7 @@
 //! - `membership.rs` - Topic invite/join/leave/remove
 //! - `lifecycle.rs` - Topic create/join/list/get_invite
 //! - `introductions.rs` - Peer suggestions
+//! - `types.rs` - Shareable/public invite and member info types
 
 pub mod introductions;
 pub mod lifecycle;
@@ -41,7 +48,7 @@ pub mod types;
 
 // Re-export protocol types
 pub use protocol::{
-    ControlAck, ControlPacketType, ControlRpcMessage, ControlRpcProtocol, CONTROL_ALPN,
+    CONTROL_ALPN, ControlAck, ControlPacketType, ControlRpcMessage, ControlRpcProtocol,
 };
 
 // Re-export wire message types (TopicInvite here is the wire format, not the shareable one)

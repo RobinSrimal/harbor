@@ -13,22 +13,23 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::network::membership::{create_membership_proof, verify_membership_proof};
 use crate::resilience::ProofOfWork;
+use crate::security::PacketId;
 
 /// Send protocol ALPN
 pub const SEND_ALPN: &[u8] = b"harbor/send/0";
 
-/// A read receipt acknowledging packet delivery
+/// A read receipt acknowledging packet reception
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Receipt {
     /// The packet being acknowledged
-    pub packet_id: [u8; 32],
+    pub packet_id: PacketId,
     /// The acknowledging node's EndpointID
     pub sender: [u8; 32],
 }
 
 impl Receipt {
     /// Create a new receipt
-    pub fn new(packet_id: [u8; 32], sender: [u8; 32]) -> Self {
+    pub fn new(packet_id: PacketId, sender: [u8; 32]) -> Self {
         Self { packet_id, sender }
     }
 }
@@ -48,7 +49,7 @@ impl Receipt {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliverTopic {
     /// Unique packet identifier (same ID used for Harbor storage for deduplication)
-    pub packet_id: [u8; 32],
+    pub packet_id: PacketId,
     /// Hash of topic_id - hides actual topic from wire
     pub harbor_id: [u8; 32],
     /// Cryptographic proof of topic membership: BLAKE3(topic_id || harbor_id || sender_id)
@@ -69,7 +70,7 @@ pub struct DeliverTopic {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliverDm {
     /// Unique packet identifier (same ID used for Harbor storage for deduplication)
-    pub packet_id: [u8; 32],
+    pub packet_id: PacketId,
     /// Raw encoded DmMessage payload
     pub payload: Vec<u8>,
     /// Proof of Work (context: sender_id || recipient_id)
@@ -104,14 +105,14 @@ mod tests {
 
     #[test]
     fn test_receipt_creation() {
-        let receipt = Receipt::new([1u8; 32], [2u8; 32]);
-        assert_eq!(receipt.packet_id, [1u8; 32]);
+        let receipt = Receipt::new([1u8; 16], [2u8; 32]);
+        assert_eq!(receipt.packet_id, [1u8; 16]);
         assert_eq!(receipt.sender, [2u8; 32]);
     }
 
     #[test]
     fn test_receipt_serialization() {
-        let receipt = Receipt::new([1u8; 32], [2u8; 32]);
+        let receipt = Receipt::new([1u8; 16], [2u8; 32]);
         let bytes = postcard::to_allocvec(&receipt).unwrap();
         let decoded: Receipt = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, receipt);
@@ -121,7 +122,7 @@ mod tests {
     fn test_deliver_topic_serialization() {
         let topic_id = [42u8; 32];
         let sender_id = [1u8; 32];
-        let packet_id = [99u8; 32];
+        let packet_id = [99u8; 16];
         let harbor_id = crate::security::harbor_id_from_topic(&topic_id);
         let proof = create_membership_proof(&topic_id, &harbor_id, &sender_id);
 
@@ -148,20 +149,32 @@ mod tests {
         let proof = create_membership_proof(&topic_id, &harbor_id, &sender_id);
 
         // Verify with correct values
-        assert!(verify_membership_proof(&topic_id, &harbor_id, &sender_id, &proof));
+        assert!(verify_membership_proof(
+            &topic_id, &harbor_id, &sender_id, &proof
+        ));
 
         // Verify with wrong topic_id fails
         let wrong_topic = [99u8; 32];
-        assert!(!verify_membership_proof(&wrong_topic, &harbor_id, &sender_id, &proof));
+        assert!(!verify_membership_proof(
+            &wrong_topic,
+            &harbor_id,
+            &sender_id,
+            &proof
+        ));
 
         // Verify with wrong sender_id fails
         let wrong_sender = [99u8; 32];
-        assert!(!verify_membership_proof(&topic_id, &harbor_id, &wrong_sender, &proof));
+        assert!(!verify_membership_proof(
+            &topic_id,
+            &harbor_id,
+            &wrong_sender,
+            &proof
+        ));
     }
 
     #[test]
     fn test_deliver_dm_serialization() {
-        let packet_id = [88u8; 32];
+        let packet_id = [88u8; 16];
         let deliver = DeliverDm {
             packet_id,
             payload: b"Hello DM!".to_vec(),

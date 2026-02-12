@@ -22,11 +22,7 @@ pub struct StreamSession {
 
 impl StreamSession {
     /// Create a new StreamSession wrapping a MOQ session (creates its own Origin)
-    pub fn new(
-        session: Session,
-        topic_id: [u8; 32],
-        request_id: [u8; 32],
-    ) -> Self {
+    pub fn new(session: Session, topic_id: [u8; 32], request_id: [u8; 32]) -> Self {
         let origin = Origin::produce();
         Self {
             session,

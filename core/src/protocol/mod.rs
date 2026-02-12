@@ -33,32 +33,49 @@
 //! }
 //! ```
 
-pub(crate) mod core;
+mod api;
 mod config;
+pub(crate) mod core;
 mod error;
 mod events;
-mod api;
 mod stats;
 
 // Core protocol
-pub use core::Protocol;
 pub use config::ProtocolConfig;
+pub use core::Protocol;
 
 // Error type
 pub use error::ProtocolError;
 
 // Events (for app layer)
 pub use events::{
-    FileAnnouncedEvent, FileCompleteEvent, FileProgressEvent, IncomingMessage, ProtocolEvent,
-    SyncUpdateEvent, SyncRequestEvent, SyncResponseEvent,
-    StreamRequestEvent, StreamAcceptedEvent, StreamRejectedEvent, StreamEndedEvent,
-    StreamConnectedEvent,
-    DmReceivedEvent, DmSyncUpdateEvent, DmSyncRequestEvent, DmSyncResponseEvent,
-    DmFileAnnouncedEvent,
+    ConnectionAcceptedEvent,
+    ConnectionDeclinedEvent,
     // Control events
-    ConnectionRequestEvent, ConnectionAcceptedEvent, ConnectionDeclinedEvent,
-    TopicInviteReceivedEvent, TopicMemberJoinedEvent, TopicMemberLeftEvent,
-    TopicEpochRotatedEvent, PeerSuggestedEvent,
+    ConnectionRequestEvent,
+    DmFileAnnouncedEvent,
+    DmReceivedEvent,
+    DmSyncRequestEvent,
+    DmSyncResponseEvent,
+    DmSyncUpdateEvent,
+    FileAnnouncedEvent,
+    FileCompleteEvent,
+    FileProgressEvent,
+    IncomingMessage,
+    PeerSuggestedEvent,
+    ProtocolEvent,
+    StreamAcceptedEvent,
+    StreamConnectedEvent,
+    StreamEndedEvent,
+    StreamRejectedEvent,
+    StreamRequestEvent,
+    SyncRequestEvent,
+    SyncResponseEvent,
+    SyncUpdateEvent,
+    TopicEpochRotatedEvent,
+    TopicInviteReceivedEvent,
+    TopicMemberJoinedEvent,
+    TopicMemberLeftEvent,
 };
 
 // Domain types (from ControlService)
@@ -74,10 +91,9 @@ pub use stats::{
 pub use api::ShareStatus;
 
 // Control types
-pub use crate::network::control::ConnectInvite;
 pub use crate::data::{ConnectionInfo, ConnectionState, PendingTopicInvite};
+pub use crate::network::control::ConnectInvite;
 
 // Target types (Topic vs DM)
 mod target;
 pub use target::Target;
-

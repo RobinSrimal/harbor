@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::data::control::{list_connections_by_state, ConnectionState};
+use crate::data::control::{ConnectionState, list_connections_by_state};
 use crate::data::{get_all_topics, get_topic_members};
 
 /// Fast connection authorization cache
@@ -56,50 +56,74 @@ impl ConnectionGate {
         let db = self.db.lock().await;
 
         // Load DM-connected peers
-        if let Ok(connected) = list_connections_by_state(&db, ConnectionState::Connected) {
-            let mut set = self.dm_connected.write().await;
-            for conn in connected {
-                set.insert(conn.peer_id);
+        match list_connections_by_state(&db, ConnectionState::Connected) {
+            Ok(connected) => {
+                let mut set = self.dm_connected.write().await;
+                for conn in connected {
+                    set.insert(conn.peer_id);
+                }
+                info!(count = set.len(), "gate: loaded DM-connected peers");
             }
-            info!(count = set.len(), "gate: loaded DM-connected peers");
+            Err(err) => {
+                warn!(error = %err, "gate: failed to load DM-connected peers");
+            }
         }
 
         // Load DM-blocked peers
-        if let Ok(blocked) = list_connections_by_state(&db, ConnectionState::Blocked) {
-            let mut set = self.dm_blocked.write().await;
-            for conn in blocked {
-                set.insert(conn.peer_id);
+        match list_connections_by_state(&db, ConnectionState::Blocked) {
+            Ok(blocked) => {
+                let mut set = self.dm_blocked.write().await;
+                for conn in blocked {
+                    set.insert(conn.peer_id);
+                }
+                info!(count = set.len(), "gate: loaded DM-blocked peers");
             }
-            info!(count = set.len(), "gate: loaded DM-blocked peers");
+            Err(err) => {
+                warn!(error = %err, "gate: failed to load DM-blocked peers");
+            }
         }
 
         // Load topic membership
         // Get all topics we're subscribed to, then load their members
-        if let Ok(topics) = get_all_topics(&db) {
-            let mut peers_map = self.topic_peers.write().await;
-            let mut total_peers = 0;
-            let topic_count = topics.len();
+        match get_all_topics(&db) {
+            Ok(topics) => {
+                let mut peers_map = self.topic_peers.write().await;
+                let mut total_peers = 0;
+                let topic_count = topics.len();
 
-            for topic in topics {
-                if let Ok(members) = get_topic_members(&db, &topic.topic_id) {
-                    for member in members {
-                        // Don't add ourselves
-                        if member == self.our_id {
-                            continue;
+                for topic in topics {
+                    match get_topic_members(&db, &topic.topic_id) {
+                        Ok(members) => {
+                            for member in members {
+                                // Don't add ourselves
+                                if member == self.our_id {
+                                    continue;
+                                }
+                                peers_map
+                                    .entry(member)
+                                    .or_insert_with(HashSet::new)
+                                    .insert(topic.topic_id);
+                                total_peers += 1;
+                            }
                         }
-                        peers_map
-                            .entry(member)
-                            .or_insert_with(HashSet::new)
-                            .insert(topic.topic_id);
-                        total_peers += 1;
+                        Err(err) => {
+                            warn!(
+                                topic = %hex::encode(&topic.topic_id[..8]),
+                                error = %err,
+                                "gate: failed to load topic members"
+                            );
+                        }
                     }
                 }
+                info!(
+                    topics = topic_count,
+                    peer_entries = total_peers,
+                    "gate: loaded topic membership"
+                );
             }
-            info!(
-                topics = topic_count,
-                peer_entries = total_peers,
-                "gate: loaded topic membership"
-            );
+            Err(err) => {
+                warn!(error = %err, "gate: failed to load topics for membership gate");
+            }
         }
     }
 
@@ -109,15 +133,17 @@ impl ConnectionGate {
     /// - They are DM-connected OR share any topic with us
     /// - AND they are NOT DM-blocked
     pub async fn is_allowed(&self, peer_id: &[u8; 32]) -> bool {
-        // Check blocked first (takes priority)
-        if self.dm_blocked.read().await.contains(peer_id) {
+        // Keep blocked guard alive until decision to avoid permissive transition windows.
+        let blocked = self.dm_blocked.read().await;
+        if blocked.contains(peer_id) {
             return false;
         }
 
-        // Check if DM-connected
-        if self.dm_connected.read().await.contains(peer_id) {
+        let connected = self.dm_connected.read().await;
+        if connected.contains(peer_id) {
             return true;
         }
+        drop(connected);
 
         // Check if shares any topic
         self.topic_peers.read().await.contains_key(peer_id)
@@ -149,8 +175,10 @@ impl ConnectionGate {
     /// Call this after accepting a connection request.
     /// Updates in-memory cache only - caller is responsible for DB update.
     pub async fn mark_dm_connected(&self, peer_id: &[u8; 32]) {
-        self.dm_blocked.write().await.remove(peer_id);
-        self.dm_connected.write().await.insert(*peer_id);
+        let mut blocked = self.dm_blocked.write().await;
+        let mut connected = self.dm_connected.write().await;
+        blocked.remove(peer_id);
+        connected.insert(*peer_id);
         debug!(peer = %hex::encode(&peer_id[..8]), "gate: marked DM-connected");
     }
 
@@ -159,8 +187,10 @@ impl ConnectionGate {
     /// Call this after blocking a peer.
     /// Updates in-memory cache only - caller is responsible for DB update.
     pub async fn mark_dm_blocked(&self, peer_id: &[u8; 32]) {
-        self.dm_connected.write().await.remove(peer_id);
-        self.dm_blocked.write().await.insert(*peer_id);
+        let mut blocked = self.dm_blocked.write().await;
+        let mut connected = self.dm_connected.write().await;
+        blocked.insert(*peer_id);
+        connected.remove(peer_id);
         debug!(peer = %hex::encode(&peer_id[..8]), "gate: marked DM-blocked");
     }
 
@@ -230,6 +260,7 @@ impl ConnectionGate {
     /// Call this when joining a topic with existing members.
     pub async fn add_topic_peers(&self, topic_id: &[u8; 32], peer_ids: &[[u8; 32]]) {
         let mut peers = self.topic_peers.write().await;
+        let mut added = 0usize;
         for peer_id in peer_ids {
             // Don't add ourselves
             if *peer_id == self.our_id {
@@ -239,11 +270,12 @@ impl ConnectionGate {
                 .entry(*peer_id)
                 .or_insert_with(HashSet::new)
                 .insert(*topic_id);
+            added += 1;
         }
 
         debug!(
             topic = %hex::encode(&topic_id[..8]),
-            count = peer_ids.len(),
+            count = added,
             "gate: added topic peers (batch)"
         );
     }
@@ -364,6 +396,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dm_blocked_overrides_connected_and_topic() {
+        let gate = setup_gate().await;
+        let peer = make_id(1);
+        let topic = make_id(10);
+
+        gate.mark_dm_connected(&peer).await;
+        gate.add_topic_peer(&peer, &topic).await;
+        assert!(gate.is_allowed(&peer).await);
+
+        gate.mark_dm_blocked(&peer).await;
+        assert!(!gate.is_allowed(&peer).await);
+        assert!(!gate.is_dm_connected(&peer).await);
+        assert!(gate.shares_topic(&peer, &topic).await);
+    }
+
+    #[tokio::test]
     async fn test_batch_operations() {
         let gate = setup_gate().await;
         let topic = make_id(10);
@@ -392,5 +440,20 @@ mod tests {
         gate.add_topic_peer(&our_id, &topic).await;
         // We shouldn't be in the topic_peers map
         assert!(!gate.topic_peers.read().await.contains_key(&our_id));
+    }
+
+    #[tokio::test]
+    async fn test_batch_add_skips_self() {
+        let gate = setup_gate().await;
+        let topic = make_id(10);
+        let our_id = make_id(0);
+        let peer = make_id(1);
+        let peers = vec![our_id, peer];
+
+        gate.add_topic_peers(&topic, &peers).await;
+
+        assert!(!gate.topic_peers.read().await.contains_key(&our_id));
+        assert!(gate.shares_topic(&peer, &topic).await);
+        assert!(gate.is_allowed(&peer).await);
     }
 }

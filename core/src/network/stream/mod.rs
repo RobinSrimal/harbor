@@ -21,5 +21,9 @@ pub const ZERO_TOPIC_ID: [u8; 32] = [0u8; 32];
 
 /// Convert a topic_id to Option: zero sentinel → None, otherwise Some
 pub fn optional_topic_id(topic_id: &[u8; 32]) -> Option<[u8; 32]> {
-    if *topic_id == ZERO_TOPIC_ID { None } else { Some(*topic_id) }
+    if *topic_id == ZERO_TOPIC_ID {
+        None
+    } else {
+        Some(*topic_id)
+    }
 }

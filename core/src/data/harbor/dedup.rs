@@ -18,10 +18,10 @@
 //! with Harbor packet lifetime. As long as a packet could exist on Harbor,
 //! we remember if we've seen it.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use tracing::trace;
 
-use super::cache::{mark_pulled, was_pulled};
+use crate::security::PacketId;
 
 /// Result of deduplication check
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +67,7 @@ impl std::fmt::Display for DedupResult {
 pub fn check_and_mark(
     conn: &Connection,
     topic_id: &[u8; 32],
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
     sender_id: &[u8; 32],
     our_id: &[u8; 32],
 ) -> Result<DedupResult, DedupError> {
@@ -82,8 +82,20 @@ pub fn check_and_mark(
         return Ok(DedupResult::OwnPacket);
     }
 
-    // Rule 2: Skip if already seen
-    if was_pulled(conn, topic_id, packet_id).map_err(|e| DedupError::Database(e.to_string()))? {
+    // Rule 2+3 atomically: mark as seen if new, otherwise detect duplicate.
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO pulled_packets (topic_id, packet_id, pulled_at)
+             VALUES (?1, ?2, ?3)",
+            params![
+                topic_id.as_slice(),
+                packet_id.as_slice(),
+                crate::data::current_timestamp()
+            ],
+        )
+        .map_err(|e| DedupError::Database(e.to_string()))?;
+
+    if inserted == 0 {
         trace!(
             topic_id = %hex::encode(&topic_id[..8]),
             packet_id = %hex::encode(&packet_id[..8]),
@@ -92,9 +104,6 @@ pub fn check_and_mark(
         );
         return Ok(DedupResult::AlreadySeen);
     }
-
-    // Rule 3: Mark as seen
-    mark_pulled(conn, topic_id, packet_id).map_err(|e| DedupError::Database(e.to_string()))?;
 
     trace!(
         topic_id = %hex::encode(&topic_id[..8]),
@@ -147,16 +156,23 @@ impl std::error::Error for DedupError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::schema::create_harbor_table;
-    use crate::data::harbor::cache::{cleanup_old_pulled_packets, PACKET_LIFETIME_SECS};
     use crate::data::current_timestamp;
+    use crate::data::harbor::cache::{
+        PACKET_LIFETIME_SECS, cleanup_old_pulled_packets, mark_pulled,
+    };
+    use crate::data::schema::create_harbor_table;
 
     fn test_id(seed: u8) -> [u8; 32] {
         [seed; 32]
     }
 
+    fn test_packet_id(seed: u8) -> PacketId {
+        [seed; 16]
+    }
+
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
         create_harbor_table(&conn).unwrap();
         conn
     }
@@ -183,7 +199,7 @@ mod tests {
     fn test_check_and_mark_new_packet() {
         let conn = setup_db();
         let topic_id = test_id(1);
-        let packet_id = test_id(10);
+        let packet_id = test_packet_id(10);
         let sender_id = test_id(20);
         let our_id = test_id(99);
 
@@ -195,7 +211,7 @@ mod tests {
     fn test_check_and_mark_own_packet() {
         let conn = setup_db();
         let topic_id = test_id(1);
-        let packet_id = test_id(10);
+        let packet_id = test_packet_id(10);
         let our_id = test_id(99);
 
         // Sender is us
@@ -207,7 +223,7 @@ mod tests {
     fn test_check_and_mark_already_seen() {
         let conn = setup_db();
         let topic_id = test_id(1);
-        let packet_id = test_id(10);
+        let packet_id = test_packet_id(10);
         let sender_id = test_id(20);
         let our_id = test_id(99);
 
@@ -221,13 +237,28 @@ mod tests {
     }
 
     #[test]
+    fn test_check_and_mark_pre_marked_packet() {
+        let conn = setup_db();
+        let topic_id = test_id(9);
+        let packet_id = test_packet_id(33);
+        let sender_id = test_id(20);
+        let our_id = test_id(99);
+
+        mark_pulled(&conn, &topic_id, &packet_id).unwrap();
+        let result = check_and_mark(&conn, &topic_id, &packet_id, &sender_id, &our_id).unwrap();
+        assert_eq!(result, DedupResult::AlreadySeen);
+    }
+
+    #[test]
     fn test_check_and_mark_different_packets() {
         let conn = setup_db();
         let topic_id = test_id(1);
         let our_id = test_id(99);
 
-        let result1 = check_and_mark(&conn, &topic_id, &test_id(10), &test_id(20), &our_id).unwrap();
-        let result2 = check_and_mark(&conn, &topic_id, &test_id(11), &test_id(20), &our_id).unwrap();
+        let result1 =
+            check_and_mark(&conn, &topic_id, &test_packet_id(10), &test_id(20), &our_id).unwrap();
+        let result2 =
+            check_and_mark(&conn, &topic_id, &test_packet_id(11), &test_id(20), &our_id).unwrap();
 
         // Both should process (different packet IDs)
         assert_eq!(result1, DedupResult::Process);
@@ -237,7 +268,7 @@ mod tests {
     #[test]
     fn test_check_and_mark_different_topics() {
         let conn = setup_db();
-        let packet_id = test_id(10);
+        let packet_id = test_packet_id(10);
         let sender_id = test_id(20);
         let our_id = test_id(99);
 
@@ -258,10 +289,10 @@ mod tests {
 
         assert_eq!(get_tracked_count(&conn, &topic_id).unwrap(), 0);
 
-        mark_pulled(&conn, &topic_id, &test_id(10)).unwrap();
+        mark_pulled(&conn, &topic_id, &test_packet_id(10)).unwrap();
         assert_eq!(get_tracked_count(&conn, &topic_id).unwrap(), 1);
 
-        mark_pulled(&conn, &topic_id, &test_id(11)).unwrap();
+        mark_pulled(&conn, &topic_id, &test_packet_id(11)).unwrap();
         assert_eq!(get_tracked_count(&conn, &topic_id).unwrap(), 2);
     }
 
@@ -269,9 +300,9 @@ mod tests {
     fn test_get_tracked_count_per_topic() {
         let conn = setup_db();
 
-        mark_pulled(&conn, &test_id(1), &test_id(10)).unwrap();
-        mark_pulled(&conn, &test_id(1), &test_id(11)).unwrap();
-        mark_pulled(&conn, &test_id(2), &test_id(20)).unwrap();
+        mark_pulled(&conn, &test_id(1), &test_packet_id(10)).unwrap();
+        mark_pulled(&conn, &test_id(1), &test_packet_id(11)).unwrap();
+        mark_pulled(&conn, &test_id(2), &test_packet_id(20)).unwrap();
 
         assert_eq!(get_tracked_count(&conn, &test_id(1)).unwrap(), 2);
         assert_eq!(get_tracked_count(&conn, &test_id(2)).unwrap(), 1);
@@ -284,9 +315,9 @@ mod tests {
 
         assert_eq!(get_total_tracked_count(&conn).unwrap(), 0);
 
-        mark_pulled(&conn, &test_id(1), &test_id(10)).unwrap();
-        mark_pulled(&conn, &test_id(2), &test_id(20)).unwrap();
-        mark_pulled(&conn, &test_id(3), &test_id(30)).unwrap();
+        mark_pulled(&conn, &test_id(1), &test_packet_id(10)).unwrap();
+        mark_pulled(&conn, &test_id(2), &test_packet_id(20)).unwrap();
+        mark_pulled(&conn, &test_id(3), &test_packet_id(30)).unwrap();
 
         assert_eq!(get_total_tracked_count(&conn).unwrap(), 3);
     }
@@ -297,14 +328,15 @@ mod tests {
     fn test_cleanup_removes_old_packets() {
         let conn = setup_db();
         let topic_id = test_id(1);
-        let packet_id = test_id(10);
-        
+        let packet_id = test_packet_id(10);
+
         // Insert with old timestamp
         let old_timestamp = current_timestamp() - PACKET_LIFETIME_SECS - 1;
         conn.execute(
             "INSERT INTO pulled_packets (topic_id, packet_id, pulled_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![topic_id.as_slice(), packet_id.as_slice(), old_timestamp],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify it exists
         assert_eq!(get_tracked_count(&conn, &topic_id).unwrap(), 1);
@@ -326,4 +358,3 @@ mod tests {
         assert!(err.to_string().contains("test error"));
     }
 }
-

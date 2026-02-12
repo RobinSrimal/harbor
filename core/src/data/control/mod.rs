@@ -5,7 +5,7 @@
 //! - Connect tokens (QR code / invite string flow)
 //! - Pending topic invites
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params, types::Type};
 
 use crate::data::dht::ensure_peer_exists;
 
@@ -61,6 +61,46 @@ pub struct ConnectionInfo {
     pub updated_at: i64,
 }
 
+fn invalid_column_type(index: usize, name: &'static str, ty: Type) -> rusqlite::Error {
+    rusqlite::Error::InvalidColumnType(index, name.to_string(), ty)
+}
+
+fn decode_fixed_32(bytes: Vec<u8>, index: usize, name: &'static str) -> rusqlite::Result<[u8; 32]> {
+    bytes
+        .try_into()
+        .map_err(|_| invalid_column_type(index, name, Type::Blob))
+}
+
+fn decode_optional_fixed_32(
+    bytes: Option<Vec<u8>>,
+    index: usize,
+    name: &'static str,
+) -> rusqlite::Result<Option<[u8; 32]>> {
+    match bytes {
+        Some(v) => decode_fixed_32(v, index, name).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn parse_connection_state(
+    state: &str,
+    index: usize,
+    name: &'static str,
+) -> rusqlite::Result<ConnectionState> {
+    ConnectionState::from_str(state).ok_or_else(|| invalid_column_type(index, name, Type::Text))
+}
+
+fn parse_epoch(epoch: i64, index: usize, name: &'static str) -> rusqlite::Result<u64> {
+    if epoch < 0 {
+        return Err(invalid_column_type(index, name, Type::Integer));
+    }
+    Ok(epoch as u64)
+}
+
+fn encode_epoch(epoch: u64, index: usize, name: &'static str) -> rusqlite::Result<i64> {
+    i64::try_from(epoch).map_err(|_| invalid_column_type(index, name, Type::Integer))
+}
+
 // ============ Connection List CRUD ============
 
 /// Insert or update a connection in the list
@@ -98,7 +138,10 @@ pub fn upsert_connection(
 }
 
 /// Get connection info for a peer
-pub fn get_connection(conn: &Connection, peer_id: &[u8; 32]) -> rusqlite::Result<Option<ConnectionInfo>> {
+pub fn get_connection(
+    conn: &Connection,
+    peer_id: &[u8; 32],
+) -> rusqlite::Result<Option<ConnectionInfo>> {
     conn.query_row(
         "SELECT p.endpoint_id, c.state, c.display_name, p.relay_url, c.request_id, c.created_at, c.updated_at
          FROM connection_list c
@@ -111,11 +154,11 @@ pub fn get_connection(conn: &Connection, peer_id: &[u8; 32]) -> rusqlite::Result
             let request_id_opt: Option<Vec<u8>> = row.get(4)?;
 
             Ok(ConnectionInfo {
-                peer_id: peer_id_vec.try_into().unwrap_or([0u8; 32]),
-                state: ConnectionState::from_str(&state_str).unwrap_or(ConnectionState::Declined),
+                peer_id: decode_fixed_32(peer_id_vec, 0, "endpoint_id")?,
+                state: parse_connection_state(&state_str, 1, "state")?,
                 display_name: row.get(2)?,
                 relay_url: row.get(3)?,
-                request_id: request_id_opt.map(|v| v.try_into().unwrap_or([0u8; 32])),
+                request_id: decode_optional_fixed_32(request_id_opt, 4, "request_id")?,
                 created_at: row.get(5)?,
                 updated_at: row.get(6)?,
             })
@@ -157,11 +200,11 @@ pub fn list_connections_by_state(
         let request_id_opt: Option<Vec<u8>> = row.get(4)?;
 
         Ok(ConnectionInfo {
-            peer_id: peer_id_vec.try_into().unwrap_or([0u8; 32]),
-            state: ConnectionState::from_str(&state_str).unwrap_or(ConnectionState::Declined),
+            peer_id: decode_fixed_32(peer_id_vec, 0, "endpoint_id")?,
+            state: parse_connection_state(&state_str, 1, "state")?,
             display_name: row.get(2)?,
             relay_url: row.get(3)?,
-            request_id: request_id_opt.map(|v| v.try_into().unwrap_or([0u8; 32])),
+            request_id: decode_optional_fixed_32(request_id_opt, 4, "request_id")?,
             created_at: row.get(5)?,
             updated_at: row.get(6)?,
         })
@@ -185,11 +228,11 @@ pub fn list_all_connections(conn: &Connection) -> rusqlite::Result<Vec<Connectio
         let request_id_opt: Option<Vec<u8>> = row.get(4)?;
 
         Ok(ConnectionInfo {
-            peer_id: peer_id_vec.try_into().unwrap_or([0u8; 32]),
-            state: ConnectionState::from_str(&state_str).unwrap_or(ConnectionState::Declined),
+            peer_id: decode_fixed_32(peer_id_vec, 0, "endpoint_id")?,
+            state: parse_connection_state(&state_str, 1, "state")?,
             display_name: row.get(2)?,
             relay_url: row.get(3)?,
-            request_id: request_id_opt.map(|v| v.try_into().unwrap_or([0u8; 32])),
+            request_id: decode_optional_fixed_32(request_id_opt, 4, "request_id")?,
             created_at: row.get(5)?,
             updated_at: row.get(6)?,
         })
@@ -263,7 +306,7 @@ pub fn list_tokens(conn: &Connection) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut stmt = conn.prepare("SELECT token FROM connect_tokens")?;
     let rows = stmt.query_map([], |row| {
         let token_vec: Vec<u8> = row.get(0)?;
-        Ok(token_vec.try_into().unwrap_or([0u8; 32]))
+        decode_fixed_32(token_vec, 0, "token")
     })?;
     rows.collect()
 }
@@ -302,6 +345,8 @@ pub fn store_pending_invite(
     ensure_peer_exists(conn, sender_id)?;
     ensure_peer_exists(conn, admin_id)?;
 
+    let epoch = encode_epoch(epoch, 4, "epoch")?;
+
     conn.execute(
         "INSERT OR REPLACE INTO pending_topic_invites
          (message_id, topic_id, sender_peer_id, topic_name, epoch, epoch_key, admin_peer_id, members_blob)
@@ -315,7 +360,7 @@ pub fn store_pending_invite(
             topic_id.as_slice(),
             sender_id.as_slice(),
             topic_name,
-            epoch as i64,
+            epoch,
             epoch_key.as_slice(),
             admin_id.as_slice(),
             members_blob,
@@ -325,14 +370,22 @@ pub fn store_pending_invite(
 }
 
 /// Parse members from concatenated 32-byte blob
-fn parse_members_blob(blob: &[u8]) -> Vec<[u8; 32]> {
-    blob.chunks_exact(32)
+fn parse_members_blob(blob: &[u8]) -> rusqlite::Result<Vec<[u8; 32]>> {
+    let mut chunks = blob.chunks_exact(32);
+    let members: Vec<[u8; 32]> = chunks
+        .by_ref()
         .map(|chunk| {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(chunk);
             arr
         })
-        .collect()
+        .collect();
+
+    if !chunks.remainder().is_empty() {
+        return Err(invalid_column_type(7, "members_blob", Type::Blob));
+    }
+
+    Ok(members)
 }
 
 /// Get a pending invite by message_id
@@ -357,14 +410,14 @@ pub fn get_pending_invite(
             let members_blob: Vec<u8> = row.get(7)?;
 
             Ok(PendingTopicInvite {
-                message_id: message_id_vec.try_into().unwrap_or([0u8; 32]),
-                topic_id: topic_id_vec.try_into().unwrap_or([0u8; 32]),
-                sender_id: sender_id_vec.try_into().unwrap_or([0u8; 32]),
+                message_id: decode_fixed_32(message_id_vec, 0, "message_id")?,
+                topic_id: decode_fixed_32(topic_id_vec, 1, "topic_id")?,
+                sender_id: decode_fixed_32(sender_id_vec, 2, "endpoint_id")?,
                 topic_name: row.get(3)?,
-                epoch: row.get::<_, i64>(4)? as u64,
-                epoch_key: epoch_key_vec.try_into().unwrap_or([0u8; 32]),
-                admin_id: admin_id_vec.try_into().unwrap_or([0u8; 32]),
-                members: parse_members_blob(&members_blob),
+                epoch: parse_epoch(row.get::<_, i64>(4)?, 4, "epoch")?,
+                epoch_key: decode_fixed_32(epoch_key_vec, 5, "epoch_key")?,
+                admin_id: decode_fixed_32(admin_id_vec, 6, "endpoint_id")?,
+                members: parse_members_blob(&members_blob)?,
                 received_at: row.get(8)?,
             })
         },
@@ -392,14 +445,14 @@ pub fn list_pending_invites(conn: &Connection) -> rusqlite::Result<Vec<PendingTo
         let members_blob: Vec<u8> = row.get(7)?;
 
         Ok(PendingTopicInvite {
-            message_id: message_id_vec.try_into().unwrap_or([0u8; 32]),
-            topic_id: topic_id_vec.try_into().unwrap_or([0u8; 32]),
-            sender_id: sender_id_vec.try_into().unwrap_or([0u8; 32]),
+            message_id: decode_fixed_32(message_id_vec, 0, "message_id")?,
+            topic_id: decode_fixed_32(topic_id_vec, 1, "topic_id")?,
+            sender_id: decode_fixed_32(sender_id_vec, 2, "endpoint_id")?,
             topic_name: row.get(3)?,
-            epoch: row.get::<_, i64>(4)? as u64,
-            epoch_key: epoch_key_vec.try_into().unwrap_or([0u8; 32]),
-            admin_id: admin_id_vec.try_into().unwrap_or([0u8; 32]),
-            members: parse_members_blob(&members_blob),
+            epoch: parse_epoch(row.get::<_, i64>(4)?, 4, "epoch")?,
+            epoch_key: decode_fixed_32(epoch_key_vec, 5, "epoch_key")?,
+            admin_id: decode_fixed_32(admin_id_vec, 6, "endpoint_id")?,
+            members: parse_members_blob(&members_blob)?,
             received_at: row.get(8)?,
         })
     })?;
@@ -417,7 +470,10 @@ pub fn delete_pending_invite(conn: &Connection, message_id: &[u8; 32]) -> rusqli
 }
 
 /// Check if we already have an invite for this topic
-pub fn has_pending_invite_for_topic(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<bool> {
+pub fn has_pending_invite_for_topic(
+    conn: &Connection,
+    topic_id: &[u8; 32],
+) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT COUNT(*) > 0 FROM pending_topic_invites WHERE topic_id = ?1",
         [topic_id.as_slice()],
@@ -538,6 +594,251 @@ mod tests {
 
         // Delete
         delete_pending_invite(&conn, &message_id).unwrap();
+        assert!(get_pending_invite(&conn, &message_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_connection_rejects_unknown_state_value() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE peers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint_id BLOB UNIQUE NOT NULL,
+                relay_url TEXT,
+                last_seen INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE connection_list (
+                peer_id INTEGER PRIMARY KEY,
+                state TEXT NOT NULL,
+                display_name TEXT,
+                request_id BLOB,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )
+        .unwrap();
+
+        let peer_id = [9u8; 32];
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            params![peer_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO connection_list (peer_id, state)
+             VALUES ((SELECT id FROM peers WHERE endpoint_id = ?1), ?2)",
+            params![peer_id.as_slice(), "invalid_state"],
+        )
+        .unwrap();
+
+        let err = get_connection(&conn, &peer_id).unwrap_err();
+        assert!(matches!(
+            err,
+            rusqlite::Error::InvalidColumnType(_, name, Type::Text) if name == "state"
+        ));
+    }
+
+    #[test]
+    fn test_list_tokens_rejects_invalid_token_length() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE connect_tokens (
+                token BLOB PRIMARY KEY NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO connect_tokens (token) VALUES (?1)",
+            [[1u8; 16].as_slice()],
+        )
+        .unwrap();
+
+        let err = list_tokens(&conn).unwrap_err();
+        assert!(matches!(
+            err,
+            rusqlite::Error::InvalidColumnType(_, name, Type::Blob) if name == "token"
+        ));
+    }
+
+    #[test]
+    fn test_get_pending_invite_rejects_invalid_members_blob_length() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE peers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint_id BLOB UNIQUE NOT NULL,
+                last_seen INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE pending_topic_invites (
+                message_id BLOB PRIMARY KEY NOT NULL,
+                topic_id BLOB NOT NULL,
+                sender_peer_id INTEGER NOT NULL,
+                topic_name TEXT,
+                epoch INTEGER NOT NULL,
+                epoch_key BLOB NOT NULL,
+                admin_peer_id INTEGER NOT NULL,
+                members_blob BLOB NOT NULL,
+                received_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )
+        .unwrap();
+
+        let message_id = [1u8; 32];
+        let topic_id = [2u8; 32];
+        let sender_id = [3u8; 32];
+        let admin_id = [4u8; 32];
+        let epoch_key = [5u8; 32];
+
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            params![sender_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            params![admin_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO pending_topic_invites
+             (message_id, topic_id, sender_peer_id, topic_name, epoch, epoch_key, admin_peer_id, members_blob)
+             VALUES (?1, ?2,
+                     (SELECT id FROM peers WHERE endpoint_id = ?3),
+                     ?4, ?5, ?6,
+                     (SELECT id FROM peers WHERE endpoint_id = ?7),
+                     ?8)",
+            params![
+                message_id.as_slice(),
+                topic_id.as_slice(),
+                sender_id.as_slice(),
+                "Bad Members",
+                1i64,
+                epoch_key.as_slice(),
+                admin_id.as_slice(),
+                vec![0u8; 33],
+            ],
+        )
+        .unwrap();
+
+        let err = get_pending_invite(&conn, &message_id).unwrap_err();
+        assert!(matches!(
+            err,
+            rusqlite::Error::InvalidColumnType(_, name, Type::Blob) if name == "members_blob"
+        ));
+    }
+
+    #[test]
+    fn test_get_pending_invite_rejects_negative_epoch() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE peers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint_id BLOB UNIQUE NOT NULL,
+                last_seen INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE pending_topic_invites (
+                message_id BLOB PRIMARY KEY NOT NULL,
+                topic_id BLOB NOT NULL,
+                sender_peer_id INTEGER NOT NULL,
+                topic_name TEXT,
+                epoch INTEGER NOT NULL,
+                epoch_key BLOB NOT NULL,
+                admin_peer_id INTEGER NOT NULL,
+                members_blob BLOB NOT NULL,
+                received_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )
+        .unwrap();
+
+        let message_id = [11u8; 32];
+        let topic_id = [12u8; 32];
+        let sender_id = [13u8; 32];
+        let admin_id = [14u8; 32];
+        let epoch_key = [15u8; 32];
+
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            params![sender_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peers (endpoint_id, last_seen) VALUES (?1, ?2)",
+            params![admin_id.as_slice(), 1704067200i64],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO pending_topic_invites
+             (message_id, topic_id, sender_peer_id, topic_name, epoch, epoch_key, admin_peer_id, members_blob)
+             VALUES (?1, ?2,
+                     (SELECT id FROM peers WHERE endpoint_id = ?3),
+                     ?4, ?5, ?6,
+                     (SELECT id FROM peers WHERE endpoint_id = ?7),
+                     ?8)",
+            params![
+                message_id.as_slice(),
+                topic_id.as_slice(),
+                sender_id.as_slice(),
+                "Bad Epoch",
+                -1i64,
+                epoch_key.as_slice(),
+                admin_id.as_slice(),
+                vec![],
+            ],
+        )
+        .unwrap();
+
+        let err = get_pending_invite(&conn, &message_id).unwrap_err();
+        assert!(matches!(
+            err,
+            rusqlite::Error::InvalidColumnType(_, name, Type::Integer) if name == "epoch"
+        ));
+    }
+
+    #[test]
+    fn test_store_pending_invite_rejects_epoch_out_of_i64_range() {
+        let conn = setup_db();
+        let message_id = [21u8; 32];
+        let topic_id = [22u8; 32];
+        let sender_id = [23u8; 32];
+        let epoch_key = [24u8; 32];
+        let admin_id = [25u8; 32];
+
+        let err = store_pending_invite(
+            &conn,
+            &message_id,
+            &topic_id,
+            &sender_id,
+            Some("Overflow Epoch"),
+            (i64::MAX as u64) + 1,
+            &epoch_key,
+            &admin_id,
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            rusqlite::Error::InvalidColumnType(_, name, Type::Integer) if name == "epoch"
+        ));
         assert!(get_pending_invite(&conn, &message_id).unwrap().is_none());
     }
 }

@@ -63,7 +63,6 @@ pub fn create_peer_table(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-
 /// DHT table: stores routing table buckets
 ///
 /// Each peer is assigned to a bucket based on XOR distance from local node.
@@ -131,13 +130,13 @@ pub fn create_topic_table(conn: &Connection) -> rusqlite::Result<()> {
 /// Outgoing table: tracks sent packets and their delivery status
 ///
 /// Used to track read receipts and determine when to replicate to Harbor Nodes.
-/// All BLOB ID fields are 32 bytes (256-bit identifiers).
+/// `topic_id`/`harbor_id` are 32-byte identifiers; `packet_id` is 16 bytes.
 /// packet_type: 0=Content, 1=Join, 2=Leave (used for Harbor store requests)
 pub fn create_outgoing_table(conn: &Connection) -> rusqlite::Result<()> {
     // Main outgoing packets table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS outgoing_packets (
-            packet_id BLOB PRIMARY KEY NOT NULL CHECK (length(packet_id) = 32),
+            packet_id BLOB PRIMARY KEY NOT NULL CHECK (length(packet_id) = 16),
             topic_id BLOB NOT NULL CHECK (length(topic_id) = 32),
             harbor_id BLOB NOT NULL CHECK (length(harbor_id) = 32),
             packet_data BLOB NOT NULL,
@@ -151,7 +150,7 @@ pub fn create_outgoing_table(conn: &Connection) -> rusqlite::Result<()> {
     // Track which recipients have acknowledged (read receipts)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS outgoing_recipients (
-            packet_id BLOB NOT NULL CHECK (length(packet_id) = 32),
+            packet_id BLOB NOT NULL CHECK (length(packet_id) = 16),
             peer_id INTEGER NOT NULL,
             acknowledged INTEGER NOT NULL DEFAULT 0,
             acknowledged_at INTEGER,
@@ -187,7 +186,7 @@ pub fn create_outgoing_table(conn: &Connection) -> rusqlite::Result<()> {
 /// Harbor stores opaque encrypted bytes. The packet type is not stored separately -
 /// recipients derive the type from plaintext[0] after decryption.
 ///
-/// All BLOB ID fields are 32 bytes (256-bit identifiers).
+/// `harbor_id` is 32 bytes; `packet_id` is 16 bytes.
 pub fn create_harbor_table(conn: &Connection) -> rusqlite::Result<()> {
     // Main harbor cache table
     // synced: 0=not yet synced to partner harbor nodes, 1=synced
@@ -195,7 +194,7 @@ pub fn create_harbor_table(conn: &Connection) -> rusqlite::Result<()> {
     //         distributed to multiple Harbor Nodes for redundancy
     conn.execute(
         "CREATE TABLE IF NOT EXISTS harbor_cache (
-            packet_id BLOB PRIMARY KEY NOT NULL CHECK (length(packet_id) = 32),
+            packet_id BLOB PRIMARY KEY NOT NULL CHECK (length(packet_id) = 16),
             harbor_id BLOB NOT NULL CHECK (length(harbor_id) = 32),
             sender_peer_id INTEGER NOT NULL,
             packet_data BLOB NOT NULL,
@@ -210,7 +209,7 @@ pub fn create_harbor_table(conn: &Connection) -> rusqlite::Result<()> {
     // Track which recipients need the packet
     conn.execute(
         "CREATE TABLE IF NOT EXISTS harbor_recipients (
-            packet_id BLOB NOT NULL CHECK (length(packet_id) = 32),
+            packet_id BLOB NOT NULL CHECK (length(packet_id) = 16),
             peer_id INTEGER NOT NULL,
             delivered INTEGER NOT NULL DEFAULT 0,
             delivered_at INTEGER,
@@ -225,7 +224,7 @@ pub fn create_harbor_table(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS pulled_packets (
             topic_id BLOB NOT NULL CHECK (length(topic_id) = 32),
-            packet_id BLOB NOT NULL CHECK (length(packet_id) = 32),
+            packet_id BLOB NOT NULL CHECK (length(packet_id) = 16),
             pulled_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             PRIMARY KEY (topic_id, packet_id)
         )",
@@ -305,7 +304,7 @@ pub fn create_membership_tables(conn: &Connection) -> rusqlite::Result<()> {
     // When the epoch key arrives, these packets are decrypted and processed
     conn.execute(
         "CREATE TABLE IF NOT EXISTS pending_decryption (
-            packet_id BLOB PRIMARY KEY NOT NULL CHECK (length(packet_id) = 32),
+            packet_id BLOB PRIMARY KEY NOT NULL CHECK (length(packet_id) = 16),
             topic_id BLOB NOT NULL CHECK (length(topic_id) = 32),
             harbor_id BLOB NOT NULL CHECK (length(harbor_id) = 32),
             sender_peer_id INTEGER NOT NULL,
@@ -511,9 +510,13 @@ mod tests {
         assert!(tables.contains(&"outgoing_recipients".to_string()));
         assert!(tables.contains(&"harbor_cache".to_string()));
         assert!(tables.contains(&"harbor_recipients".to_string()));
+        assert!(tables.contains(&"harbor_nodes_cache".to_string()));
         assert!(tables.contains(&"pulled_packets".to_string()));
         assert!(tables.contains(&"epoch_keys".to_string()));
         assert!(tables.contains(&"pending_decryption".to_string()));
+        assert!(tables.contains(&"blobs".to_string()));
+        assert!(tables.contains(&"blob_recipients".to_string()));
+        assert!(tables.contains(&"blob_sections".to_string()));
         assert!(tables.contains(&"connection_list".to_string()));
         assert!(tables.contains(&"connect_tokens".to_string()));
         assert!(tables.contains(&"pending_topic_invites".to_string()));
@@ -529,10 +532,7 @@ mod tests {
         conn.execute(
             "INSERT INTO peers (endpoint_id, last_seen) 
              VALUES (?1, ?2)",
-            rusqlite::params![
-                endpoint_id.as_slice(),
-                1704067200i64,
-            ],
+            rusqlite::params![endpoint_id.as_slice(), 1704067200i64,],
         )
         .unwrap();
 
@@ -653,10 +653,7 @@ mod tests {
             rusqlite::params![short_id.as_slice(), 1704067200i64],
         );
 
-        assert!(
-            result.is_err(),
-            "Should reject endpoint_id with wrong size"
-        );
+        assert!(result.is_err(), "Should reject endpoint_id with wrong size");
     }
 
     #[test]
@@ -679,7 +676,11 @@ mod tests {
         conn.execute(
             "INSERT INTO topics (topic_id, harbor_id, admin_peer_id)
              VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
-            rusqlite::params![topic_id.as_slice(), harbor_id.as_slice(), admin_id.as_slice()],
+            rusqlite::params![
+                topic_id.as_slice(),
+                harbor_id.as_slice(),
+                admin_id.as_slice()
+            ],
         )
         .unwrap();
 
@@ -688,12 +689,16 @@ mod tests {
         let result = conn.execute(
             "INSERT INTO topics (topic_id, harbor_id, admin_peer_id)
              VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
-            rusqlite::params![[4u8; 32].as_slice(), bad_harbor.as_slice(), admin_id.as_slice()],
+            rusqlite::params![
+                [4u8; 32].as_slice(),
+                bad_harbor.as_slice(),
+                admin_id.as_slice()
+            ],
         );
         assert!(result.is_err(), "Should reject harbor_id with wrong size");
     }
 
-    // ========== Membership Tables Tests (Tier 1 - placeholder) ==========
+    // ========== Membership Tables Tests ==========
 
     #[test]
     fn test_create_membership_tables() {
@@ -738,7 +743,11 @@ mod tests {
         conn.execute(
             "INSERT INTO topics (topic_id, harbor_id, admin_peer_id)
              VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
-            rusqlite::params![topic_id.as_slice(), harbor_id.as_slice(), admin_id.as_slice()],
+            rusqlite::params![
+                topic_id.as_slice(),
+                harbor_id.as_slice(),
+                admin_id.as_slice()
+            ],
         )
         .unwrap();
 
@@ -773,7 +782,7 @@ mod tests {
         let topic_id = [1u8; 32];
         let harbor_id = [2u8; 32];
         let admin_id = [3u8; 32];
-        let packet_id = [4u8; 32];
+        let packet_id = [4u8; 16];
         let sender_id = [5u8; 32];
         let packet_data = b"encrypted payload";
 
@@ -793,7 +802,11 @@ mod tests {
         conn.execute(
             "INSERT INTO topics (topic_id, harbor_id, admin_peer_id)
              VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
-            rusqlite::params![topic_id.as_slice(), harbor_id.as_slice(), admin_id.as_slice()],
+            rusqlite::params![
+                topic_id.as_slice(),
+                harbor_id.as_slice(),
+                admin_id.as_slice()
+            ],
         )
         .unwrap();
 

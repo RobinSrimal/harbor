@@ -20,7 +20,10 @@ use crate::network::pool::PoolError;
 pub use crate::network::dht::protocol::RPC_ALPN as DHT_ALPN;
 
 // Re-export common types from generic pool
-pub use crate::network::pool::{PoolConfig as DhtPoolConfig, PoolError as DhtPoolError, ConnectionRef as DhtConnectionRef, PoolStats};
+pub use crate::network::pool::{
+    ConnectionRef as DhtConnectionRef, PoolConfig as DhtPoolConfig, PoolError as DhtPoolError,
+    PoolStats,
+};
 
 /// Information about a peer for dialing
 #[derive(Debug, Clone)]
@@ -102,7 +105,10 @@ impl DhtPool {
     /// Get or create a connection to a peer
     ///
     /// Returns the connection and whether the relay URL was confirmed working.
-    pub async fn get_connection(&self, dial_info: &DialInfo) -> Result<(Connection, bool), PoolError> {
+    pub async fn get_connection(
+        &self,
+        dial_info: &DialInfo,
+    ) -> Result<(Connection, bool), PoolError> {
         let node_id = dial_info.node_id;
 
         // Merge with known node info (e.g., bootstrap relay URLs)
@@ -112,8 +118,13 @@ impl DhtPool {
                 // Prefer provided relay_url, fall back to known
                 DialInfo {
                     node_id,
-                    relay_url: dial_info.relay_url.clone().or_else(|| known_info.relay_url.clone()),
-                    relay_url_last_success: dial_info.relay_url_last_success.or(known_info.relay_url_last_success),
+                    relay_url: dial_info
+                        .relay_url
+                        .clone()
+                        .or_else(|| known_info.relay_url.clone()),
+                    relay_url_last_success: dial_info
+                        .relay_url_last_success
+                        .or(known_info.relay_url_last_success),
                 }
             } else {
                 dial_info.clone()
@@ -121,7 +132,8 @@ impl DhtPool {
         };
 
         // Parse relay URL for the smart connect primitive
-        let parsed_relay: Option<iroh::RelayUrl> = merged_dial_info.relay_url
+        let parsed_relay: Option<iroh::RelayUrl> = merged_dial_info
+            .relay_url
             .as_ref()
             .and_then(|url| url.parse().ok());
 
@@ -145,13 +157,10 @@ impl DhtPool {
 
     /// Get statistics about the pool
     pub async fn stats(&self) -> PoolStats {
-        self.connector
-            .pool_stats()
-            .await
-            .unwrap_or(PoolStats {
-                active_connections: 0,
-                max_connections: 0,
-            })
+        self.connector.pool_stats().await.unwrap_or(PoolStats {
+            active_connections: 0,
+            max_connections: 0,
+        })
     }
 }
 
@@ -192,10 +201,7 @@ mod tests {
             PoolError::Shutdown.to_string(),
             "connection pool is shut down"
         );
-        assert_eq!(
-            PoolError::Timeout.to_string(),
-            "connection timed out"
-        );
+        assert_eq!(PoolError::Timeout.to_string(), "connection timed out");
         assert_eq!(
             PoolError::TooManyConnections.to_string(),
             "too many connections"
@@ -237,7 +243,10 @@ mod tests {
 
         let info = info.unwrap();
         assert_eq!(info.node_id, node_id);
-        assert_eq!(info.relay_url, Some("https://relay.example.com/".to_string()));
+        assert_eq!(
+            info.relay_url,
+            Some("https://relay.example.com/".to_string())
+        );
         assert_eq!(info.relay_url_last_success, Some(12345));
     }
 

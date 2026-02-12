@@ -6,9 +6,9 @@
 mod control;
 mod dht;
 mod harbor;
-mod stream;
 mod send;
 mod share;
+mod stream;
 mod sync;
 
 use std::sync::Arc;
@@ -16,14 +16,14 @@ use std::sync::Arc;
 use iroh::Endpoint;
 use iroh::protocol::Router;
 
-use crate::network::control::{ControlService, CONTROL_ALPN};
-use crate::network::dht::{DhtService, DHT_ALPN};
+use crate::network::control::{CONTROL_ALPN, ControlService};
+use crate::network::dht::{DHT_ALPN, DhtService};
 use crate::network::harbor::HarborService;
 use crate::network::harbor::protocol::HARBOR_ALPN;
-use crate::network::stream::{StreamService, STREAM_ALPN};
 use crate::network::send::{SendService, protocol::SEND_ALPN};
-use crate::network::share::{ShareService, SHARE_ALPN};
-use crate::network::sync::{SyncService, SYNC_ALPN};
+use crate::network::share::{SHARE_ALPN, ShareService};
+use crate::network::stream::{STREAM_ALPN, StreamService};
+use crate::network::sync::{SYNC_ALPN, SyncService};
 
 /// Build the iroh Router that dispatches incoming connections by ALPN.
 pub(crate) fn build_router(

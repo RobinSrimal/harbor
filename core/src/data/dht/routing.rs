@@ -33,9 +33,18 @@ fn parse_dht_row(row: &rusqlite::Row) -> rusqlite::Result<DhtEntry> {
     let mut endpoint_id = [0u8; 32];
     endpoint_id.copy_from_slice(&id_vec);
 
+    let bucket_index_i32: i32 = row.get(1)?;
+    if !(0..=255).contains(&bucket_index_i32) {
+        return Err(rusqlite::Error::InvalidColumnType(
+            1,
+            "bucket_index".to_string(),
+            rusqlite::types::Type::Integer,
+        ));
+    }
+
     Ok(DhtEntry {
         endpoint_id,
-        bucket_index: row.get::<_, i32>(1)? as u8,
+        bucket_index: bucket_index_i32 as u8,
         added_at: row.get(2)?,
     })
 }
@@ -110,11 +119,7 @@ pub fn count_bucket_entries(conn: &Connection, bucket_index: u8) -> rusqlite::Re
 
 /// Get total entry count across all buckets
 pub fn count_all_entries(conn: &Connection) -> rusqlite::Result<usize> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM dht_routing",
-        [],
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM dht_routing", [], |row| row.get(0))?;
     Ok(count as usize)
 }
 
@@ -140,9 +145,11 @@ pub fn load_routing_table(conn: &Connection) -> rusqlite::Result<Vec<Vec<[u8; 32
 
 /// Load relay URLs for routing table nodes from the peers table
 ///
-/// Returns a list of (endpoint_id, relay_url) pairs for nodes that have
-/// a relay URL stored in the peers table.
-pub fn load_routing_table_relay_urls(conn: &Connection) -> rusqlite::Result<Vec<([u8; 32], String, Option<i64>)>> {
+/// Returns a list of `(endpoint_id, relay_url, relay_url_last_success)` tuples
+/// for nodes that have a relay URL stored in the peers table.
+pub fn load_routing_table_relay_urls(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<([u8; 32], String, Option<i64>)>> {
     let mut stmt = conn.prepare(
         "SELECT p.endpoint_id, p.relay_url, p.relay_url_last_success
          FROM dht_routing r
@@ -174,8 +181,8 @@ pub fn load_routing_table_relay_urls(conn: &Connection) -> rusqlite::Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::dht::peer::{PeerInfo, current_timestamp, upsert_peer};
     use crate::data::schema::{create_dht_table, create_peer_table};
-    use crate::data::dht::peer::{current_timestamp, upsert_peer, PeerInfo};
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -369,7 +376,13 @@ mod tests {
             relay_url_last_success: Some(current_timestamp()),
         };
         upsert_peer(&conn, &peer).unwrap();
-        crate::data::update_peer_relay_url(&conn, &endpoint_id, "https://relay.example.com/", current_timestamp()).unwrap();
+        crate::data::update_peer_relay_url(
+            &conn,
+            &endpoint_id,
+            "https://relay.example.com/",
+            current_timestamp(),
+        )
+        .unwrap();
 
         let entry = DhtEntry {
             endpoint_id,
@@ -391,6 +404,53 @@ mod tests {
         assert_eq!(relay_urls.len(), 1);
         assert_eq!(relay_urls[0].0, endpoint_id);
         assert_eq!(relay_urls[0].1, "https://relay.example.com/");
-        assert!(relay_urls[0].2.is_some(), "should have relay_url_last_success");
+        assert!(
+            relay_urls[0].2.is_some(),
+            "should have relay_url_last_success"
+        );
+    }
+
+    #[test]
+    fn test_insert_dht_entry_creates_missing_peer() {
+        let conn = setup_db();
+        let endpoint_id = [77u8; 32];
+        let entry = DhtEntry {
+            endpoint_id,
+            bucket_index: 9,
+            added_at: current_timestamp(),
+        };
+
+        // Should succeed even though peer wasn't inserted first.
+        insert_dht_entry(&conn, &entry).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM peers WHERE endpoint_id = ?1",
+                [endpoint_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_get_all_entries_rejects_invalid_bucket_index() {
+        let conn = setup_db();
+        let endpoint_id = create_test_peer(&conn, 88);
+
+        // Bypass typed API and insert corrupt bucket value directly.
+        conn.execute(
+            "INSERT INTO dht_routing (peer_id, bucket_index, added_at)
+             VALUES ((SELECT id FROM peers WHERE endpoint_id = ?1), ?2, ?3)",
+            params![endpoint_id.as_slice(), -1i32, current_timestamp()],
+        )
+        .unwrap();
+
+        let err = get_all_entries(&conn).unwrap_err();
+        assert!(matches!(
+            err,
+            rusqlite::Error::InvalidColumnType(idx, name, rusqlite::types::Type::Integer)
+                if idx == 1 && name == "bucket_index"
+        ));
     }
 }

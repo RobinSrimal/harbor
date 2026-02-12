@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn current_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -318,7 +318,9 @@ impl ByteWindow {
         let cutoff = now - window_secs as i64;
         self.entries.retain(|(ts, _)| *ts > cutoff);
         self.entries.push((now, bytes));
-        self.entries.iter().map(|(_, b)| b).sum()
+        self.entries
+            .iter()
+            .fold(0u64, |acc, (_, b)| acc.saturating_add(*b))
     }
 
     /// Get total bytes in window (without adding)
@@ -327,8 +329,7 @@ impl ByteWindow {
         self.entries
             .iter()
             .filter(|(ts, _)| *ts > cutoff)
-            .map(|(_, b)| b)
-            .sum()
+            .fold(0u64, |acc, (_, b)| acc.saturating_add(*b))
     }
 
     /// Check if window has any recent activity
@@ -397,8 +398,6 @@ pub enum PoWResult {
         /// Maximum allowed age
         max_age_secs: i64,
     },
-    /// PoW context doesn't match (hash verification failed)
-    InvalidContext,
 }
 
 impl PoWResult {
@@ -454,7 +453,6 @@ impl PoWVerifier {
     /// * `PoWResult::Allowed` - PoW is valid
     /// * `PoWResult::InsufficientDifficulty` - PoW too weak
     /// * `PoWResult::Expired` - Timestamp out of range
-    /// * `PoWResult::InvalidContext` - Hash doesn't match
     pub fn verify(
         &self,
         pow: &ProofOfWork,
@@ -513,11 +511,12 @@ impl PoWVerifier {
                 let existing = state
                     .map(|s| s.byte_window.total(now, *window_secs))
                     .unwrap_or(0);
-                let total_bytes = existing + bytes.unwrap_or(0);
+                let total_bytes = existing.saturating_add(bytes.unwrap_or(0));
 
                 if total_bytes > *byte_threshold {
-                    let excess_mb = (total_bytes - byte_threshold) / (1024 * 1024);
-                    (excess_mb as u8).saturating_mul(*bits_per_mb)
+                    let excess_mb = total_bytes.saturating_sub(*byte_threshold) / (1024 * 1024);
+                    let scaled = excess_mb.saturating_mul(u64::from(*bits_per_mb));
+                    scaled.min(u64::from(u8::MAX)) as u8
                 } else {
                     0
                 }
@@ -530,12 +529,13 @@ impl PoWVerifier {
             } => {
                 let state = self.peer_state.get(peer_id);
                 let count = state
-                    .map(|s| s.request_window.count(now, *window_secs) + 1) // +1 for current
+                    .map(|s| s.request_window.count(now, *window_secs).saturating_add(1)) // +1 for current
                     .unwrap_or(1);
 
                 if count > *threshold {
-                    let excess = count - threshold;
-                    (excess as u8).saturating_mul(*bits_per_request)
+                    let excess = count.saturating_sub(*threshold);
+                    let scaled = excess.saturating_mul(u64::from(*bits_per_request));
+                    scaled.min(u64::from(u8::MAX)) as u8
                 } else {
                     0
                 }
@@ -554,18 +554,27 @@ impl PoWVerifier {
         }
 
         let now = current_timestamp();
-        let state = self.peer_state.entry(*peer_id).or_default();
 
         match &self.config.scaling {
-            ScalingConfig::ByteBased { window_secs, .. } => {
+            ScalingConfig::ByteBased {
+                enabled: true,
+                window_secs,
+                ..
+            } => {
                 if let Some(b) = bytes {
+                    let state = self.peer_state.entry(*peer_id).or_default();
                     state.byte_window.add_and_total(now, *window_secs, b);
                 }
             }
-            ScalingConfig::RequestBased { window_secs, .. } => {
+            ScalingConfig::RequestBased {
+                enabled: true,
+                window_secs,
+                ..
+            } => {
+                let state = self.peer_state.entry(*peer_id).or_default();
                 state.request_window.add_and_count(now, *window_secs);
             }
-            ScalingConfig::None => {}
+            _ => {}
         }
     }
 
@@ -695,7 +704,10 @@ mod tests {
 
         let control = PoWConfig::control();
         assert_eq!(control.base_difficulty, 18);
-        assert!(matches!(control.scaling, ScalingConfig::RequestBased { .. }));
+        assert!(matches!(
+            control.scaling,
+            ScalingConfig::RequestBased { .. }
+        ));
 
         let send = PoWConfig::send();
         assert_eq!(send.base_difficulty, 8);
@@ -882,6 +894,57 @@ mod tests {
         assert_eq!(verifier.effective_difficulty(&peer2, None), 8);
     }
 
+    #[test]
+    fn test_request_scaling_saturates_instead_of_wrapping() {
+        let config = PoWConfig {
+            base_difficulty: 1,
+            max_difficulty: 250,
+            max_age_secs: 300,
+            enabled: true,
+            scaling: ScalingConfig::RequestBased {
+                enabled: true,
+                window_secs: 60,
+                threshold: 0,
+                bits_per_request: 1,
+            },
+        };
+        let mut verifier = PoWVerifier::new(config);
+        let peer_id = test_id(9);
+
+        for _ in 0..300 {
+            verifier.record_request(&peer_id, None);
+        }
+
+        // Without saturating conversion this wrapped to a much smaller value.
+        assert_eq!(verifier.effective_difficulty(&peer_id, None), 250);
+    }
+
+    #[test]
+    fn test_byte_scaling_saturates_instead_of_wrapping() {
+        let config = PoWConfig {
+            base_difficulty: 1,
+            max_difficulty: 250,
+            max_age_secs: 300,
+            enabled: true,
+            scaling: ScalingConfig::ByteBased {
+                enabled: true,
+                window_secs: 60,
+                byte_threshold: 0,
+                bits_per_mb: 1,
+            },
+        };
+        let mut verifier = PoWVerifier::new(config);
+        let peer_id = test_id(10);
+
+        // 300 MB recorded in-window.
+        for _ in 0..300 {
+            verifier.record_request(&peer_id, Some(1024 * 1024));
+        }
+
+        // Without saturating conversion this wrapped to a much smaller value.
+        assert_eq!(verifier.effective_difficulty(&peer_id, Some(0)), 250);
+    }
+
     // === Context Builder Tests ===
 
     #[test]
@@ -904,7 +967,10 @@ mod tests {
 
     #[test]
     fn test_stats() {
-        let config = PoWConfig::for_testing();
+        let config = PoWConfig {
+            scaling: ScalingConfig::request_based_default(),
+            ..PoWConfig::for_testing()
+        };
         let mut verifier = PoWVerifier::new(config);
 
         assert_eq!(verifier.stats().tracked_peers, 0);
@@ -925,6 +991,35 @@ mod tests {
 
         // Cleanup should be a no-op
         verifier.cleanup();
+        assert_eq!(verifier.stats().tracked_peers, 0);
+    }
+
+    #[test]
+    fn test_record_request_no_scaling_does_not_track_peer() {
+        let config = PoWConfig {
+            scaling: ScalingConfig::None,
+            ..PoWConfig::for_testing()
+        };
+        let mut verifier = PoWVerifier::new(config);
+
+        verifier.record_request(&test_id(1), None);
+        assert_eq!(verifier.stats().tracked_peers, 0);
+    }
+
+    #[test]
+    fn test_record_request_byte_scaling_ignores_missing_size() {
+        let config = PoWConfig {
+            scaling: ScalingConfig::ByteBased {
+                enabled: true,
+                window_secs: 60,
+                byte_threshold: 1024,
+                bits_per_mb: 1,
+            },
+            ..PoWConfig::for_testing()
+        };
+        let mut verifier = PoWVerifier::new(config);
+
+        verifier.record_request(&test_id(2), None);
         assert_eq!(verifier.stats().tracked_peers, 0);
     }
 }

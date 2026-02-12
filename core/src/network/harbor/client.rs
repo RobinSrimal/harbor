@@ -13,26 +13,85 @@
 use std::sync::Arc;
 
 use rusqlite::Connection;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use crate::data::harbor::{
-    cache_packet, cleanup_expired, get_active_harbor_ids, get_cached_packet, get_packets_for_sync,
-    get_undelivered_recipients, mark_pulled, was_pulled,
+    WILDCARD_RECIPIENT, cache_packet, cleanup_expired, get_active_harbor_ids, get_cached_packet,
+    get_packets_for_sync, get_undelivered_recipients, mark_pulled, was_pulled,
 };
 use crate::network::dht::DhtService;
+use crate::network::packet::PacketType;
 use crate::network::process::{ProcessContext, ProcessError, ProcessScope, process_packet};
 use crate::network::stream::StreamService;
 use crate::resilience::ProofOfWork;
 use crate::security::{
-    EpochKeys, SendPacket, VerificationMode, verify_and_decrypt_dm_packet,
+    EpochKeys, PacketError, PacketId, SendPacket, VerificationMode, verify_and_decrypt_dm_packet,
     verify_and_decrypt_with_epoch,
 };
 
 use super::protocol::{
-    DeliveryAck, PacketInfo, PullRequest, PullResponse, StoreRequest, SyncRequest,
-    SyncResponse,
+    DeliveryAck, PacketInfo, PullRequest, PullResponse, StoreRequest, SyncRequest, SyncResponse,
 };
 use super::service::{HarborError, HarborService};
+
+fn validate_pulled_packet_sender(
+    claimed_sender: &[u8; 32],
+    signed_sender: &[u8; 32],
+) -> Result<(), ProcessError> {
+    if claimed_sender == signed_sender {
+        return Ok(());
+    }
+
+    Err(ProcessError::Decode(format!(
+        "pull sender mismatch: claimed {}, signed {}",
+        hex::encode(&claimed_sender[..8]),
+        hex::encode(&signed_sender[..8]),
+    )))
+}
+
+fn verify_and_decrypt_topic_for_pull(
+    send_packet: &SendPacket,
+    topic_id: &[u8; 32],
+    epoch_keys: &EpochKeys,
+) -> Result<Vec<u8>, ProcessError> {
+    match verify_and_decrypt_with_epoch(send_packet, topic_id, epoch_keys, VerificationMode::Full) {
+        Ok(plaintext) => Ok(plaintext),
+        Err(full_err) => {
+            // Only allow MacOnly fallback when Full failed due signature issues.
+            if !matches!(full_err, PacketError::InvalidSignature) {
+                return Err(ProcessError::Decode(format!(
+                    "topic decryption failed: {}",
+                    full_err
+                )));
+            }
+
+            let plaintext = verify_and_decrypt_with_epoch(
+                send_packet,
+                topic_id,
+                epoch_keys,
+                VerificationMode::MacOnly,
+            )
+            .map_err(|e| ProcessError::Decode(format!("topic decryption failed: {}", e)))?;
+
+            let packet_type = plaintext
+                .first()
+                .copied()
+                .and_then(PacketType::from_byte)
+                .ok_or_else(|| {
+                    ProcessError::Decode("topic decryption failed: unknown packet type".into())
+                })?;
+
+            if packet_type != PacketType::TopicJoin {
+                return Err(ProcessError::Decode(format!(
+                    "topic decryption failed: {}",
+                    full_err
+                )));
+            }
+
+            Ok(plaintext)
+        }
+    }
+}
 
 impl HarborService {
     // ============ Client Side ============
@@ -43,7 +102,7 @@ impl HarborService {
     /// The PoW should be computed with context: `harbor_id || packet_id`
     pub fn create_store_request(
         &self,
-        packet_id: [u8; 32],
+        packet_id: PacketId,
         harbor_id: [u8; 32],
         packet_data: Vec<u8>,
         undelivered_recipients: Vec<[u8; 32]>,
@@ -158,7 +217,7 @@ impl HarborService {
     }
 
     /// Create an acknowledgment for a packet
-    pub fn create_ack(&self, packet_id: [u8; 32]) -> DeliveryAck {
+    pub fn create_ack(&self, packet_id: PacketId) -> DeliveryAck {
         trace!(
             packet_id = %hex::encode(packet_id),
             "Harbor CLIENT: creating delivery ack"
@@ -196,6 +255,9 @@ impl HarborService {
         let send_packet = SendPacket::from_bytes(&packet_info.packet_data)
             .map_err(|e| ProcessError::Decode(format!("failed to parse SendPacket: {}", e)))?;
 
+        // Bind packet metadata sender to signed packet sender identity.
+        validate_pulled_packet_sender(&packet_info.sender_id, &send_packet.endpoint_id)?;
+
         // Decrypt based on scope
         let plaintext = match &scope {
             ProcessScope::Dm => {
@@ -231,23 +293,7 @@ impl HarborService {
                 let epoch_keys =
                     EpochKeys::derive_from_secret(send_packet.epoch, &stored_key.key_data);
 
-                // Try Full verification first (most common)
-                verify_and_decrypt_with_epoch(
-                    &send_packet,
-                    topic_id,
-                    &epoch_keys,
-                    VerificationMode::Full,
-                )
-                .or_else(|_| {
-                    // Fall back to MacOnly for TopicJoin packets
-                    verify_and_decrypt_with_epoch(
-                        &send_packet,
-                        topic_id,
-                        &epoch_keys,
-                        VerificationMode::MacOnly,
-                    )
-                })
-                .map_err(|e| ProcessError::Decode(format!("topic decryption failed: {}", e)))?
+                verify_and_decrypt_topic_for_pull(&send_packet, topic_id, &epoch_keys)?
             }
         };
 
@@ -261,7 +307,13 @@ impl HarborService {
         };
 
         // Dispatch to unified processor
-        process_packet(&plaintext, packet_info.sender_id, packet_info.created_at, &ctx).await
+        process_packet(
+            &plaintext,
+            packet_info.sender_id,
+            packet_info.created_at,
+            &ctx,
+        )
+        .await
     }
 
     // ============ Maintenance ============
@@ -269,7 +321,11 @@ impl HarborService {
     /// Get HarborIDs we're actively serving as a Harbor Node
     pub fn get_active_harbor_ids(&self, conn: &Connection) -> Result<Vec<[u8; 32]>, HarborError> {
         let ids = get_active_harbor_ids(conn).map_err(HarborError::Database)?;
-        trace!(count = ids.len(), "Harbor: found {} active HarborIDs", ids.len());
+        trace!(
+            count = ids.len(),
+            "Harbor: found {} active HarborIDs",
+            ids.len()
+        );
         Ok(ids)
     }
 
@@ -288,10 +344,9 @@ impl HarborService {
         );
 
         for harbor_id in harbor_ids {
-            let packets =
-                get_packets_for_sync(conn, &harbor_id).map_err(HarborError::Database)?;
+            let packets = get_packets_for_sync(conn, &harbor_id).map_err(HarborError::Database)?;
 
-            let have_packets: Vec<[u8; 32]> = packets.iter().map(|p| p.packet_id).collect();
+            let have_packets: Vec<PacketId> = packets.iter().map(|p| p.packet_id).collect();
             let delivery_updates = self.get_delivery_updates(conn, &harbor_id)?;
 
             trace!(
@@ -307,7 +362,7 @@ impl HarborService {
                     harbor_id,
                     have_packets,
                     delivery_updates,
-                    member_entries: vec![], // Member tracking removed for Tier 1
+                    member_entries: vec![], // Member sync disabled in current Harbor protocol.
                 },
             ));
         }
@@ -333,6 +388,8 @@ impl HarborService {
         );
 
         // Store missing packets (as synced)
+        let mut packets_stored = 0;
+        let mut packets_defaulted = 0;
         for packet in &response.missing_packets {
             // Get recipients from existing packet if we have it
             let recipients = if let Some(existing) =
@@ -341,9 +398,40 @@ impl HarborService {
                 get_undelivered_recipients(conn, &existing.packet_id)
                     .map_err(HarborError::Database)?
             } else {
-                // No existing packet - store with empty recipients
-                // (delivery tracking comes from the sender)
-                vec![]
+                // For packets we don't have locally, rebuild a safe recipient fallback.
+                // DM packets target exactly one recipient (harbor_id). Topic packets use
+                // wildcard recipient because per-recipient tracking is not in sync payload.
+                match SendPacket::from_bytes(&packet.packet_data) {
+                    Ok(parsed) => {
+                        if parsed.harbor_id != response.harbor_id {
+                            warn!(
+                                harbor_id = %harbor_hex,
+                                packet_id = %hex::encode(packet.packet_id),
+                                packet_harbor_id = %hex::encode(parsed.harbor_id),
+                                "Harbor: skipping synced packet with harbor_id mismatch"
+                            );
+                            continue;
+                        }
+                        packets_defaulted += 1;
+                        if parsed.is_dm() {
+                            vec![parsed.harbor_id]
+                        } else {
+                            vec![WILDCARD_RECIPIENT]
+                        }
+                    }
+                    Err(e) => {
+                        // Legacy/compat path: keep packet available for pull and let
+                        // downstream parse/decrypt fail if bytes are malformed.
+                        warn!(
+                            harbor_id = %harbor_hex,
+                            packet_id = %hex::encode(packet.packet_id),
+                            error = %e,
+                            "Harbor: synced packet is not a valid SendPacket; defaulting recipients to wildcard"
+                        );
+                        packets_defaulted += 1;
+                        vec![WILDCARD_RECIPIENT]
+                    }
+                }
             };
 
             trace!(
@@ -361,23 +449,30 @@ impl HarborService {
                 true, // Synced from another Harbor Node
             )
             .map_err(HarborError::Database)?;
+            packets_stored += 1;
         }
 
         // Apply delivery updates
         let mut updates_applied = 0;
         for update in &response.delivery_updates {
             for recipient in &update.delivered_to {
-                let _ = crate::data::harbor::mark_delivered(conn, &update.packet_id, recipient);
-                updates_applied += 1;
+                if crate::data::harbor::mark_delivered(conn, &update.packet_id, recipient)
+                    .map_err(HarborError::Database)?
+                {
+                    updates_applied += 1;
+                }
             }
         }
 
         info!(
             harbor_id = %harbor_hex,
-            packets_stored = missing_count,
+            missing_packets = missing_count,
+            packets_stored = packets_stored,
+            packets_with_default_recipients = packets_defaulted,
             deliveries_marked = updates_applied,
-            "Harbor: applied sync response - stored {} packets, marked {} deliveries",
-            missing_count,
+            "Harbor: applied sync response - stored {} packets ({} defaulted), marked {} deliveries",
+            packets_stored,
+            packets_defaulted,
             updates_applied
         );
 
@@ -402,10 +497,7 @@ impl HarborService {
     ///
     /// Returns cached nodes from the harbor_nodes_cache table.
     /// The cache is populated by the background discovery task.
-    pub fn find_harbor_nodes(
-        conn: &rusqlite::Connection,
-        harbor_id: &[u8; 32],
-    ) -> Vec<[u8; 32]> {
+    pub fn find_harbor_nodes(conn: &rusqlite::Connection, harbor_id: &[u8; 32]) -> Vec<[u8; 32]> {
         crate::data::harbor::get_cached_harbor_nodes(conn, harbor_id).unwrap_or_default()
     }
 
@@ -444,12 +536,17 @@ impl HarborService {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::protocol::DeliveryUpdate;
+    use super::*;
     use crate::data::dht::current_timestamp;
-    use crate::data::harbor::{cache_packet, get_cached_packet, mark_delivered};
+    use crate::data::harbor::{
+        cache_packet, get_cached_packet, get_packets_for_recipient, mark_delivered,
+    };
     use crate::data::schema::{create_harbor_table, create_peer_table};
+    use crate::network::packet::PacketType;
     use crate::resilience::ProofOfWork;
+    use crate::security::create_key_pair::generate_key_pair;
+    use crate::security::send::packet::{PacketBuilder, create_dm_packet, generate_packet_id};
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -461,6 +558,10 @@ mod tests {
 
     fn test_id(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    fn test_packet_id(seed: u8) -> PacketId {
+        [seed; 16]
     }
 
     /// Create a dummy PoW for tests (difficulty 0 = always passes)
@@ -477,14 +578,14 @@ mod tests {
         let service = HarborService::without_rate_limiting(test_id(1));
 
         let request = service.create_store_request(
-            test_id(10),
+            test_packet_id(10),
             test_id(20),
             b"packet data".to_vec(),
             vec![test_id(40), test_id(41)],
             test_pow(),
         );
 
-        assert_eq!(request.packet_id, test_id(10));
+        assert_eq!(request.packet_id, test_packet_id(10));
         assert_eq!(request.harbor_id, test_id(20));
         assert_eq!(request.sender_id, test_id(1));
         assert_eq!(request.recipients.len(), 2);
@@ -514,7 +615,7 @@ mod tests {
         let response = PullResponse {
             harbor_id: test_id(20),
             packets: vec![PacketInfo {
-                packet_id: test_id(10),
+                packet_id: test_packet_id(10),
                 sender_id: test_id(30),
                 packet_data: b"packet".to_vec(),
                 created_at: current_timestamp(),
@@ -527,15 +628,15 @@ mod tests {
         assert_eq!(packets.len(), 1);
 
         // Should be marked as pulled
-        assert!(was_pulled(&conn, &topic_id, &test_id(10)).unwrap());
+        assert!(was_pulled(&conn, &topic_id, &test_packet_id(10)).unwrap());
     }
 
     #[test]
     fn test_create_ack() {
         let service = HarborService::without_rate_limiting(test_id(1));
-        let ack = service.create_ack(test_id(10));
+        let ack = service.create_ack(test_packet_id(10));
 
-        assert_eq!(ack.packet_id, test_id(10));
+        assert_eq!(ack.packet_id, test_packet_id(10));
         assert_eq!(ack.recipient_id, test_id(1));
     }
 
@@ -556,7 +657,7 @@ mod tests {
         // Store packets for two different harbor_ids
         cache_packet(
             &mut conn,
-            &test_id(10),
+            &test_packet_id(10),
             &test_id(20), // harbor_id 1
             &test_id(30),
             b"packet 1",
@@ -567,7 +668,7 @@ mod tests {
 
         cache_packet(
             &mut conn,
-            &test_id(11),
+            &test_packet_id(11),
             &test_id(21), // harbor_id 2
             &test_id(31),
             b"packet 2",
@@ -606,7 +707,7 @@ mod tests {
         let response = SyncResponse {
             harbor_id: test_id(20),
             missing_packets: vec![PacketInfo {
-                packet_id: test_id(10),
+                packet_id: test_packet_id(10),
                 sender_id: test_id(30),
                 packet_data: b"synced packet".to_vec(),
                 created_at: current_timestamp(),
@@ -618,7 +719,7 @@ mod tests {
         service.apply_sync_response(&mut conn, response).unwrap();
 
         // Packet should now be cached
-        let cached = get_cached_packet(&conn, &test_id(10)).unwrap();
+        let cached = get_cached_packet(&conn, &test_packet_id(10)).unwrap();
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().packet_data, b"synced packet");
     }
@@ -631,7 +732,7 @@ mod tests {
         // First store a packet
         cache_packet(
             &mut conn,
-            &test_id(10),
+            &test_packet_id(10),
             &test_id(20),
             &test_id(30),
             b"packet",
@@ -645,7 +746,7 @@ mod tests {
             harbor_id: test_id(20),
             missing_packets: vec![],
             delivery_updates: vec![DeliveryUpdate {
-                packet_id: test_id(10),
+                packet_id: test_packet_id(10),
                 delivered_to: vec![test_id(40)],
             }],
             members: vec![],
@@ -654,7 +755,7 @@ mod tests {
         service.apply_sync_response(&mut conn, response).unwrap();
 
         // Delivery should be marked
-        let undelivered = get_undelivered_recipients(&conn, &test_id(10)).unwrap();
+        let undelivered = get_undelivered_recipients(&conn, &test_packet_id(10)).unwrap();
         assert_eq!(undelivered.len(), 1);
         assert_eq!(undelivered[0], test_id(41));
     }
@@ -672,7 +773,7 @@ mod tests {
         // Node 1 has packet A
         cache_packet(
             &mut conn1,
-            &test_id(10),
+            &test_packet_id(10),
             &harbor_id,
             &test_id(30),
             b"packet A",
@@ -684,7 +785,7 @@ mod tests {
         // Node 2 has packet B
         cache_packet(
             &mut conn2,
-            &test_id(11),
+            &test_packet_id(11),
             &harbor_id,
             &test_id(31),
             b"packet B",
@@ -705,14 +806,22 @@ mod tests {
 
         // Response should include packet B (which node 1 doesn't have)
         assert_eq!(response.missing_packets.len(), 1);
-        assert_eq!(response.missing_packets[0].packet_id, test_id(11));
+        assert_eq!(response.missing_packets[0].packet_id, test_packet_id(11));
 
         // Node 1 applies the response
         service1.apply_sync_response(&mut conn1, response).unwrap();
 
         // Node 1 should now have both packets
-        assert!(get_cached_packet(&conn1, &test_id(10)).unwrap().is_some());
-        assert!(get_cached_packet(&conn1, &test_id(11)).unwrap().is_some());
+        assert!(
+            get_cached_packet(&conn1, &test_packet_id(10))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            get_cached_packet(&conn1, &test_packet_id(11))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -733,7 +842,7 @@ mod tests {
         // Store a packet and mark partial delivery
         cache_packet(
             &mut conn,
-            &test_id(10),
+            &test_packet_id(10),
             &test_id(20),
             &test_id(30),
             b"packet data",
@@ -742,7 +851,7 @@ mod tests {
         )
         .unwrap();
 
-        mark_delivered(&conn, &test_id(10), &test_id(40)).unwrap();
+        mark_delivered(&conn, &test_packet_id(10), &test_id(40)).unwrap();
 
         // Create sync requests - should include delivery updates
         let requests = service.create_sync_requests(&conn).unwrap();
@@ -750,9 +859,98 @@ mod tests {
 
         let (_, sync_request) = &requests[0];
         assert_eq!(sync_request.delivery_updates.len(), 1);
-        assert_eq!(sync_request.delivery_updates[0].packet_id, test_id(10));
-        assert!(sync_request.delivery_updates[0]
-            .delivered_to
-            .contains(&test_id(40)));
+        assert_eq!(
+            sync_request.delivery_updates[0].packet_id,
+            test_packet_id(10)
+        );
+        assert!(
+            sync_request.delivery_updates[0]
+                .delivered_to
+                .contains(&test_id(40))
+        );
+    }
+
+    #[test]
+    fn test_validate_pulled_packet_sender_rejects_mismatch() {
+        let err = validate_pulled_packet_sender(&test_id(1), &test_id(2)).unwrap_err();
+        assert!(err.to_string().contains("sender mismatch"));
+    }
+
+    #[test]
+    fn test_verify_and_decrypt_topic_for_pull_allows_topic_join_mac_only_fallback() {
+        let topic_id = test_id(90);
+        let keypair = generate_key_pair();
+
+        let packet = PacketBuilder::new(topic_id, keypair.private_key, keypair.public_key)
+            .build(&[PacketType::TopicJoin.as_byte()], generate_packet_id())
+            .unwrap();
+
+        let mut tampered = packet.clone();
+        tampered.signature = [0u8; 64];
+
+        let epoch_keys = EpochKeys::derive_from_topic(&topic_id, tampered.epoch);
+        let plaintext =
+            verify_and_decrypt_topic_for_pull(&tampered, &topic_id, &epoch_keys).unwrap();
+        assert_eq!(plaintext[0], PacketType::TopicJoin.as_byte());
+    }
+
+    #[test]
+    fn test_verify_and_decrypt_topic_for_pull_rejects_non_join_mac_only_fallback() {
+        let topic_id = test_id(91);
+        let keypair = generate_key_pair();
+
+        let packet = PacketBuilder::new(topic_id, keypair.private_key, keypair.public_key)
+            .build(
+                &[PacketType::TopicContent.as_byte(), 1, 2, 3],
+                generate_packet_id(),
+            )
+            .unwrap();
+
+        let mut tampered = packet.clone();
+        tampered.signature = [0u8; 64];
+
+        let epoch_keys = EpochKeys::derive_from_topic(&topic_id, tampered.epoch);
+        let err = verify_and_decrypt_topic_for_pull(&tampered, &topic_id, &epoch_keys).unwrap_err();
+        assert!(err.to_string().contains("signature"));
+    }
+
+    #[test]
+    fn test_apply_sync_response_new_dm_packet_defaults_recipient_to_harbor_id() {
+        let mut conn = setup_db();
+        let service = HarborService::without_rate_limiting(test_id(1));
+
+        let sender = generate_key_pair();
+        let recipient = generate_key_pair();
+        let dm_packet = create_dm_packet(
+            &sender.private_key,
+            &sender.public_key,
+            &recipient.public_key,
+            b"synced dm",
+            test_packet_id(77),
+        )
+        .unwrap();
+
+        let response = SyncResponse {
+            harbor_id: recipient.public_key,
+            missing_packets: vec![PacketInfo {
+                packet_id: dm_packet.packet_id,
+                sender_id: sender.public_key,
+                packet_data: dm_packet.to_bytes().unwrap(),
+                created_at: current_timestamp(),
+            }],
+            delivery_updates: vec![],
+            members: vec![],
+        };
+
+        service.apply_sync_response(&mut conn, response).unwrap();
+
+        let visible_to_recipient =
+            get_packets_for_recipient(&conn, &recipient.public_key, &recipient.public_key, 0)
+                .unwrap();
+        assert_eq!(visible_to_recipient.len(), 1);
+
+        let visible_to_other =
+            get_packets_for_recipient(&conn, &recipient.public_key, &test_id(200), 0).unwrap();
+        assert!(visible_to_other.is_empty());
     }
 }

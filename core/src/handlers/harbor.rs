@@ -9,8 +9,8 @@
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tracing::{debug, trace, warn};
 
-use crate::network::harbor::protocol::HarborMessage;
 use crate::network::harbor::HarborService;
+use crate::network::harbor::protocol::HarborMessage;
 use crate::protocol::ProtocolError;
 
 impl ProtocolHandler for HarborService {
@@ -25,7 +25,13 @@ impl ProtocolHandler for HarborService {
 
 /// Send a response message on the connection
 async fn send_response(conn: &iroh::endpoint::Connection, msg: &HarborMessage) {
-    let bytes = msg.encode();
+    let bytes = match msg.try_encode() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            debug!(error = %e, "failed to encode Harbor response");
+            return;
+        }
+    };
     if let Ok(mut send) = conn.open_uni().await {
         if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut send, &bytes).await {
             debug!(error = %e, "failed to send Harbor response");
@@ -82,14 +88,17 @@ impl HarborService {
                 }
             };
 
-            trace!("decoded HarborMessage: {:?}", std::mem::discriminant(&message));
+            trace!(
+                "decoded HarborMessage: {:?}",
+                std::mem::discriminant(&message)
+            );
 
             // Dispatch to handlers
             let db = self.db();
             match message {
                 HarborMessage::Store(req) => {
                     let mut db_lock = db.lock().await;
-                    match self.handle_store(&mut db_lock, req) {
+                    match self.handle_store_authenticated(&mut db_lock, req, &sender_id) {
                         Ok(resp) => {
                             send_response(&conn, &HarborMessage::StoreResponse(resp)).await;
                         }

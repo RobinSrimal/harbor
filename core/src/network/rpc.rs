@@ -45,10 +45,7 @@ impl irpc::rpc::RemoteConnection for ExistingConnection {
     fn open_bi(
         &self,
     ) -> n0_future::future::Boxed<
-        Result<
-            (iroh::endpoint::SendStream, iroh::endpoint::RecvStream),
-            irpc::RequestError,
-        >,
+        Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), irpc::RequestError>,
     > {
         let conn = self.0.clone();
         Box::pin(async move {

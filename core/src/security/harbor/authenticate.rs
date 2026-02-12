@@ -117,6 +117,23 @@ mod tests {
             .count();
 
         // Most bytes should differ (good avalanche property)
-        assert!(diff_count >= 16, "Poor avalanche effect: only {} bytes differ", diff_count);
+        assert!(
+            diff_count >= 16,
+            "Poor avalanche effect: only {} bytes differ",
+            diff_count
+        );
+    }
+
+    #[test]
+    fn test_create_mac_known_vector() {
+        let key: [u8; 32] = [0x42; 32];
+        let message = b"Hello, Harbor!";
+        let mac = create_mac(&key, message);
+
+        let expected: [u8; 32] = [
+            215, 185, 236, 58, 34, 72, 111, 183, 18, 89, 179, 10, 192, 248, 26, 19, 89, 95, 235,
+            68, 127, 212, 118, 253, 184, 5, 114, 206, 61, 177, 207, 125,
+        ];
+        assert_eq!(mac.as_bytes(), &expected);
     }
 }

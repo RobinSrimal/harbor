@@ -11,6 +11,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::data::dht::{current_timestamp, ensure_peer_exists};
+use crate::security::PacketId;
 
 /// Maximum lifetime for cached packets (3 months in seconds)
 pub const PACKET_LIFETIME_SECS: i64 = 90 * 24 * 60 * 60;
@@ -22,7 +23,7 @@ pub const PACKET_LIFETIME_SECS: i64 = 90 * 24 * 60 * 60;
 #[derive(Debug, Clone)]
 pub struct CachedPacket {
     /// Unique packet identifier
-    pub packet_id: [u8; 32],
+    pub packet_id: PacketId,
     /// HarborID this packet belongs to
     pub harbor_id: [u8; 32],
     /// Sender's EndpointID
@@ -37,18 +38,12 @@ pub struct CachedPacket {
     pub expires_at: i64,
 }
 
-/// Parse a 32-byte ID from a database blob
-fn parse_id(vec: &[u8], column_name: &str) -> rusqlite::Result<[u8; 32]> {
-    if vec.len() != 32 {
-        return Err(rusqlite::Error::InvalidColumnType(
-            0,
-            column_name.to_string(),
-            rusqlite::types::Type::Blob,
-        ));
-    }
-    let mut id = [0u8; 32];
-    id.copy_from_slice(vec);
-    Ok(id)
+fn invalid_column_type(
+    index: usize,
+    column_name: &str,
+    ty: rusqlite::types::Type,
+) -> rusqlite::Error {
+    rusqlite::Error::InvalidColumnType(index, column_name.to_string(), ty)
 }
 
 /// Parse a CachedPacket from a database row
@@ -57,9 +52,9 @@ fn parse_cached_packet_row(row: &rusqlite::Row) -> rusqlite::Result<CachedPacket
     let harbor_id_vec: Vec<u8> = row.get(1)?;
     let sender_id_vec: Vec<u8> = row.get(2)?;
 
-    let packet_id = parse_id(&packet_id_vec, "packet_id")?;
-    let harbor_id = parse_id(&harbor_id_vec, "harbor_id")?;
-    let sender_id = parse_id(&sender_id_vec, "sender_id")?;
+    let packet_id = parse_packet_id_with_index(&packet_id_vec, 0, "packet_id")?;
+    let harbor_id = parse_id_with_index(&harbor_id_vec, 1, "harbor_id")?;
+    let sender_id = parse_id_with_index(&sender_id_vec, 2, "sender_id")?;
 
     Ok(CachedPacket {
         packet_id,
@@ -72,6 +67,36 @@ fn parse_cached_packet_row(row: &rusqlite::Row) -> rusqlite::Result<CachedPacket
     })
 }
 
+fn parse_id_with_index(vec: &[u8], index: usize, column_name: &str) -> rusqlite::Result<[u8; 32]> {
+    if vec.len() != 32 {
+        return Err(invalid_column_type(
+            index,
+            column_name,
+            rusqlite::types::Type::Blob,
+        ));
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(vec);
+    Ok(id)
+}
+
+fn parse_packet_id_with_index(
+    vec: &[u8],
+    index: usize,
+    column_name: &str,
+) -> rusqlite::Result<PacketId> {
+    if vec.len() != 16 {
+        return Err(invalid_column_type(
+            index,
+            column_name,
+            rusqlite::types::Type::Blob,
+        ));
+    }
+    let mut id: PacketId = [0u8; 16];
+    id.copy_from_slice(vec);
+    Ok(id)
+}
+
 /// Store a packet in the harbor cache
 ///
 /// Called when:
@@ -82,14 +107,23 @@ fn parse_cached_packet_row(row: &rusqlite::Row) -> rusqlite::Result<CachedPacket
 /// Harbor stores opaque encrypted bytes - no packet type needed.
 pub fn cache_packet(
     conn: &mut Connection,
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
     harbor_id: &[u8; 32],
     sender_id: &[u8; 32],
     packet_data: &[u8],
     recipients: &[[u8; 32]],
     synced: bool,
 ) -> rusqlite::Result<()> {
-    cache_packet_with_ttl(conn, packet_id, harbor_id, sender_id, packet_data, recipients, synced, None)
+    cache_packet_with_ttl(
+        conn,
+        packet_id,
+        harbor_id,
+        sender_id,
+        packet_data,
+        recipients,
+        synced,
+        None,
+    )
 }
 
 /// Store a packet in the harbor cache with an optional custom TTL
@@ -98,7 +132,7 @@ pub fn cache_packet(
 /// Harbor stores opaque encrypted bytes - no packet type needed.
 pub fn cache_packet_with_ttl(
     conn: &mut Connection,
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
     harbor_id: &[u8; 32],
     sender_id: &[u8; 32],
     packet_data: &[u8],
@@ -107,7 +141,15 @@ pub fn cache_packet_with_ttl(
     ttl_secs: Option<i64>,
 ) -> rusqlite::Result<()> {
     let now = current_timestamp();
-    let expires_at = now + ttl_secs.unwrap_or(PACKET_LIFETIME_SECS);
+    let ttl = ttl_secs.unwrap_or(PACKET_LIFETIME_SECS);
+    if ttl < 0 {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "ttl_secs must be non-negative".to_string(),
+        ));
+    }
+    let expires_at = now
+        .checked_add(ttl)
+        .ok_or_else(|| rusqlite::Error::InvalidParameterName("ttl_secs overflow".to_string()))?;
 
     let tx = conn.transaction()?;
 
@@ -144,7 +186,7 @@ pub fn cache_packet_with_ttl(
 /// Get a cached packet by ID
 pub fn get_cached_packet(
     conn: &Connection,
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
 ) -> rusqlite::Result<Option<CachedPacket>> {
     conn.query_row(
         "SELECT c.packet_id, c.harbor_id, p.endpoint_id, c.packet_data, c.synced, c.created_at, c.expires_at
@@ -195,7 +237,13 @@ pub fn get_packets_for_recipient(
     let now = current_timestamp();
     let packets = stmt
         .query_map(
-            params![harbor_id.as_slice(), recipient_id.as_slice(), since_timestamp, now, WILDCARD_RECIPIENT.as_slice()],
+            params![
+                harbor_id.as_slice(),
+                recipient_id.as_slice(),
+                since_timestamp,
+                now,
+                WILDCARD_RECIPIENT.as_slice()
+            ],
             parse_cached_packet_row,
         )?
         .collect::<Result<Vec<_>, _>>()?;
@@ -206,23 +254,24 @@ pub fn get_packets_for_recipient(
 /// Mark a packet as delivered to a recipient
 pub fn mark_delivered(
     conn: &Connection,
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
     recipient_id: &[u8; 32],
 ) -> rusqlite::Result<bool> {
     let rows = conn.execute(
         "UPDATE harbor_recipients SET delivered = 1, delivered_at = ?1
          WHERE packet_id = ?2
            AND peer_id = (SELECT id FROM peers WHERE endpoint_id = ?3)",
-        params![current_timestamp(), packet_id.as_slice(), recipient_id.as_slice()],
+        params![
+            current_timestamp(),
+            packet_id.as_slice(),
+            recipient_id.as_slice()
+        ],
     )?;
     Ok(rows > 0)
 }
 
 /// Check if all recipients have received a packet
-pub fn all_recipients_delivered(
-    conn: &Connection,
-    packet_id: &[u8; 32],
-) -> rusqlite::Result<bool> {
+pub fn all_recipients_delivered(conn: &Connection, packet_id: &PacketId) -> rusqlite::Result<bool> {
     let undelivered: i64 = conn.query_row(
         "SELECT COUNT(*) FROM harbor_recipients 
          WHERE packet_id = ?1 AND delivered = 0",
@@ -235,7 +284,7 @@ pub fn all_recipients_delivered(
 /// Get undelivered recipient IDs for a packet
 pub fn get_undelivered_recipients(
     conn: &Connection,
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
 ) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut stmt = conn.prepare(
         "SELECT p.endpoint_id
@@ -247,7 +296,7 @@ pub fn get_undelivered_recipients(
     let recipients = stmt
         .query_map([packet_id.as_slice()], |row| {
             let id_vec: Vec<u8> = row.get(0)?;
-            parse_id(&id_vec, "recipient_id")
+            parse_id_with_index(&id_vec, 0, "recipient_id")
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -259,7 +308,7 @@ pub fn get_undelivered_recipients(
 /// Used for sync protocol - share delivery status with other Harbor Nodes.
 pub fn get_delivered_recipients(
     conn: &Connection,
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
 ) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut stmt = conn.prepare(
         "SELECT p.endpoint_id
@@ -271,7 +320,7 @@ pub fn get_delivered_recipients(
     let recipients = stmt
         .query_map([packet_id.as_slice()], |row| {
             let id_vec: Vec<u8> = row.get(0)?;
-            parse_id(&id_vec, "recipient_id")
+            parse_id_with_index(&id_vec, 0, "recipient_id")
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -314,7 +363,7 @@ pub fn get_active_harbor_ids(conn: &Connection) -> rusqlite::Result<Vec<[u8; 32]
     let ids = stmt
         .query_map([now], |row| {
             let id_vec: Vec<u8> = row.get(0)?;
-            parse_id(&id_vec, "harbor_id")
+            parse_id_with_index(&id_vec, 0, "harbor_id")
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -337,11 +386,8 @@ pub fn get_harbor_cache_stats(conn: &Connection) -> rusqlite::Result<(u32, u64)>
 /// Recipients are automatically deleted via CASCADE foreign key.
 pub fn cleanup_expired(conn: &Connection) -> rusqlite::Result<usize> {
     let now = current_timestamp();
-    
-    let rows = conn.execute(
-        "DELETE FROM harbor_cache WHERE expires_at <= ?1",
-        [now],
-    )?;
+
+    let rows = conn.execute("DELETE FROM harbor_cache WHERE expires_at <= ?1", [now])?;
 
     Ok(rows)
 }
@@ -349,7 +395,7 @@ pub fn cleanup_expired(conn: &Connection) -> rusqlite::Result<usize> {
 /// Delete a fully delivered packet
 ///
 /// Recipients are automatically deleted via CASCADE foreign key.
-pub fn delete_packet(conn: &Connection, packet_id: &[u8; 32]) -> rusqlite::Result<bool> {
+pub fn delete_packet(conn: &Connection, packet_id: &PacketId) -> rusqlite::Result<bool> {
     let rows = conn.execute(
         "DELETE FROM harbor_cache WHERE packet_id = ?1",
         [packet_id.as_slice()],
@@ -364,12 +410,16 @@ pub fn delete_packet(conn: &Connection, packet_id: &[u8; 32]) -> rusqlite::Resul
 pub fn mark_pulled(
     conn: &Connection,
     topic_id: &[u8; 32],
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
 ) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO pulled_packets (topic_id, packet_id, pulled_at)
          VALUES (?1, ?2, ?3)",
-        params![topic_id.as_slice(), packet_id.as_slice(), current_timestamp()],
+        params![
+            topic_id.as_slice(),
+            packet_id.as_slice(),
+            current_timestamp()
+        ],
     )?;
     Ok(())
 }
@@ -378,7 +428,7 @@ pub fn mark_pulled(
 pub fn was_pulled(
     conn: &Connection,
     topic_id: &[u8; 32],
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
 ) -> rusqlite::Result<bool> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pulled_packets 
@@ -393,15 +443,13 @@ pub fn was_pulled(
 pub fn get_pulled_packet_ids(
     conn: &Connection,
     topic_id: &[u8; 32],
-) -> rusqlite::Result<Vec<[u8; 32]>> {
-    let mut stmt = conn.prepare(
-        "SELECT packet_id FROM pulled_packets WHERE topic_id = ?1",
-    )?;
+) -> rusqlite::Result<Vec<PacketId>> {
+    let mut stmt = conn.prepare("SELECT packet_id FROM pulled_packets WHERE topic_id = ?1")?;
 
     let ids = stmt
         .query_map([topic_id.as_slice()], |row| {
             let id_vec: Vec<u8> = row.get(0)?;
-            parse_id(&id_vec, "packet_id")
+            parse_packet_id_with_index(&id_vec, 0, "packet_id")
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -424,10 +472,7 @@ pub fn cleanup_pulled_for_topic(conn: &Connection, topic_id: &[u8; 32]) -> rusql
 /// the harbor packets are deleted, so we can clean up the tracking records.
 pub fn cleanup_old_pulled_packets(conn: &Connection) -> rusqlite::Result<usize> {
     let cutoff = current_timestamp() - PACKET_LIFETIME_SECS;
-    let rows = conn.execute(
-        "DELETE FROM pulled_packets WHERE pulled_at < ?1",
-        [cutoff],
-    )?;
+    let rows = conn.execute("DELETE FROM pulled_packets WHERE pulled_at < ?1", [cutoff])?;
     Ok(rows)
 }
 
@@ -448,10 +493,14 @@ mod tests {
         [seed; 32]
     }
 
+    fn test_packet_id(seed: u8) -> PacketId {
+        [seed; 16]
+    }
+
     #[test]
     fn test_cache_packet() {
         let mut conn = setup_db();
-        let packet_id = test_id(1);
+        let packet_id = test_packet_id(1);
         let harbor_id = test_id(2);
         let sender_id = test_id(3);
         let recipients = [test_id(10), test_id(11)];
@@ -484,7 +533,7 @@ mod tests {
         // Cache 2 packets
         cache_packet(
             &mut conn,
-            &test_id(1),
+            &test_packet_id(1),
             &harbor_id,
             &test_id(3),
             b"packet 1",
@@ -495,7 +544,7 @@ mod tests {
 
         cache_packet(
             &mut conn,
-            &test_id(2),
+            &test_packet_id(2),
             &harbor_id,
             &test_id(4),
             b"packet 2",
@@ -511,7 +560,7 @@ mod tests {
     #[test]
     fn test_mark_delivered() {
         let mut conn = setup_db();
-        let packet_id = test_id(1);
+        let packet_id = test_packet_id(1);
         let recipient = test_id(10);
 
         cache_packet(
@@ -536,7 +585,7 @@ mod tests {
     #[test]
     fn test_get_undelivered_recipients() {
         let mut conn = setup_db();
-        let packet_id = test_id(1);
+        let packet_id = test_packet_id(1);
         let recipients = [test_id(10), test_id(11), test_id(12)];
 
         cache_packet(
@@ -561,7 +610,7 @@ mod tests {
     #[test]
     fn test_get_delivered_recipients() {
         let mut conn = setup_db();
-        let packet_id = test_id(1);
+        let packet_id = test_packet_id(1);
         let recipients = [test_id(10), test_id(11), test_id(12)];
 
         cache_packet(
@@ -597,7 +646,7 @@ mod tests {
         // Original packet
         cache_packet(
             &mut conn,
-            &test_id(1),
+            &test_packet_id(1),
             &test_id(100),
             &test_id(3),
             b"data",
@@ -609,7 +658,7 @@ mod tests {
         // Synced packet (different harbor_id)
         cache_packet(
             &mut conn,
-            &test_id(2),
+            &test_packet_id(2),
             &test_id(200),
             &test_id(4),
             b"data",
@@ -626,7 +675,7 @@ mod tests {
     #[test]
     fn test_delete_packet() {
         let mut conn = setup_db();
-        let packet_id = test_id(1);
+        let packet_id = test_packet_id(1);
 
         cache_packet(
             &mut conn,
@@ -649,7 +698,7 @@ mod tests {
     fn test_mark_pulled() {
         let conn = setup_db();
         let topic_id = test_id(1);
-        let packet_id = test_id(2);
+        let packet_id = test_packet_id(2);
 
         assert!(!was_pulled(&conn, &topic_id, &packet_id).unwrap());
 
@@ -662,9 +711,9 @@ mod tests {
         let conn = setup_db();
         let topic_id = test_id(1);
 
-        mark_pulled(&conn, &topic_id, &test_id(10)).unwrap();
-        mark_pulled(&conn, &topic_id, &test_id(11)).unwrap();
-        mark_pulled(&conn, &topic_id, &test_id(12)).unwrap();
+        mark_pulled(&conn, &topic_id, &test_packet_id(10)).unwrap();
+        mark_pulled(&conn, &topic_id, &test_packet_id(11)).unwrap();
+        mark_pulled(&conn, &topic_id, &test_packet_id(12)).unwrap();
 
         let ids = get_pulled_packet_ids(&conn, &topic_id).unwrap();
         assert_eq!(ids.len(), 3);
@@ -679,7 +728,7 @@ mod tests {
 
         cache_packet(
             &mut conn,
-            &test_id(1),
+            &test_packet_id(1),
             &harbor_id,
             &test_id(3),
             b"old packet",
@@ -705,7 +754,7 @@ mod tests {
         // Store as original
         cache_packet(
             &mut conn,
-            &test_id(1),
+            &test_packet_id(1),
             &harbor_id,
             &test_id(3),
             b"original",
@@ -717,7 +766,7 @@ mod tests {
         // Store as synced
         cache_packet(
             &mut conn,
-            &test_id(2),
+            &test_packet_id(2),
             &harbor_id,
             &test_id(4),
             b"synced",
@@ -726,8 +775,12 @@ mod tests {
         )
         .unwrap();
 
-        let original = get_cached_packet(&conn, &test_id(1)).unwrap().unwrap();
-        let synced = get_cached_packet(&conn, &test_id(2)).unwrap().unwrap();
+        let original = get_cached_packet(&conn, &test_packet_id(1))
+            .unwrap()
+            .unwrap();
+        let synced = get_cached_packet(&conn, &test_packet_id(2))
+            .unwrap()
+            .unwrap();
 
         assert!(!original.synced);
         assert!(synced.synced);
@@ -736,7 +789,7 @@ mod tests {
     #[test]
     fn test_cascade_delete_recipients() {
         let mut conn = setup_db();
-        let packet_id = test_id(1);
+        let packet_id = test_packet_id(1);
         let recipients = [test_id(10), test_id(11)];
 
         cache_packet(
@@ -767,9 +820,9 @@ mod tests {
         let conn = setup_db();
         let topic1 = test_id(1);
         let topic2 = test_id(2);
-        let packet1 = test_id(10);
-        let packet2 = test_id(11);
-        let packet3 = test_id(12);
+        let packet1 = test_packet_id(10);
+        let packet2 = test_packet_id(11);
+        let packet3 = test_packet_id(12);
 
         // Mark some packets as pulled for two topics
         mark_pulled(&conn, &topic1, &packet1).unwrap();
@@ -795,7 +848,7 @@ mod tests {
     fn test_cleanup_old_pulled_packets() {
         let conn = setup_db();
         let topic = test_id(1);
-        let packet = test_id(10);
+        let packet = test_packet_id(10);
 
         // Mark a packet as pulled
         mark_pulled(&conn, &topic, &packet).unwrap();
@@ -807,12 +860,13 @@ mod tests {
         assert!(was_pulled(&conn, &topic, &packet).unwrap());
 
         // Manually insert an old pulled packet (older than PACKET_LIFETIME_SECS)
-        let old_packet = test_id(11);
+        let old_packet = test_packet_id(11);
         let old_timestamp = current_timestamp() - PACKET_LIFETIME_SECS - 1000;
         conn.execute(
             "INSERT INTO pulled_packets (topic_id, packet_id, pulled_at) VALUES (?1, ?2, ?3)",
             params![topic.as_slice(), old_packet.as_slice(), old_timestamp],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify it was inserted
         assert!(was_pulled(&conn, &topic, &old_packet).unwrap());
@@ -824,5 +878,39 @@ mod tests {
         // Recent packet should remain, old one gone
         assert!(was_pulled(&conn, &topic, &packet).unwrap());
         assert!(!was_pulled(&conn, &topic, &old_packet).unwrap());
+    }
+
+    #[test]
+    fn test_cache_packet_with_ttl_rejects_negative_ttl() {
+        let mut conn = setup_db();
+        let packet_id = test_packet_id(21);
+        let result = cache_packet_with_ttl(
+            &mut conn,
+            &packet_id,
+            &test_id(2),
+            &test_id(3),
+            b"data",
+            &[test_id(10)],
+            false,
+            Some(-1),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cache_packet_with_ttl_rejects_overflow() {
+        let mut conn = setup_db();
+        let packet_id = test_packet_id(22);
+        let result = cache_packet_with_ttl(
+            &mut conn,
+            &packet_id,
+            &test_id(2),
+            &test_id(3),
+            b"data",
+            &[test_id(10)],
+            false,
+            Some(i64::MAX),
+        );
+        assert!(result.is_err());
     }
 }

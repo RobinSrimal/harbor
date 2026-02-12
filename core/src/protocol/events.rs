@@ -47,7 +47,6 @@ pub enum ProtocolEvent {
     // =========================================================================
     // Control events
     // =========================================================================
-
     /// A peer wants to connect with us
     ConnectionRequest(ConnectionRequestEvent),
     /// Our connection request was accepted
@@ -172,6 +171,8 @@ pub struct StreamRequestEvent {
     pub topic_id: Option<[u8; 32]>,
     /// The peer requesting to stream
     pub peer_id: [u8; 32],
+    /// Logical broadcast grouping ID (shared across recipients)
+    pub broadcast_id: [u8; 32],
     /// Unique identifier for this stream request
     pub request_id: [u8; 32],
     /// Human-readable stream name
@@ -183,6 +184,8 @@ pub struct StreamRequestEvent {
 /// Event: Our stream request was accepted by the destination
 #[derive(Debug, Clone)]
 pub struct StreamAcceptedEvent {
+    /// Logical broadcast grouping ID (shared across recipients)
+    pub broadcast_id: [u8; 32],
     /// The request that was accepted
     pub request_id: [u8; 32],
 }
@@ -190,6 +193,8 @@ pub struct StreamAcceptedEvent {
 /// Event: Our stream request was rejected by the destination
 #[derive(Debug, Clone)]
 pub struct StreamRejectedEvent {
+    /// Logical broadcast grouping ID (shared across recipients)
+    pub broadcast_id: [u8; 32],
     /// The request that was rejected
     pub request_id: [u8; 32],
     /// Optional reason for rejection
@@ -199,6 +204,8 @@ pub struct StreamRejectedEvent {
 /// Event: An active stream has ended
 #[derive(Debug, Clone)]
 pub struct StreamEndedEvent {
+    /// Logical broadcast grouping ID (shared across recipients)
+    pub broadcast_id: Option<[u8; 32]>,
     /// The stream that ended
     pub request_id: [u8; 32],
     /// The peer whose stream ended
@@ -211,6 +218,8 @@ pub struct StreamEndedEvent {
 /// The app can now call `publish_to_stream()` or `consume_stream()`.
 #[derive(Debug, Clone)]
 pub struct StreamConnectedEvent {
+    /// Logical broadcast grouping ID (shared across recipients)
+    pub broadcast_id: [u8; 32],
     /// The stream request this session belongs to
     pub request_id: [u8; 32],
     /// The topic this stream is scoped to (None for DM streams)
@@ -476,4 +485,3 @@ mod tests {
         assert!(matches!(file_event, ProtocolEvent::FileAnnounced(_)));
     }
 }
-

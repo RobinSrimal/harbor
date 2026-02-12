@@ -22,9 +22,10 @@ use crate::data::LocalIdentity;
 use crate::network::connect::Connector;
 use crate::network::dht::DhtService;
 use crate::protocol::ProtocolEvent;
+use crate::resilience::{PoWConfig, PoWResult, PoWVerifier, build_context};
 use crate::resilience::{RateLimitConfig, RateLimiter};
 use crate::resilience::{StorageConfig, StorageManager};
-use crate::resilience::{PoWConfig, PoWResult, PoWVerifier, build_context};
+use crate::security::PacketId;
 
 /// Harbor Node service
 ///
@@ -151,22 +152,30 @@ impl HarborService {
 
     /// Get the identity
     pub fn identity(&self) -> &LocalIdentity {
-        self.identity.as_ref().expect("HarborService: identity not set (test-only instance?)")
+        self.identity
+            .as_ref()
+            .expect("HarborService: identity not set (test-only instance?)")
     }
 
     /// Get the database
     pub fn db(&self) -> &Arc<TokioMutex<DbConnection>> {
-        self.db.as_ref().expect("HarborService: db not set (test-only instance?)")
+        self.db
+            .as_ref()
+            .expect("HarborService: db not set (test-only instance?)")
     }
 
     /// Get the event sender
     pub fn event_tx(&self) -> &mpsc::Sender<ProtocolEvent> {
-        self.event_tx.as_ref().expect("HarborService: event_tx not set (test-only instance?)")
+        self.event_tx
+            .as_ref()
+            .expect("HarborService: event_tx not set (test-only instance?)")
     }
 
     /// Get the connector
     pub fn connector(&self) -> &Arc<Connector> {
-        self.connector.as_ref().expect("HarborService: connector not set (test-only instance?)")
+        self.connector
+            .as_ref()
+            .expect("HarborService: connector not set (test-only instance?)")
     }
 
     /// Get the endpoint
@@ -204,15 +213,18 @@ impl HarborService {
         &self,
         pow: &crate::resilience::ProofOfWork,
         harbor_id: &[u8; 32],
-        packet_id: &[u8; 32],
+        packet_id: &PacketId,
         sender_id: &[u8; 32],
         packet_size: u64,
     ) -> Result<(), HarborError> {
         let context = build_context(&[harbor_id, packet_id]);
-        let verifier = self.pow_verifier.lock().unwrap();
+        let mut verifier = lock_pow_verifier(&self.pow_verifier);
 
         match verifier.verify(pow, &context, sender_id, Some(packet_size)) {
-            PoWResult::Allowed => Ok(()),
+            PoWResult::Allowed => {
+                verifier.record_request(sender_id, Some(packet_size));
+                Ok(())
+            }
             PoWResult::InsufficientDifficulty { required, .. } => {
                 Err(HarborError::InsufficientPoW { required })
             }
@@ -220,18 +232,17 @@ impl HarborService {
                 // Treat expired PoW as insufficient - require recomputation
                 // Get current required difficulty for the hint
                 let required = verifier.effective_difficulty(sender_id, Some(packet_size));
-                tracing::warn!(
-                    max_age_secs = max_age_secs,
-                    "Harbor: PoW expired"
-                );
-                Err(HarborError::InsufficientPoW { required })
-            }
-            PoWResult::InvalidContext => {
-                // Context mismatch - PoW was computed for different data
-                let required = verifier.effective_difficulty(sender_id, Some(packet_size));
+                tracing::warn!(max_age_secs = max_age_secs, "Harbor: PoW expired");
                 Err(HarborError::InsufficientPoW { required })
             }
         }
+    }
+}
+
+fn lock_pow_verifier(pow_verifier: &Mutex<PoWVerifier>) -> std::sync::MutexGuard<'_, PoWVerifier> {
+    match pow_verifier.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -336,6 +347,10 @@ mod tests {
         [seed; 32]
     }
 
+    fn test_packet_id(seed: u8) -> PacketId {
+        [seed; 16]
+    }
+
     /// Create a dummy PoW for tests (difficulty 0 = always passes)
     fn test_pow() -> ProofOfWork {
         ProofOfWork {
@@ -412,7 +427,7 @@ mod tests {
         // First 2 requests should succeed
         for i in 0..2 {
             let request = StoreRequest {
-                packet_id: test_id(100 + i),
+                packet_id: test_packet_id(100 + i),
                 harbor_id,
                 sender_id: sender_keypair.public_key,
                 packet_data: packet_bytes.clone(),
@@ -425,7 +440,7 @@ mod tests {
 
         // Third request should be rate limited
         let request = StoreRequest {
-            packet_id: test_id(102),
+            packet_id: test_packet_id(102),
             harbor_id,
             sender_id: sender_keypair.public_key,
             packet_data: packet_bytes,
@@ -458,7 +473,7 @@ mod tests {
         // Many requests should all succeed when rate limiting is disabled
         for i in 0..100 {
             let request = StoreRequest {
-                packet_id: test_id(100 + i),
+                packet_id: test_packet_id(100 + i),
                 harbor_id,
                 sender_id: sender_keypair.public_key,
                 packet_data: packet_bytes.clone(),
@@ -475,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn test_storage_limits_block_when_full() {
+    fn test_storage_limits_evict_when_full() {
         use crate::resilience::StorageConfig;
 
         let mut conn = setup_db();
@@ -497,7 +512,7 @@ mod tests {
 
         // Set limit to allow exactly 1 packet but not 2
         let storage_config = StorageConfig {
-            max_total_bytes: packet_size + 10, // Just enough for 1 packet
+            max_total_bytes: packet_size + 10,      // Just enough for 1 packet
             max_per_harbor_bytes: packet_size * 10, // High so total limit hits first
             enabled: true,
         };
@@ -527,7 +542,7 @@ mod tests {
             response.error
         );
 
-        // Second request should fail - storage full
+        // Second request should succeed after evicting older cached packet(s).
         // Need a new packet with different packet_id
         let packet2 = PacketBuilder::new(
             topic_id,
@@ -547,15 +562,21 @@ mod tests {
             pow: test_pow(),
         };
         let result = service.handle_store(&mut conn, request2);
+        let response = result.expect("Second request should not error");
         assert!(
-            matches!(result, Err(HarborError::StorageFull { .. })),
-            "Second request should fail with StorageFull, got: {:?}",
-            result
+            response.success,
+            "Second store should succeed after eviction: {:?}",
+            response.error
         );
+
+        let cached_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM harbor_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached_count, 1, "eviction should keep cache within quota");
     }
 
     #[test]
-    fn test_storage_per_harbor_limit() {
+    fn test_storage_per_harbor_limit_evicts_oldest() {
         use crate::resilience::StorageConfig;
 
         let mut conn = setup_db();
@@ -607,7 +628,7 @@ mod tests {
             response.error
         );
 
-        // Second request to same harbor should fail - per-harbor quota exceeded
+        // Second request to same harbor should succeed by evicting oldest in that harbor.
         let packet2 = PacketBuilder::new(
             topic_id,
             sender_keypair.private_key,
@@ -626,10 +647,23 @@ mod tests {
             pow: test_pow(),
         };
         let result = service.handle_store(&mut conn, request2);
+        let response = result.expect("Second request should not error");
         assert!(
-            matches!(result, Err(HarborError::HarborQuotaExceeded { .. })),
-            "Second request should fail with HarborQuotaExceeded, got: {:?}",
-            result
+            response.success,
+            "Second same-harbor store should succeed after eviction: {:?}",
+            response.error
+        );
+
+        let same_harbor_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM harbor_cache WHERE harbor_id = ?1",
+                [harbor_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            same_harbor_count, 1,
+            "per-harbor eviction should keep only bounded packets per harbor"
         );
 
         // Request to DIFFERENT harbor should succeed (different quota)
@@ -662,6 +696,53 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_limits_still_reject_when_packet_cannot_fit() {
+        use crate::resilience::StorageConfig;
+
+        let mut conn = setup_db();
+
+        let sender_keypair = generate_key_pair();
+        let topic_id = test_id(20);
+        let packet = PacketBuilder::new(
+            topic_id,
+            sender_keypair.private_key,
+            sender_keypair.public_key,
+        )
+        .build(b"test message", generate_packet_id())
+        .unwrap();
+        let packet_bytes = packet.to_bytes().unwrap();
+        let packet_size = packet_bytes.len() as u64;
+        let harbor_id = harbor_id_from_topic(&topic_id);
+
+        let service = HarborService::with_full_config(
+            test_id(1),
+            RateLimitConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            StorageConfig {
+                max_total_bytes: packet_size.saturating_sub(1),
+                max_per_harbor_bytes: packet_size * 10,
+                enabled: true,
+            },
+        );
+
+        let request = StoreRequest {
+            packet_id: packet.packet_id,
+            harbor_id,
+            sender_id: sender_keypair.public_key,
+            packet_data: packet_bytes,
+            recipients: vec![test_id(40)],
+            pow: test_pow(),
+        };
+        let result = service.handle_store(&mut conn, request);
+        assert!(
+            matches!(result, Err(HarborError::StorageFull { .. })),
+            "request larger than total quota should still be rejected"
+        );
+    }
+
+    #[test]
     fn test_storage_disabled() {
         let mut conn = setup_db();
         let service = HarborService::without_rate_limiting(test_id(1));
@@ -686,7 +767,7 @@ mod tests {
         // Many requests should all succeed when storage limits are disabled
         for i in 0..10 {
             let request = StoreRequest {
-                packet_id: test_id(100 + i),
+                packet_id: test_packet_id(100 + i),
                 harbor_id,
                 sender_id: sender_keypair.public_key,
                 packet_data: packet_bytes.clone(),
@@ -752,5 +833,21 @@ mod tests {
         let harbor_id = [123u8; 32];
         let target = DhtId::new(harbor_id);
         assert_eq!(*target.as_bytes(), harbor_id);
+    }
+
+    #[test]
+    fn test_lock_pow_verifier_recovers_from_poison() {
+        let pow_verifier = Arc::new(Mutex::new(PoWVerifier::new(PoWConfig::harbor())));
+        let poisoned_ref = pow_verifier.clone();
+
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned_ref.lock().unwrap();
+            panic!("poison test mutex");
+        })
+        .join();
+
+        let sender_id = test_id(9);
+        let mut guard = lock_pow_verifier(pow_verifier.as_ref());
+        guard.record_request(&sender_id, Some(128));
     }
 }

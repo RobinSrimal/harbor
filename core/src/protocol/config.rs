@@ -11,79 +11,79 @@ pub struct ProtocolConfig {
     /// Path to the database file
     /// If None, uses a default path in the user's data directory
     pub db_path: Option<PathBuf>,
-    
+
     /// Path to blob storage directory
     /// If None, uses .harbor_blobs/ next to the database
     pub blob_path: Option<PathBuf>,
-    
+
     /// Database encryption key (32 bytes)
     /// Required — Protocol::start() will return an error if not set.
     pub db_key: Option<[u8; 32]>,
-    
+
     /// Bootstrap nodes for DHT (EndpointIDs as hex strings)
     pub bootstrap_nodes: Vec<String>,
-    
+
     /// Maximum storage for Harbor cache (bytes)
     /// Default: 10GB
     pub max_storage_bytes: u64,
-    
+
     /// How often to sync with other Harbor Nodes (seconds)
     /// This is Harbor-to-Harbor sync for redundancy.
     /// Default: 300 (5 minutes)
     pub harbor_sync_interval_secs: u64,
-    
+
     /// Number of closest Harbor Nodes to consider for sync
     /// Default: 5
     pub harbor_sync_candidates: usize,
-    
+
     /// How often to pull from Harbor Nodes (seconds)
     /// Default: 60 (1 minute)
     pub harbor_pull_interval_secs: u64,
-    
+
     /// How often to check for packets needing replication (seconds)
     /// Default: 30
     pub replication_check_interval_secs: u64,
-    
+
     /// Number of Harbor Nodes to replicate each packet to
     /// Default: 3
     pub replication_factor: usize,
-    
+
     /// Maximum number of Harbor Nodes to try when replicating
     /// Default: 6 (replication_factor * 2)
     pub max_replication_attempts: usize,
-    
+
     /// Maximum number of Harbor Nodes to pull from
     /// Default: 5
     pub harbor_pull_max_nodes: usize,
-    
+
     /// Stop pulling early after this many consecutive empty responses
     /// Default: 2
     pub harbor_pull_early_stop: usize,
-    
+
     /// Timeout for connecting to Harbor Nodes (seconds)
     /// Default: 5
     pub harbor_connect_timeout_secs: u64,
-    
+
     /// Timeout for Harbor Node responses (seconds)
     /// Default: 30
     pub harbor_response_timeout_secs: u64,
-    
+
     /// Delay before DHT bootstrap (seconds)
     /// Default: 5
     pub dht_bootstrap_delay_secs: u64,
-    
+
     /// DHT refresh interval during initial phase (seconds)
     /// Default: 10
     pub dht_initial_refresh_interval_secs: u64,
-    
+
     /// DHT refresh interval once stable (seconds)
     /// Default: 120
     pub dht_stable_refresh_interval_secs: u64,
-    
+
     /// DHT routing table save interval (seconds)
     /// Default: 60
     pub dht_save_interval_secs: u64,
-    
+
     /// Cleanup interval for expired data (seconds)
     /// Default: 3600 (1 hour)
     pub cleanup_interval_secs: u64,
@@ -120,20 +120,38 @@ impl fmt::Debug for ProtocolConfig {
             .field("harbor_sync_interval_secs", &self.harbor_sync_interval_secs)
             .field("harbor_sync_candidates", &self.harbor_sync_candidates)
             .field("harbor_pull_interval_secs", &self.harbor_pull_interval_secs)
-            .field("replication_check_interval_secs", &self.replication_check_interval_secs)
+            .field(
+                "replication_check_interval_secs",
+                &self.replication_check_interval_secs,
+            )
             .field("replication_factor", &self.replication_factor)
             .field("max_replication_attempts", &self.max_replication_attempts)
             .field("harbor_pull_max_nodes", &self.harbor_pull_max_nodes)
             .field("harbor_pull_early_stop", &self.harbor_pull_early_stop)
-            .field("harbor_connect_timeout_secs", &self.harbor_connect_timeout_secs)
-            .field("harbor_response_timeout_secs", &self.harbor_response_timeout_secs)
+            .field(
+                "harbor_connect_timeout_secs",
+                &self.harbor_connect_timeout_secs,
+            )
+            .field(
+                "harbor_response_timeout_secs",
+                &self.harbor_response_timeout_secs,
+            )
             .field("dht_bootstrap_delay_secs", &self.dht_bootstrap_delay_secs)
-            .field("dht_initial_refresh_interval_secs", &self.dht_initial_refresh_interval_secs)
-            .field("dht_stable_refresh_interval_secs", &self.dht_stable_refresh_interval_secs)
+            .field(
+                "dht_initial_refresh_interval_secs",
+                &self.dht_initial_refresh_interval_secs,
+            )
+            .field(
+                "dht_stable_refresh_interval_secs",
+                &self.dht_stable_refresh_interval_secs,
+            )
             .field("dht_save_interval_secs", &self.dht_save_interval_secs)
             .field("cleanup_interval_secs", &self.cleanup_interval_secs)
             .field("share_pull_interval_secs", &self.share_pull_interval_secs)
-            .field("harbor_node_refresh_interval_secs", &self.harbor_node_refresh_interval_secs)
+            .field(
+                "harbor_node_refresh_interval_secs",
+                &self.harbor_node_refresh_interval_secs,
+            )
             .field("harbor_pow", &self.harbor_pow)
             .field("control_pow", &self.control_pow)
             .field("dht_pow", &self.dht_pow)
@@ -153,7 +171,7 @@ impl Default for ProtocolConfig {
                 "6bcf661fb9f503d534f732686163c3fd739f7aa10354966a06177cb5a7a6d103".to_string(),
             ],
             max_storage_bytes: 10 * 1024 * 1024 * 1024, // 10 GB
-            harbor_sync_interval_secs: 300, // 5 minutes
+            harbor_sync_interval_secs: 300,             // 5 minutes
             harbor_sync_candidates: 5,
             harbor_pull_interval_secs: 60,
             replication_check_interval_secs: 30,
@@ -246,22 +264,22 @@ impl ProtocolConfig {
             db_key: None,
             bootstrap_nodes: vec![],
             max_storage_bytes: 10 * 1024 * 1024, // 10 MB
-            harbor_sync_interval_secs: 5,    // Faster for testing
-            harbor_sync_candidates: 8,       // Store on more nodes
-            harbor_pull_interval_secs: 3,    // Faster pulls
+            harbor_sync_interval_secs: 5,        // Faster for testing
+            harbor_sync_candidates: 8,           // Store on more nodes
+            harbor_pull_interval_secs: 3,        // Faster pulls
             replication_check_interval_secs: 5,
-            replication_factor: 5,           // Higher for testing reliability
-            max_replication_attempts: 10,    // Try more nodes
-            harbor_pull_max_nodes: 12,       // Pull from more nodes
-            harbor_pull_early_stop: 10,      // Much more thorough
-            harbor_connect_timeout_secs: 5,  // Same as default
+            replication_factor: 5,            // Higher for testing reliability
+            max_replication_attempts: 10,     // Try more nodes
+            harbor_pull_max_nodes: 12,        // Pull from more nodes
+            harbor_pull_early_stop: 10,       // Much more thorough
+            harbor_connect_timeout_secs: 5,   // Same as default
             harbor_response_timeout_secs: 30, // Same as default
-            dht_bootstrap_delay_secs: 5,     // Same as default
+            dht_bootstrap_delay_secs: 5,      // Same as default
             dht_initial_refresh_interval_secs: 10, // Same as default
             dht_stable_refresh_interval_secs: 120, // Same as default
-            dht_save_interval_secs: 60,      // Same as default
-            cleanup_interval_secs: 3600,     // Same as default
-            share_pull_interval_secs: 10,    // Faster for testing
+            dht_save_interval_secs: 60,       // Same as default
+            cleanup_interval_secs: 3600,      // Same as default
+            share_pull_interval_secs: 10,     // Faster for testing
             harbor_node_refresh_interval_secs: 30, // Faster for testing
             harbor_pow: PoWConfig::for_testing(),
             control_pow: PoWConfig::for_testing(),
@@ -269,79 +287,79 @@ impl ProtocolConfig {
             send_pow: PoWConfig::for_testing(),
         }
     }
-    
+
     /// Set replication check interval
     pub fn with_replication_check_interval(mut self, secs: u64) -> Self {
         self.replication_check_interval_secs = secs;
         self
     }
-    
+
     /// Set replication factor (number of Harbor nodes to replicate to)
     pub fn with_replication_factor(mut self, factor: usize) -> Self {
         self.replication_factor = factor;
         self
     }
-    
+
     /// Set max replication attempts (max nodes to try when replicating)
     pub fn with_max_replication_attempts(mut self, attempts: usize) -> Self {
         self.max_replication_attempts = attempts;
         self
     }
-    
+
     /// Set max Harbor nodes to pull from
     pub fn with_harbor_pull_max_nodes(mut self, count: usize) -> Self {
         self.harbor_pull_max_nodes = count;
         self
     }
-    
+
     /// Set early stop threshold for Harbor pull
     pub fn with_harbor_pull_early_stop(mut self, count: usize) -> Self {
         self.harbor_pull_early_stop = count;
         self
     }
-    
+
     /// Set Harbor connect timeout
     pub fn with_harbor_connect_timeout(mut self, secs: u64) -> Self {
         self.harbor_connect_timeout_secs = secs;
         self
     }
-    
+
     /// Set Harbor response timeout
     pub fn with_harbor_response_timeout(mut self, secs: u64) -> Self {
         self.harbor_response_timeout_secs = secs;
         self
     }
-    
+
     /// Set DHT bootstrap delay
     pub fn with_dht_bootstrap_delay(mut self, secs: u64) -> Self {
         self.dht_bootstrap_delay_secs = secs;
         self
     }
-    
+
     /// Set DHT initial refresh interval
     pub fn with_dht_initial_refresh_interval(mut self, secs: u64) -> Self {
         self.dht_initial_refresh_interval_secs = secs;
         self
     }
-    
+
     /// Set DHT stable refresh interval
     pub fn with_dht_stable_refresh_interval(mut self, secs: u64) -> Self {
         self.dht_stable_refresh_interval_secs = secs;
         self
     }
-    
+
     /// Set DHT save interval
     pub fn with_dht_save_interval(mut self, secs: u64) -> Self {
         self.dht_save_interval_secs = secs;
         self
     }
-    
+
     /// Set cleanup interval
     pub fn with_cleanup_interval(mut self, secs: u64) -> Self {
         self.cleanup_interval_secs = secs;
         self
     }
-    
+
     /// Set share pull retry interval
     pub fn with_share_pull_interval(mut self, secs: u64) -> Self {
         self.share_pull_interval_secs = secs;
@@ -430,7 +448,7 @@ mod tests {
     fn test_with_db_path() {
         let path = PathBuf::from("/tmp/test.db");
         let config = ProtocolConfig::new().with_db_path(path.clone());
-        
+
         assert_eq!(config.db_path, Some(path));
     }
 
@@ -438,7 +456,7 @@ mod tests {
     fn test_with_db_key() {
         let key = [42u8; 32];
         let config = ProtocolConfig::new().with_db_key(key);
-        
+
         assert_eq!(config.db_key, Some(key));
     }
 
@@ -447,7 +465,7 @@ mod tests {
         let config = ProtocolConfig::new()
             .with_bootstrap_node("first".to_string())
             .with_bootstrap_nodes(vec!["a".to_string(), "b".to_string()]);
-        
+
         // with_bootstrap_nodes replaces, so "first" should be gone
         assert_eq!(config.bootstrap_nodes.len(), 2);
         assert!(!config.bootstrap_nodes.contains(&"first".to_string()));
@@ -456,9 +474,8 @@ mod tests {
 
     #[test]
     fn test_with_bootstrap_node_adds() {
-        let config = ProtocolConfig::new()
-            .with_bootstrap_node("extra".to_string());
-        
+        let config = ProtocolConfig::new().with_bootstrap_node("extra".to_string());
+
         // Should have default + extra
         assert!(config.bootstrap_nodes.len() >= 2);
         assert!(config.bootstrap_nodes.contains(&"extra".to_string()));
@@ -499,9 +516,9 @@ mod tests {
         let config1 = ProtocolConfig::new()
             .with_max_storage(1234)
             .with_bootstrap_node("test".to_string());
-        
+
         let config2 = config1.clone();
-        
+
         assert_eq!(config1.max_storage_bytes, config2.max_storage_bytes);
         assert_eq!(config1.bootstrap_nodes, config2.bootstrap_nodes);
     }
@@ -510,7 +527,7 @@ mod tests {
     fn test_debug_redacts_db_key() {
         let config = ProtocolConfig::new().with_db_key([0xABu8; 32]);
         let debug_output = format!("{:?}", config);
-        
+
         // Should contain REDACTED, not the actual key bytes
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains("171")); // 0xAB = 171, should not appear
@@ -522,7 +539,7 @@ mod tests {
     fn test_debug_shows_none_for_missing_key() {
         let config = ProtocolConfig::new();
         let debug_output = format!("{:?}", config);
-        
+
         // When db_key is None, should show None not REDACTED
         assert!(debug_output.contains("db_key: None"));
     }
@@ -565,4 +582,3 @@ mod tests {
         assert_eq!(config.harbor_pull_interval_secs, 30);
     }
 }
-

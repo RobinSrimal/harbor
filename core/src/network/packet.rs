@@ -13,7 +13,7 @@
 //! Harbor stores opaque encrypted bytes. Recipients derive decryption key
 //! from the harbor_id they're pulling from, then read plaintext[0] for PacketType.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 // =============================================================================
 // PacketType - Unified type classification
@@ -318,10 +318,10 @@ impl PacketType {
             Self::Suggest => true,
 
             // Internal handling only
-            Self::TopicCanSeed => false,     // Updates seeder records internally
-            Self::TopicJoin => false,        // Updates membership internally
-            Self::TopicLeave => false,       // Updates membership internally
-            Self::RemoveMember => false,     // Updates epoch key internally
+            Self::TopicCanSeed => false, // Updates seeder records internally
+            Self::TopicJoin => false,    // Updates membership internally
+            Self::TopicLeave => false,   // Updates membership internally
+            Self::RemoveMember => false, // Updates epoch key internally
         }
     }
 }
@@ -394,6 +394,8 @@ pub struct SyncUpdateMessage {
 /// Live stream request message (topic-scoped, broadcast)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamRequestMessage {
+    /// Correlates per-peer request IDs that belong to one logical broadcast
+    pub broadcast_id: [u8; 32],
     /// Unique stream session ID
     pub request_id: [u8; 32],
     /// Stream name (e.g., "camera", "screen")
@@ -406,6 +408,8 @@ pub struct StreamRequestMessage {
 /// DM stream request message (point-to-point)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DmStreamRequestMessage {
+    /// Correlates per-peer request IDs that belong to one logical broadcast
+    pub broadcast_id: [u8; 32],
     /// Unique request ID
     pub request_id: [u8; 32],
     /// Stream name (e.g., "camera", "screen")
@@ -524,30 +528,30 @@ impl TopicMessage {
             return Err(DecodeError::Empty);
         }
 
-        let packet_type = PacketType::from_byte(bytes[0])
-            .ok_or(DecodeError::UnknownType(bytes[0]))?;
+        let payload = &bytes[1..];
+        let packet_type =
+            PacketType::from_byte(bytes[0]).ok_or(DecodeError::UnknownType(bytes[0]))?;
 
         match packet_type {
-            PacketType::TopicContent => Ok(TopicMessage::Content(bytes[1..].to_vec())),
+            PacketType::TopicContent => Ok(TopicMessage::Content(payload.to_vec())),
             PacketType::TopicFileAnnounce => {
-                let msg: FileAnnouncementMessage = postcard::from_bytes(&bytes[1..])
-                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                let msg: FileAnnouncementMessage = decode_structured_payload(payload)?;
                 Ok(TopicMessage::FileAnnouncement(msg))
             }
             PacketType::TopicCanSeed => {
-                let msg: CanSeedMessage = postcard::from_bytes(&bytes[1..])
-                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                let msg: CanSeedMessage = decode_structured_payload(payload)?;
                 Ok(TopicMessage::CanSeed(msg))
             }
             PacketType::TopicSyncUpdate => {
-                let msg: SyncUpdateMessage = postcard::from_bytes(&bytes[1..])
-                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                let msg: SyncUpdateMessage = decode_structured_payload(payload)?;
                 Ok(TopicMessage::SyncUpdate(msg))
             }
-            PacketType::TopicSyncRequest => Ok(TopicMessage::SyncRequest),
+            PacketType::TopicSyncRequest => {
+                ensure_empty_payload(payload)?;
+                Ok(TopicMessage::SyncRequest)
+            }
             PacketType::TopicStreamRequest => {
-                let msg: StreamRequestMessage = postcard::from_bytes(&bytes[1..])
-                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                let msg: StreamRequestMessage = decode_structured_payload(payload)?;
                 Ok(TopicMessage::StreamRequest(msg))
             }
             _ => Err(DecodeError::UnknownType(bytes[0])),
@@ -645,25 +649,26 @@ impl DmMessage {
             return Err(DecodeError::Empty);
         }
 
-        let packet_type = PacketType::from_byte(bytes[0])
-            .ok_or(DecodeError::UnknownType(bytes[0]))?;
+        let payload = &bytes[1..];
+        let packet_type =
+            PacketType::from_byte(bytes[0]).ok_or(DecodeError::UnknownType(bytes[0]))?;
 
         match packet_type {
-            PacketType::DmContent => Ok(DmMessage::Content(bytes[1..].to_vec())),
+            PacketType::DmContent => Ok(DmMessage::Content(payload.to_vec())),
             PacketType::DmFileAnnounce => {
-                let msg: FileAnnouncementMessage = postcard::from_bytes(&bytes[1..])
-                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                let msg: FileAnnouncementMessage = decode_structured_payload(payload)?;
                 Ok(DmMessage::FileAnnouncement(msg))
             }
             PacketType::DmSyncUpdate => {
-                let msg: SyncUpdateMessage = postcard::from_bytes(&bytes[1..])
-                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                let msg: SyncUpdateMessage = decode_structured_payload(payload)?;
                 Ok(DmMessage::SyncUpdate(msg))
             }
-            PacketType::DmSyncRequest => Ok(DmMessage::SyncRequest),
+            PacketType::DmSyncRequest => {
+                ensure_empty_payload(payload)?;
+                Ok(DmMessage::SyncRequest)
+            }
             PacketType::DmStreamRequest => {
-                let msg: DmStreamRequestMessage = postcard::from_bytes(&bytes[1..])
-                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                let msg: DmStreamRequestMessage = decode_structured_payload(payload)?;
                 Ok(DmMessage::StreamRequest(msg))
             }
             _ => Err(DecodeError::UnknownType(bytes[0])),
@@ -749,33 +754,29 @@ impl StreamSignalingMessage {
             return Err(DecodeError::Empty);
         }
 
-        let packet_type = PacketType::from_byte(bytes[0])
-            .ok_or(DecodeError::UnknownType(bytes[0]))?;
+        let payload = &bytes[1..];
+        let packet_type =
+            PacketType::from_byte(bytes[0]).ok_or(DecodeError::UnknownType(bytes[0]))?;
 
         match packet_type {
             PacketType::StreamAccept => {
-                let msg: StreamAcceptMessage = postcard::from_bytes(&bytes[1..])
-                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                let msg: StreamAcceptMessage = decode_structured_payload(payload)?;
                 Ok(StreamSignalingMessage::Accept(msg))
             }
             PacketType::StreamReject => {
-                let msg: StreamRejectMessage = postcard::from_bytes(&bytes[1..])
-                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                let msg: StreamRejectMessage = decode_structured_payload(payload)?;
                 Ok(StreamSignalingMessage::Reject(msg))
             }
             PacketType::StreamQuery => {
-                let msg: StreamQueryMessage = postcard::from_bytes(&bytes[1..])
-                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                let msg: StreamQueryMessage = decode_structured_payload(payload)?;
                 Ok(StreamSignalingMessage::Query(msg))
             }
             PacketType::StreamActive => {
-                let msg: StreamActiveMessage = postcard::from_bytes(&bytes[1..])
-                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                let msg: StreamActiveMessage = decode_structured_payload(payload)?;
                 Ok(StreamSignalingMessage::Active(msg))
             }
             PacketType::StreamEnded => {
-                let msg: StreamEndedMessage = postcard::from_bytes(&bytes[1..])
-                    .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+                let msg: StreamEndedMessage = decode_structured_payload(payload)?;
                 Ok(StreamSignalingMessage::Ended(msg))
             }
             _ => Err(DecodeError::UnknownType(bytes[0])),
@@ -805,6 +806,10 @@ pub enum DecodeError {
     Empty,
     /// Unknown message type
     UnknownType(u8),
+    /// Payload had unexpected trailing bytes
+    TrailingBytes(usize),
+    /// Request type had unexpected payload bytes
+    UnexpectedPayload(usize),
     /// Invalid payload data
     InvalidPayload(String),
 }
@@ -814,6 +819,8 @@ impl std::fmt::Display for DecodeError {
         match self {
             DecodeError::Empty => write!(f, "empty payload"),
             DecodeError::UnknownType(t) => write!(f, "unknown message type: {:#x}", t),
+            DecodeError::TrailingBytes(n) => write!(f, "payload has trailing bytes: {}", n),
+            DecodeError::UnexpectedPayload(n) => write!(f, "unexpected payload bytes: {}", n),
             DecodeError::InvalidPayload(e) => write!(f, "invalid payload: {}", e),
         }
     }
@@ -825,14 +832,52 @@ impl std::error::Error for DecodeError {}
 // Helper Functions
 // =============================================================================
 
+fn decode_structured_payload<T>(payload: &[u8]) -> Result<T, DecodeError>
+where
+    T: DeserializeOwned,
+{
+    let (msg, rest) = postcard::take_from_bytes::<T>(payload)
+        .map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
+    if !rest.is_empty() {
+        return Err(DecodeError::TrailingBytes(rest.len()));
+    }
+    Ok(msg)
+}
+
+fn ensure_empty_payload(payload: &[u8]) -> Result<(), DecodeError> {
+    if payload.is_empty() {
+        Ok(())
+    } else {
+        Err(DecodeError::UnexpectedPayload(payload.len()))
+    }
+}
+
 /// Check if a type byte is in the DM range (0x40-0x4F)
 pub fn is_dm_message_type(type_byte: u8) -> bool {
-    type_byte >= 0x40 && type_byte < 0x50
+    matches!(
+        PacketType::from_byte(type_byte),
+        Some(
+            PacketType::DmContent
+                | PacketType::DmFileAnnounce
+                | PacketType::DmSyncUpdate
+                | PacketType::DmSyncRequest
+                | PacketType::DmStreamRequest
+        )
+    )
 }
 
 /// Check if a type byte is in the stream signaling range (0x50-0x5F)
 pub fn is_stream_signaling_type(type_byte: u8) -> bool {
-    type_byte >= 0x50 && type_byte < 0x60
+    matches!(
+        PacketType::from_byte(type_byte),
+        Some(
+            PacketType::StreamAccept
+                | PacketType::StreamReject
+                | PacketType::StreamQuery
+                | PacketType::StreamActive
+                | PacketType::StreamEnded
+        )
+    )
 }
 
 // =============================================================================
@@ -910,9 +955,18 @@ mod tests {
 
     #[test]
     fn test_verification_mode() {
-        assert_eq!(PacketType::TopicJoin.verification_mode(), VerificationMode::MacOnly);
-        assert_eq!(PacketType::TopicContent.verification_mode(), VerificationMode::Full);
-        assert_eq!(PacketType::TopicLeave.verification_mode(), VerificationMode::Full);
+        assert_eq!(
+            PacketType::TopicJoin.verification_mode(),
+            VerificationMode::MacOnly
+        );
+        assert_eq!(
+            PacketType::TopicContent.verification_mode(),
+            VerificationMode::Full
+        );
+        assert_eq!(
+            PacketType::TopicLeave.verification_mode(),
+            VerificationMode::Full
+        );
     }
 
     // TopicMessage tests
@@ -928,7 +982,12 @@ mod tests {
     #[test]
     fn test_topic_file_announcement_roundtrip() {
         let ann = FileAnnouncementMessage::new(
-            [1u8; 32], [2u8; 32], 1024 * 1024, 2, 2, "test_file.bin".to_string(),
+            [1u8; 32],
+            [2u8; 32],
+            1024 * 1024,
+            2,
+            2,
+            "test_file.bin".to_string(),
         );
         let original = TopicMessage::FileAnnouncement(ann);
         let encoded = original.encode();
@@ -956,6 +1015,47 @@ mod tests {
         assert_eq!(encoded, vec![0x04]);
     }
 
+    #[test]
+    fn test_topic_stream_request_roundtrip() {
+        let original = TopicMessage::StreamRequest(StreamRequestMessage {
+            broadcast_id: [9u8; 32],
+            request_id: [8u8; 32],
+            name: "camera".to_string(),
+            catalog: vec![1, 2, 3],
+        });
+        let encoded = original.encode();
+        assert_eq!(encoded[0], 0x05);
+        let decoded = TopicMessage::decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_topic_structured_decode_rejects_trailing_bytes() {
+        let original = TopicMessage::FileAnnouncement(FileAnnouncementMessage::new(
+            [1u8; 32],
+            [2u8; 32],
+            123,
+            1,
+            1,
+            "x.bin".to_string(),
+        ));
+        let mut encoded = original.encode();
+        encoded.push(0xAA);
+
+        assert!(matches!(
+            TopicMessage::decode(&encoded),
+            Err(DecodeError::TrailingBytes(1))
+        ));
+    }
+
+    #[test]
+    fn test_topic_sync_request_rejects_unexpected_payload() {
+        assert!(matches!(
+            TopicMessage::decode(&[PacketType::TopicSyncRequest.as_byte(), 0x01]),
+            Err(DecodeError::UnexpectedPayload(1))
+        ));
+    }
+
     // DmMessage tests
     #[test]
     fn test_dm_content_roundtrip() {
@@ -969,7 +1069,12 @@ mod tests {
     #[test]
     fn test_dm_file_announcement_roundtrip() {
         let original = DmMessage::FileAnnouncement(FileAnnouncementMessage::new(
-            [1u8; 32], [2u8; 32], 1024 * 1024, 2, 2, "test.bin".to_string(),
+            [1u8; 32],
+            [2u8; 32],
+            1024 * 1024,
+            2,
+            2,
+            "test.bin".to_string(),
         ));
         let encoded = original.encode();
         assert_eq!(encoded[0], 0x41);
@@ -989,6 +1094,7 @@ mod tests {
     #[test]
     fn test_dm_stream_request_roundtrip() {
         let original = DmMessage::StreamRequest(DmStreamRequestMessage {
+            broadcast_id: [4u8; 32],
             request_id: [5u8; 32],
             stream_name: "camera".to_string(),
         });
@@ -996,6 +1102,30 @@ mod tests {
         assert_eq!(encoded[0], 0x44);
         let decoded = DmMessage::decode(&encoded).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_dm_structured_decode_rejects_trailing_bytes() {
+        let original = DmMessage::StreamRequest(DmStreamRequestMessage {
+            broadcast_id: [4u8; 32],
+            request_id: [5u8; 32],
+            stream_name: "camera".to_string(),
+        });
+        let mut encoded = original.encode();
+        encoded.push(0xAB);
+
+        assert!(matches!(
+            DmMessage::decode(&encoded),
+            Err(DecodeError::TrailingBytes(1))
+        ));
+    }
+
+    #[test]
+    fn test_dm_sync_request_rejects_unexpected_payload() {
+        assert!(matches!(
+            DmMessage::decode(&[PacketType::DmSyncRequest.as_byte(), 0x01, 0x02]),
+            Err(DecodeError::UnexpectedPayload(2))
+        ));
     }
 
     // StreamSignalingMessage tests
@@ -1022,21 +1152,109 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
+    #[test]
+    fn test_stream_structured_decode_rejects_trailing_bytes() {
+        let original = StreamSignalingMessage::Accept(StreamAcceptMessage {
+            request_id: [1u8; 32],
+        });
+        let mut encoded = original.encode();
+        encoded.push(0xAC);
+
+        assert!(matches!(
+            StreamSignalingMessage::decode(&encoded),
+            Err(DecodeError::TrailingBytes(1))
+        ));
+    }
+
+    #[test]
+    fn test_packet_type_metadata_invariants() {
+        let all = [
+            PacketType::TopicContent,
+            PacketType::TopicFileAnnounce,
+            PacketType::TopicCanSeed,
+            PacketType::TopicSyncUpdate,
+            PacketType::TopicSyncRequest,
+            PacketType::TopicStreamRequest,
+            PacketType::DmContent,
+            PacketType::DmFileAnnounce,
+            PacketType::DmSyncUpdate,
+            PacketType::DmSyncRequest,
+            PacketType::DmStreamRequest,
+            PacketType::StreamAccept,
+            PacketType::StreamReject,
+            PacketType::StreamQuery,
+            PacketType::StreamActive,
+            PacketType::StreamEnded,
+            PacketType::ConnectRequest,
+            PacketType::ConnectAccept,
+            PacketType::ConnectDecline,
+            PacketType::TopicInvite,
+            PacketType::TopicJoin,
+            PacketType::TopicLeave,
+            PacketType::RemoveMember,
+            PacketType::Suggest,
+        ];
+
+        for packet_type in all {
+            match packet_type {
+                PacketType::TopicContent
+                | PacketType::TopicFileAnnounce
+                | PacketType::TopicCanSeed
+                | PacketType::TopicSyncUpdate
+                | PacketType::TopicSyncRequest
+                | PacketType::TopicStreamRequest
+                | PacketType::TopicJoin
+                | PacketType::TopicLeave => {
+                    assert_eq!(packet_type.harbor_id_source(), HarborIdSource::TopicHash);
+                    assert_eq!(
+                        packet_type.encryption_key_type(),
+                        EncryptionKeyType::TopicKey
+                    );
+                }
+                _ => {
+                    assert_eq!(packet_type.harbor_id_source(), HarborIdSource::RecipientId);
+                    assert_eq!(packet_type.encryption_key_type(), EncryptionKeyType::DmKey);
+                }
+            }
+        }
+
+        assert_eq!(
+            PacketType::TopicJoin.verification_mode(),
+            VerificationMode::MacOnly
+        );
+        for packet_type in all {
+            if packet_type != PacketType::TopicJoin {
+                assert_eq!(packet_type.verification_mode(), VerificationMode::Full);
+            }
+        }
+
+        for packet_type in [
+            PacketType::TopicCanSeed,
+            PacketType::TopicJoin,
+            PacketType::TopicLeave,
+            PacketType::RemoveMember,
+        ] {
+            assert!(!packet_type.emits_event());
+        }
+    }
+
     // Helper function tests
     #[test]
     fn test_is_dm_message_type() {
         assert!(!is_dm_message_type(0x00)); // Topic Content
         assert!(!is_dm_message_type(0x3F)); // Last topic
-        assert!(is_dm_message_type(0x40));  // DM Content
-        assert!(is_dm_message_type(0x44));  // DM StreamRequest
+        assert!(is_dm_message_type(0x40)); // DM Content
+        assert!(is_dm_message_type(0x44)); // DM StreamRequest
+        assert!(!is_dm_message_type(0x45)); // Reserved in DM range
         assert!(!is_dm_message_type(0x50)); // Stream signaling
     }
 
     #[test]
     fn test_is_stream_signaling_type() {
         assert!(!is_stream_signaling_type(0x4F)); // Last DM
-        assert!(is_stream_signaling_type(0x50));  // StreamAccept
-        assert!(is_stream_signaling_type(0x54));  // StreamEnded
+        assert!(is_stream_signaling_type(0x50)); // StreamAccept
+        assert!(is_stream_signaling_type(0x54)); // StreamEnded
+        assert!(!is_stream_signaling_type(0x55)); // Reserved in stream range
         assert!(!is_stream_signaling_type(0x60)); // Reserved
     }
 
@@ -1049,14 +1267,31 @@ mod tests {
 
     #[test]
     fn test_decode_unknown_type() {
-        assert!(matches!(TopicMessage::decode(&[0xFF]), Err(DecodeError::UnknownType(0xFF))));
-        assert!(matches!(DmMessage::decode(&[0xFF]), Err(DecodeError::UnknownType(0xFF))));
+        assert!(matches!(
+            TopicMessage::decode(&[0xFF]),
+            Err(DecodeError::UnknownType(0xFF))
+        ));
+        assert!(matches!(
+            DmMessage::decode(&[0xFF]),
+            Err(DecodeError::UnknownType(0xFF))
+        ));
     }
 
     #[test]
     fn test_decode_error_display() {
         assert_eq!(DecodeError::Empty.to_string(), "empty payload");
-        assert_eq!(DecodeError::UnknownType(0xFF).to_string(), "unknown message type: 0xff");
+        assert_eq!(
+            DecodeError::UnknownType(0xFF).to_string(),
+            "unknown message type: 0xff"
+        );
+        assert_eq!(
+            DecodeError::TrailingBytes(3).to_string(),
+            "payload has trailing bytes: 3"
+        );
+        assert_eq!(
+            DecodeError::UnexpectedPayload(2).to_string(),
+            "unexpected payload bytes: 2"
+        );
         assert_eq!(
             DecodeError::InvalidPayload("test error".to_string()).to_string(),
             "invalid payload: test error"

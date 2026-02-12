@@ -10,8 +10,8 @@
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tracing::{debug, trace};
 
-use crate::network::send::protocol::{SendRpcMessage, SendRpcProtocol};
 use crate::network::send::SendService;
+use crate::network::send::protocol::{SendRpcMessage, SendRpcProtocol};
 use crate::protocol::ProtocolError;
 
 impl ProtocolHandler for SendService {
@@ -79,21 +79,26 @@ impl SendService {
 #[cfg(test)]
 mod tests {
     use crate::network::send::protocol::Receipt;
+    use crate::security::PacketId;
 
     fn make_id(seed: u8) -> [u8; 32] {
         [seed; 32]
     }
 
+    fn make_packet_id(seed: u8) -> PacketId {
+        [seed; 16]
+    }
+
     #[test]
     fn test_receipt_creation() {
-        let receipt = Receipt::new(make_id(1), make_id(2));
-        assert_eq!(receipt.packet_id, make_id(1));
+        let receipt = Receipt::new(make_packet_id(1), make_id(2));
+        assert_eq!(receipt.packet_id, make_packet_id(1));
         assert_eq!(receipt.sender, make_id(2));
     }
 
     #[test]
     fn test_receipt_serialization() {
-        let receipt = Receipt::new(make_id(1), make_id(2));
+        let receipt = Receipt::new(make_packet_id(1), make_id(2));
         let bytes = postcard::to_allocvec(&receipt).unwrap();
         let decoded: Receipt = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, receipt);

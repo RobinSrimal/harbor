@@ -1,14 +1,13 @@
 //! Tauri app integration with Harbor Protocol
 
+use serde::Serialize;
 use std::sync::Arc;
 use tauri::State;
-use tokio::sync::{Mutex, mpsc};
-use serde::Serialize;
+use tokio::sync::{mpsc, Mutex};
 
 use harbor_core::{
-    Protocol, ProtocolConfig, TopicInvite, Target,
-    ProtocolStats, DhtBucketInfo, TopicDetails, TopicSummary,
-    ProtocolEvent,
+    DhtBucketInfo, Protocol, ProtocolConfig, ProtocolEvent, ProtocolStats, Target, TopicDetails,
+    TopicInvite, TopicSummary,
 };
 
 /// Shared protocol state
@@ -103,7 +102,7 @@ pub struct SyncResponseEventFE {
 
 // Helper module for serializing Vec<u8> as array
 mod serde_bytes_as_array {
-    use serde::{Serializer, Serialize};
+    use serde::{Serialize, Serializer};
 
     pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -162,14 +161,14 @@ fn resolve_db_key() -> [u8; 32] {
 #[tauri::command]
 async fn start_protocol(state: State<'_, AppState>) -> Result<StartResponse, String> {
     let mut protocol_guard = state.protocol.lock().await;
-    
+
     if protocol_guard.is_some() {
         return Err("Protocol already running".to_string());
     }
 
     // Bootstrap ID from bootstrap.rs
     let bootstrap_id = "1f5c436e4511ab2db15db837b827f237931bc722ede6f223c7f5d41b412c0cad";
-    
+
     let db_key = resolve_db_key();
 
     // Add bootstrap node so we can join the DHT network
@@ -183,13 +182,11 @@ async fn start_protocol(state: State<'_, AppState>) -> Result<StartResponse, Str
         println!("Using custom database path: {}", db_path);
         config = config.with_db_path(db_path.into());
     }
-    
-    let protocol = Protocol::start(config)
-        .await
-        .map_err(|e| e.to_string())?;
+
+    let protocol = Protocol::start(config).await.map_err(|e| e.to_string())?;
 
     let endpoint_id = hex::encode(protocol.endpoint_id());
-    
+
     // Print endpoint_id and compare with bootstrap
     println!();
     println!("========================================");
@@ -206,11 +203,11 @@ async fn start_protocol(state: State<'_, AppState>) -> Result<StartResponse, Str
         println!("   Identity may have changed or database was reset.");
     }
     println!("========================================");
-    
+
     // Wait a moment for relay connection, then print info
     println!("Waiting for relay connection...");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    
+
     let relay_url = protocol.relay_url().await;
     if let Some(ref relay) = relay_url {
         println!("✅ RELAY URL: {}", relay);
@@ -218,7 +215,7 @@ async fn start_protocol(state: State<'_, AppState>) -> Result<StartResponse, Str
         println!("⚠️  NO RELAY CONNECTED - cross-network may not work!");
     }
     println!("========================================");
-    
+
     // Print bootstrap configuration info
     println!();
     println!("TO USE THIS NODE AS BOOTSTRAP, UPDATE:");
@@ -235,7 +232,7 @@ async fn start_protocol(state: State<'_, AppState>) -> Result<StartResponse, Str
     println!("  ),");
     println!("========================================");
     println!();
-    
+
     // Get event receiver
     if let Some(rx) = protocol.events().await {
         let mut rx_guard = state.event_rx.lock().await;
@@ -261,11 +258,11 @@ async fn start_protocol(state: State<'_, AppState>) -> Result<StartResponse, Str
 #[tauri::command]
 async fn stop_protocol(state: State<'_, AppState>) -> Result<(), String> {
     let mut protocol_guard = state.protocol.lock().await;
-    
+
     if let Some(protocol) = protocol_guard.take() {
         protocol.stop().await;
     }
-    
+
     Ok(())
 }
 
@@ -282,10 +279,8 @@ async fn get_endpoint_id(state: State<'_, AppState>) -> Result<String, String> {
 async fn create_topic(state: State<'_, AppState>) -> Result<TopicResponse, String> {
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
-    
-    let invite = protocol.create_topic()
-        .await
-        .map_err(|e| e.to_string())?;
+
+    let invite = protocol.create_topic().await.map_err(|e| e.to_string())?;
 
     Ok(TopicResponse {
         topic_id: hex::encode(invite.topic_id),
@@ -296,17 +291,20 @@ async fn create_topic(state: State<'_, AppState>) -> Result<TopicResponse, Strin
 
 /// Join a topic using an invite
 #[tauri::command]
-async fn join_topic(state: State<'_, AppState>, invite_hex: String) -> Result<TopicResponse, String> {
+async fn join_topic(
+    state: State<'_, AppState>,
+    invite_hex: String,
+) -> Result<TopicResponse, String> {
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
-    
-    let invite = TopicInvite::from_hex(&invite_hex)
-        .map_err(|e| e.to_string())?;
+
+    let invite = TopicInvite::from_hex(&invite_hex).map_err(|e| e.to_string())?;
 
     let topic_id = invite.topic_id;
     let members = invite.members.clone();
 
-    protocol.join_topic(invite)
+    protocol
+        .join_topic(invite)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -323,8 +321,7 @@ async fn leave_topic(state: State<'_, AppState>, topic_id: String) -> Result<(),
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
 
-    let topic_bytes = hex::decode(&topic_id)
-        .map_err(|e| e.to_string())?;
+    let topic_bytes = hex::decode(&topic_id).map_err(|e| e.to_string())?;
 
     if topic_bytes.len() != 32 {
         return Err("Invalid topic ID length".to_string());
@@ -333,7 +330,8 @@ async fn leave_topic(state: State<'_, AppState>, topic_id: String) -> Result<(),
     let mut topic_arr = [0u8; 32];
     topic_arr.copy_from_slice(&topic_bytes);
 
-    protocol.leave_topic(&topic_arr)
+    protocol
+        .leave_topic(&topic_arr)
         .await
         .map_err(|e| e.to_string())
 }
@@ -347,18 +345,18 @@ async fn send_message(
 ) -> Result<(), String> {
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
-    
-    let topic_bytes = hex::decode(&topic_id)
-        .map_err(|e| e.to_string())?;
-    
+
+    let topic_bytes = hex::decode(&topic_id).map_err(|e| e.to_string())?;
+
     if topic_bytes.len() != 32 {
         return Err("Invalid topic ID length".to_string());
     }
-    
+
     let mut topic_arr = [0u8; 32];
     topic_arr.copy_from_slice(&topic_bytes);
 
-    protocol.send(harbor_core::Target::Topic(topic_arr), message.as_bytes())
+    protocol
+        .send(harbor_core::Target::Topic(topic_arr), message.as_bytes())
         .await
         .map_err(|e| e.to_string())
 }
@@ -368,10 +366,8 @@ async fn send_message(
 async fn list_topics(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
-    
-    let topics = protocol.list_topics()
-        .await
-        .map_err(|e| e.to_string())?;
+
+    let topics = protocol.list_topics().await.map_err(|e| e.to_string())?;
 
     Ok(topics.iter().map(hex::encode).collect())
 }
@@ -381,18 +377,18 @@ async fn list_topics(state: State<'_, AppState>) -> Result<Vec<String>, String> 
 async fn get_invite(state: State<'_, AppState>, topic_id: String) -> Result<String, String> {
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
-    
-    let topic_bytes = hex::decode(&topic_id)
-        .map_err(|e| e.to_string())?;
-    
+
+    let topic_bytes = hex::decode(&topic_id).map_err(|e| e.to_string())?;
+
     if topic_bytes.len() != 32 {
         return Err("Invalid topic ID length".to_string());
     }
-    
+
     let mut topic_arr = [0u8; 32];
     topic_arr.copy_from_slice(&topic_bytes);
 
-    let invite = protocol.get_invite(&topic_arr)
+    let invite = protocol
+        .get_invite(&topic_arr)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -514,7 +510,10 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
     }
 
     if !events.is_empty() {
-        println!("[poll_events] Returning {} events to frontend", events.len());
+        println!(
+            "[poll_events] Returning {} events to frontend",
+            events.len()
+        );
     }
 
     Ok(events)
@@ -524,14 +523,17 @@ async fn poll_events(state: State<'_, AppState>) -> Result<Vec<AppEvent>, String
 #[tauri::command]
 async fn poll_messages(state: State<'_, AppState>) -> Result<Vec<MessageEvent>, String> {
     let events = poll_events(state).await?;
-    
-    Ok(events.into_iter().filter_map(|e| {
-        if let AppEvent::Message(msg) = e {
-            Some(msg)
-        } else {
-            None
-        }
-    }).collect())
+
+    Ok(events
+        .into_iter()
+        .filter_map(|e| {
+            if let AppEvent::Message(msg) = e {
+                Some(msg)
+            } else {
+                None
+            }
+        })
+        .collect())
 }
 
 // ============================================================================
@@ -543,10 +545,8 @@ async fn poll_messages(state: State<'_, AppState>) -> Result<Vec<MessageEvent>, 
 async fn get_stats(state: State<'_, AppState>) -> Result<ProtocolStats, String> {
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
-    
-    protocol.get_stats()
-        .await
-        .map_err(|e| e.to_string())
+
+    protocol.get_stats().await.map_err(|e| e.to_string())
 }
 
 /// Get detailed DHT bucket information
@@ -554,29 +554,30 @@ async fn get_stats(state: State<'_, AppState>) -> Result<ProtocolStats, String> 
 async fn get_dht_buckets(state: State<'_, AppState>) -> Result<Vec<DhtBucketInfo>, String> {
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
-    
-    protocol.get_dht_buckets()
-        .await
-        .map_err(|e| e.to_string())
+
+    protocol.get_dht_buckets().await.map_err(|e| e.to_string())
 }
 
 /// Get detailed information about a specific topic
 #[tauri::command]
-async fn get_topic_details(state: State<'_, AppState>, topic_id: String) -> Result<TopicDetails, String> {
+async fn get_topic_details(
+    state: State<'_, AppState>,
+    topic_id: String,
+) -> Result<TopicDetails, String> {
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
-    
-    let topic_bytes = hex::decode(&topic_id)
-        .map_err(|e| e.to_string())?;
-    
+
+    let topic_bytes = hex::decode(&topic_id).map_err(|e| e.to_string())?;
+
     if topic_bytes.len() != 32 {
         return Err("Invalid topic ID length".to_string());
     }
-    
+
     let mut topic_arr = [0u8; 32];
     topic_arr.copy_from_slice(&topic_bytes);
 
-    protocol.get_topic_details(&topic_arr)
+    protocol
+        .get_topic_details(&topic_arr)
         .await
         .map_err(|e| e.to_string())
 }
@@ -586,8 +587,9 @@ async fn get_topic_details(state: State<'_, AppState>, topic_id: String) -> Resu
 async fn list_topic_summaries(state: State<'_, AppState>) -> Result<Vec<TopicSummary>, String> {
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
-    
-    protocol.list_topic_summaries()
+
+    protocol
+        .list_topic_summaries()
         .await
         .map_err(|e| e.to_string())
 }
@@ -614,33 +616,31 @@ async fn share_file(
 ) -> Result<ShareResponse, String> {
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
-    
-    let topic_bytes = hex::decode(&topic_id)
-        .map_err(|e| e.to_string())?;
-    
+
+    let topic_bytes = hex::decode(&topic_id).map_err(|e| e.to_string())?;
+
     if topic_bytes.len() != 32 {
         return Err("Invalid topic ID length".to_string());
     }
-    
+
     let mut topic_arr = [0u8; 32];
     topic_arr.copy_from_slice(&topic_bytes);
 
-    let hash = protocol.share_file(harbor_core::Target::Topic(topic_arr), &file_path)
+    let hash = protocol
+        .share_file(harbor_core::Target::Topic(topic_arr), &file_path)
         .await
         .map_err(|e| e.to_string())?;
-    
+
     // Get file info for response
     let file_name = std::path::Path::new(&file_path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    
-    let file_size = std::fs::metadata(&file_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    
+
+    let file_size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+
     let total_chunks = ((file_size + 512 * 1024 - 1) / (512 * 1024)) as u32;
-    
+
     Ok(ShareResponse {
         hash: hex::encode(hash),
         display_name: file_name,
@@ -658,18 +658,18 @@ async fn export_file(
 ) -> Result<(), String> {
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
-    
-    let hash_bytes = hex::decode(&hash)
-        .map_err(|e| e.to_string())?;
-    
+
+    let hash_bytes = hex::decode(&hash).map_err(|e| e.to_string())?;
+
     if hash_bytes.len() != 32 {
         return Err("Invalid hash length".to_string());
     }
-    
+
     let mut hash_arr = [0u8; 32];
     hash_arr.copy_from_slice(&hash_bytes);
 
-    protocol.export_blob(&hash_arr, &destination)
+    protocol
+        .export_blob(&hash_arr, &destination)
         .await
         .map_err(|e| e.to_string())
 }
@@ -691,8 +691,7 @@ async fn sync_send_update(
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
 
-    let topic_bytes = hex::decode(&topic_id)
-        .map_err(|e| e.to_string())?;
+    let topic_bytes = hex::decode(&topic_id).map_err(|e| e.to_string())?;
 
     if topic_bytes.len() != 32 {
         return Err("Invalid topic ID length".to_string());
@@ -702,7 +701,8 @@ async fn sync_send_update(
     topic_arr.copy_from_slice(&topic_bytes);
 
     println!("[sync_send_update] Calling protocol.send_sync_update...");
-    protocol.send_sync_update(Target::Topic(topic_arr), data)
+    protocol
+        .send_sync_update(Target::Topic(topic_arr), data)
         .await
         .map_err(|e| {
             println!("[sync_send_update] ✗ Error: {}", e);
@@ -715,17 +715,13 @@ async fn sync_send_update(
 
 /// Request sync state from all topic members
 #[tauri::command]
-async fn sync_request(
-    state: State<'_, AppState>,
-    topic_id: String,
-) -> Result<(), String> {
+async fn sync_request(state: State<'_, AppState>, topic_id: String) -> Result<(), String> {
     println!("[sync_request] Called for topic: {}", &topic_id[..16]);
 
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
 
-    let topic_bytes = hex::decode(&topic_id)
-        .map_err(|e| e.to_string())?;
+    let topic_bytes = hex::decode(&topic_id).map_err(|e| e.to_string())?;
 
     if topic_bytes.len() != 32 {
         return Err("Invalid topic ID length".to_string());
@@ -735,7 +731,8 @@ async fn sync_request(
     topic_arr.copy_from_slice(&topic_bytes);
 
     println!("[sync_request] Calling protocol.request_sync...");
-    protocol.request_sync(Target::Topic(topic_arr))
+    protocol
+        .request_sync(Target::Topic(topic_arr))
         .await
         .map_err(|e| {
             println!("[sync_request] ✗ Error: {}", e);
@@ -761,10 +758,8 @@ async fn sync_respond(
     let protocol_guard = state.protocol.lock().await;
     let protocol = protocol_guard.as_ref().ok_or("Protocol not running")?;
 
-    let topic_bytes = hex::decode(&topic_id)
-        .map_err(|e| e.to_string())?;
-    let requester_bytes = hex::decode(&requester_id)
-        .map_err(|e| e.to_string())?;
+    let topic_bytes = hex::decode(&topic_id).map_err(|e| e.to_string())?;
+    let requester_bytes = hex::decode(&requester_id).map_err(|e| e.to_string())?;
 
     if topic_bytes.len() != 32 || requester_bytes.len() != 32 {
         return Err("Invalid ID length".to_string());
@@ -776,7 +771,8 @@ async fn sync_respond(
     requester_arr.copy_from_slice(&requester_bytes);
 
     println!("[sync_respond] Calling protocol.respond_sync...");
-    protocol.respond_sync(Target::Topic(topic_arr), &requester_arr, data)
+    protocol
+        .respond_sync(Target::Topic(topic_arr), &requester_arr, data)
         .await
         .map_err(|e| {
             println!("[sync_respond] ✗ Error: {}", e);
@@ -817,15 +813,13 @@ async fn write_frontend_log(state: State<'_, AppState>, message: String) -> Resu
 /// Store the current database passphrase in the OS keychain ("remember me").
 #[tauri::command]
 async fn keychain_store(passphrase_hex: String) -> Result<(), String> {
-    harbor_core::keychain::store_passphrase(&passphrase_hex)
-        .map_err(|e| e.to_string())
+    harbor_core::keychain::store_passphrase(&passphrase_hex).map_err(|e| e.to_string())
 }
 
 /// Delete the stored passphrase from the OS keychain ("forget").
 #[tauri::command]
 async fn keychain_delete() -> Result<(), String> {
-    harbor_core::keychain::delete_passphrase()
-        .map_err(|e| e.to_string())
+    harbor_core::keychain::delete_passphrase().map_err(|e| e.to_string())
 }
 
 /// Check if a passphrase is stored in the OS keychain.

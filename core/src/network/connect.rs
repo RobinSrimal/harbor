@@ -12,7 +12,7 @@ use iroh::endpoint::{Connection, Endpoint};
 use iroh::{EndpointAddr, EndpointId, RelayUrl};
 use rusqlite::Connection as DbConnection;
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::data::dht::peer::{current_timestamp, get_peer, update_peer_relay_url};
 use crate::network::pool::{ConnectionPool, PoolConfig, PoolError};
@@ -70,12 +70,12 @@ pub async fn connect(
     let relay_is_fresh = is_relay_fresh(relay_url, relay_url_last_success);
 
     if relay_is_fresh {
-        // Relay URL is fresh — try it first with half the timeout
+        // Relay URL is fresh — try it first with a split timeout.
         let relay = relay_url.expect("relay_url must be Some when fresh");
-        let half_timeout = timeout / 2;
+        let first_attempt_timeout = split_attempt_timeout(timeout);
 
         let addr = EndpointAddr::new(node_id).with_relay_url(relay.clone());
-        match tokio::time::timeout(half_timeout, endpoint.connect(addr, alpn)).await {
+        match tokio::time::timeout(first_attempt_timeout, endpoint.connect(addr, alpn)).await {
             Ok(Ok(conn)) => {
                 return Ok(ConnectResult {
                     connection: conn,
@@ -85,10 +85,11 @@ pub async fn connect(
             _ => {
                 // Relay attempt failed or timed out — fall back to DNS
                 let addr = EndpointAddr::from(node_id);
-                let conn = tokio::time::timeout(half_timeout, endpoint.connect(addr, alpn))
-                    .await
-                    .map_err(|_| ConnectError::Timeout)?
-                    .map_err(|e| ConnectError::Failed(e.to_string()))?;
+                let conn =
+                    tokio::time::timeout(first_attempt_timeout, endpoint.connect(addr, alpn))
+                        .await
+                        .map_err(|_| ConnectError::Timeout)?
+                        .map_err(|e| ConnectError::Failed(e.to_string()))?;
 
                 return Ok(ConnectResult {
                     connection: conn,
@@ -119,6 +120,15 @@ fn is_relay_fresh(relay_url: Option<&RelayUrl>, last_success: Option<i64>) -> bo
             now - ts < RELAY_URL_FRESHNESS_SECS
         }
         _ => false,
+    }
+}
+
+/// Use half of the budget for each attempt, but avoid accidental zero-duration timeouts.
+fn split_attempt_timeout(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        Duration::ZERO
+    } else {
+        std::cmp::max(timeout / 2, Duration::from_millis(1))
     }
 }
 
@@ -169,7 +179,8 @@ impl Connector {
 
     /// Connect to a peer by ID using the default timeout.
     pub async fn connect(&self, peer_id: &[u8; 32]) -> Result<Connection, ConnectError> {
-        self.connect_with_timeout(peer_id, self.connect_timeout).await
+        self.connect_with_timeout(peer_id, self.connect_timeout)
+            .await
     }
 
     /// Connect to a peer by ID with a custom timeout.
@@ -229,6 +240,8 @@ impl Connector {
     /// Connect to a peer using an optional relay hint with a custom timeout.
     ///
     /// If the hint is `None`, falls back to relay info from the database.
+    /// If the hint is present but has no known success timestamp, the hint
+    /// is still tried first for this connection attempt.
     /// Returns whether the relay URL was confirmed working.
     pub async fn connect_with_relay_hint_timeout(
         &self,
@@ -247,19 +260,19 @@ impl Connector {
             });
         }
 
-        let (db_relay_url, db_relay_last_success) = self.load_peer_relay_info(peer_id).await;
+        let (db_relay_url, db_relay_last_success) =
+            if relay_hint.is_none() || relay_hint_last_success.is_none() {
+                self.load_peer_relay_info(peer_id).await
+            } else {
+                (None, None)
+            };
 
-        let (relay_url, relay_last_success) = match relay_hint {
-            Some(hint) => {
-                let hint_last_success = relay_hint_last_success.or_else(|| {
-                    db_relay_url
-                        .as_ref()
-                        .and_then(|db_url| if db_url == hint { db_relay_last_success } else { None })
-                });
-                (Some(hint.clone()), hint_last_success)
-            }
-            None => (db_relay_url, db_relay_last_success),
-        };
+        let (relay_url, relay_last_success) = resolve_relay_for_attempt(
+            relay_hint,
+            relay_hint_last_success,
+            db_relay_url,
+            db_relay_last_success,
+        );
 
         let result = self
             .connect_internal(node_id, relay_url.as_ref(), relay_last_success, timeout)
@@ -304,7 +317,7 @@ impl Connector {
     ) -> Result<ConnectResult, ConnectError> {
         if let Some(pool) = &self.pool {
             let (conn_ref, relay_confirmed) = pool
-                .get_connection(node_id, relay_url, relay_url_last_success)
+                .get_connection_with_timeout(node_id, relay_url, relay_url_last_success, timeout)
                 .await
                 .map_err(pool_error_to_connect_error)?;
             Ok(ConnectResult {
@@ -324,17 +337,33 @@ impl Connector {
         }
     }
 
-    async fn load_peer_relay_info(
-        &self,
-        peer_id: &[u8; 32],
-    ) -> (Option<RelayUrl>, Option<i64>) {
+    async fn load_peer_relay_info(&self, peer_id: &[u8; 32]) -> (Option<RelayUrl>, Option<i64>) {
         let db = self.db.lock().await;
-        match get_peer(&db, peer_id).unwrap_or(None) {
-            Some(peer) => {
-                let relay_url = peer.relay_url.as_deref().and_then(|u| u.parse().ok());
+        match get_peer(&db, peer_id) {
+            Ok(Some(peer)) => {
+                let relay_url = peer.relay_url.as_deref().and_then(|u| match u.parse() {
+                    Ok(url) => Some(url),
+                    Err(err) => {
+                        warn!(
+                            peer = %hex::encode(&peer_id[..8]),
+                            relay_url = %u,
+                            error = %err,
+                            "invalid relay URL in peers table"
+                        );
+                        None
+                    }
+                });
                 (relay_url, peer.relay_url_last_success)
             }
-            None => (None, None),
+            Ok(None) => (None, None),
+            Err(err) => {
+                warn!(
+                    peer = %hex::encode(&peer_id[..8]),
+                    error = %err,
+                    "failed to load relay info from peers table"
+                );
+                (None, None)
+            }
         }
     }
 
@@ -347,14 +376,43 @@ impl Connector {
         if relay_confirmed {
             if let Some(url) = relay_url {
                 let db = self.db.lock().await;
-                let _ = update_peer_relay_url(
-                    &db,
-                    peer_id,
-                    &url.to_string(),
-                    current_timestamp(),
-                );
+                if let Err(err) =
+                    update_peer_relay_url(&db, peer_id, &url.to_string(), current_timestamp())
+                {
+                    warn!(
+                        peer = %hex::encode(&peer_id[..8]),
+                        error = %err,
+                        "failed to persist confirmed relay URL"
+                    );
+                }
             }
         }
+    }
+}
+
+fn resolve_relay_for_attempt(
+    relay_hint: Option<&RelayUrl>,
+    relay_hint_last_success: Option<i64>,
+    db_relay_url: Option<RelayUrl>,
+    db_relay_last_success: Option<i64>,
+) -> (Option<RelayUrl>, Option<i64>) {
+    match relay_hint {
+        Some(hint) => {
+            let hint_last_success = relay_hint_last_success
+                .or_else(|| {
+                    db_relay_url.as_ref().and_then(|db_url| {
+                        if db_url == hint {
+                            db_relay_last_success
+                        } else {
+                            None
+                        }
+                    })
+                })
+                // Explicit hints should be attempted even if never verified.
+                .or_else(|| Some(current_timestamp()));
+            (Some(hint.clone()), hint_last_success)
+        }
+        None => (db_relay_url, db_relay_last_success),
     }
 }
 
@@ -363,5 +421,47 @@ fn pool_error_to_connect_error(err: PoolError) -> ConnectError {
         PoolError::Timeout => ConnectError::Timeout,
         PoolError::ConnectionFailed(msg) => ConnectError::Failed(msg),
         other => ConnectError::Failed(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_attempt_timeout_never_zero_when_budget_non_zero() {
+        assert_eq!(
+            split_attempt_timeout(Duration::from_micros(1)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            split_attempt_timeout(Duration::from_secs(4)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(split_attempt_timeout(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_resolve_relay_for_attempt_uses_hint_even_without_timestamp() {
+        let hint: RelayUrl = "https://relay.example.com/"
+            .parse()
+            .expect("valid relay url");
+        let (relay_url, relay_last_success) =
+            resolve_relay_for_attempt(Some(&hint), None, None, None);
+
+        assert_eq!(relay_url.as_ref(), Some(&hint));
+        assert!(relay_last_success.is_some());
+    }
+
+    #[test]
+    fn test_resolve_relay_for_attempt_reuses_matching_db_timestamp() {
+        let hint: RelayUrl = "https://relay.example.com/"
+            .parse()
+            .expect("valid relay url");
+        let (relay_url, relay_last_success) =
+            resolve_relay_for_attempt(Some(&hint), None, Some(hint.clone()), Some(123));
+
+        assert_eq!(relay_url.as_ref(), Some(&hint));
+        assert_eq!(relay_last_success, Some(123));
     }
 }

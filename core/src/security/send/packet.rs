@@ -6,6 +6,7 @@
 //!     PacketID,
 //!     HarborID,
 //!     EndpointID,
+//!     flags,       // bit 0 = DM (direct message)
 //!     epoch,       // Reserved for future tiers (always 0 for Tier 1)
 //!     nonce,
 //!     ciphertext,
@@ -49,13 +50,13 @@ use serde_big_array::BigArray;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::security::dm_keys::{dm_open, dm_seal};
 use crate::security::harbor::{
     authenticate::create_mac,
     encrypt::{decrypt, encrypt, generate_nonce},
     sign::{sign_packet, verify_packet},
 };
 use crate::security::topic_keys::harbor_id_from_topic;
-use crate::security::dm_keys::{dm_seal, dm_open};
 
 /// Flag bit indicating a DM (direct message) packet
 pub const FLAG_DM: u8 = 0x01;
@@ -63,8 +64,25 @@ pub const FLAG_DM: u8 = 0x01;
 /// Maximum packet payload size (512 KB)
 pub const MAX_PAYLOAD_SIZE: usize = 512 * 1024;
 
-/// Packet ID size (32 bytes = 256 bits, consistent with other IDs)
-pub const PACKET_ID_SIZE: usize = 32;
+/// Packet ID size (16 bytes = 128 bits)
+pub const PACKET_ID_SIZE: usize = 16;
+
+/// ChaCha20-Poly1305 AEAD tag size (bytes)
+const AEAD_TAG_SIZE: usize = 16;
+
+/// DM ciphertext stores the XChaCha nonce inline (bytes)
+const DM_CIPHERTEXT_NONCE_SIZE: usize = 24;
+
+/// Topic packet ciphertext bounds (plaintext + AEAD tag)
+const MIN_TOPIC_CIPHERTEXT_SIZE: usize = AEAD_TAG_SIZE;
+const MAX_TOPIC_CIPHERTEXT_SIZE: usize = MAX_PAYLOAD_SIZE + AEAD_TAG_SIZE;
+
+/// DM packet ciphertext bounds (plaintext + AEAD tag + inline nonce)
+const MIN_DM_CIPHERTEXT_SIZE: usize = AEAD_TAG_SIZE + DM_CIPHERTEXT_NONCE_SIZE;
+const MAX_DM_CIPHERTEXT_SIZE: usize = MAX_PAYLOAD_SIZE + AEAD_TAG_SIZE + DM_CIPHERTEXT_NONCE_SIZE;
+
+/// Packet identifier type used across send/harbor/dedup flows.
+pub type PacketId = [u8; PACKET_ID_SIZE];
 
 /// Error during packet creation or verification
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +93,8 @@ pub enum PacketError {
     InvalidMac,
     /// Signature verification failed (sender identity mismatch)
     InvalidSignature,
+    /// Encryption failed during packet creation
+    EncryptionFailed,
     /// AEAD decryption failed (tampered or wrong keys)
     DecryptionFailed,
     /// Invalid packet structure
@@ -99,13 +119,21 @@ impl std::fmt::Display for PacketError {
             }
             PacketError::InvalidMac => write!(f, "MAC verification failed"),
             PacketError::InvalidSignature => write!(f, "signature verification failed"),
+            PacketError::EncryptionFailed => write!(f, "encryption failed"),
             PacketError::DecryptionFailed => write!(f, "decryption failed"),
             PacketError::InvalidFormat(msg) => write!(f, "invalid packet format: {}", msg),
             PacketError::SerializationFailed(msg) => write!(f, "serialization failed: {}", msg),
             PacketError::HarborIdMismatch => write!(f, "HarborID mismatch"),
             PacketError::SenderIdMismatch => write!(f, "sender ID mismatch"),
-            PacketError::EpochMismatch { packet_epoch, key_epoch } => {
-                write!(f, "epoch mismatch: packet epoch {} != key epoch {}", packet_epoch, key_epoch)
+            PacketError::EpochMismatch {
+                packet_epoch,
+                key_epoch,
+            } => {
+                write!(
+                    f,
+                    "epoch mismatch: packet epoch {} != key epoch {}",
+                    packet_epoch, key_epoch
+                )
             }
             PacketError::NoEpochKey { epoch } => {
                 write!(f, "no epoch key available for epoch {}", epoch)
@@ -120,7 +148,7 @@ impl std::error::Error for PacketError {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendPacket {
     /// Unique packet identifier (16 bytes)
-    pub packet_id: [u8; PACKET_ID_SIZE],
+    pub packet_id: PacketId,
     /// Hash of TopicID - used to find Harbor Nodes
     pub harbor_id: [u8; 32],
     /// Sender's EndpointID (public key)
@@ -159,8 +187,7 @@ impl SendPacket {
     ///
     /// Returns an error if serialization fails (should be rare).
     pub fn to_bytes(&self) -> Result<Vec<u8>, PacketError> {
-        postcard::to_allocvec(self)
-            .map_err(|e| PacketError::SerializationFailed(e.to_string()))
+        postcard::to_allocvec(self).map_err(|e| PacketError::SerializationFailed(e.to_string()))
     }
 
     /// Deserialize a packet from bytes
@@ -170,7 +197,7 @@ impl SendPacket {
 }
 
 /// Epoch encryption keys
-/// 
+///
 /// For Tier 1: Derived from `topic_id` with epoch 0
 /// For Tier 2+: Derived from epoch secret distributed by admin
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -187,19 +214,23 @@ pub struct EpochKeys {
 impl EpochKeys {
     /// Create new epoch keys
     pub fn new(epoch: u64, k_enc: [u8; 32], k_mac: [u8; 32]) -> Self {
-        Self { epoch, k_enc, k_mac }
+        Self {
+            epoch,
+            k_enc,
+            k_mac,
+        }
     }
 
     /// Derive epoch keys from an epoch secret
-    /// 
+    ///
     /// For Tier 2: The epoch secret is distributed by the topic admin.
     /// For Tier 3: The epoch secret comes from MLS export_secret().
-    /// 
+    ///
     /// We derive separate encryption and MAC keys from it, incorporating
     /// the epoch number into the derivation for domain separation.
     pub fn derive_from_secret(epoch: u64, epoch_secret: &[u8; 32]) -> Self {
         use blake3::Hasher;
-        
+
         // Derive k_enc: hash(epoch_secret || epoch || "enc")
         let mut hasher = Hasher::new_derive_key("harbor epoch encryption key");
         hasher.update(epoch_secret);
@@ -207,7 +238,7 @@ impl EpochKeys {
         let k_enc_hash = hasher.finalize();
         let mut k_enc = [0u8; 32];
         k_enc.copy_from_slice(&k_enc_hash.as_bytes()[..32]);
-        
+
         // Derive k_mac: hash(epoch_secret || epoch || "mac")
         let mut hasher = Hasher::new_derive_key("harbor epoch mac key");
         hasher.update(epoch_secret);
@@ -215,8 +246,12 @@ impl EpochKeys {
         let k_mac_hash = hasher.finalize();
         let mut k_mac = [0u8; 32];
         k_mac.copy_from_slice(&k_mac_hash.as_bytes()[..32]);
-        
-        Self { epoch, k_enc, k_mac }
+
+        Self {
+            epoch,
+            k_enc,
+            k_mac,
+        }
     }
 
     /// Derive keys from TopicID and epoch
@@ -303,7 +338,7 @@ impl PacketBuilder {
         &self,
         plaintext: &[u8],
         epoch_keys: &EpochKeys,
-        packet_id: [u8; 32],
+        packet_id: PacketId,
     ) -> Result<SendPacket, PacketError> {
         // Check payload size
         if plaintext.len() > MAX_PAYLOAD_SIZE {
@@ -325,7 +360,7 @@ impl PacketBuilder {
         aad.extend_from_slice(&epoch_keys.epoch.to_le_bytes());
 
         let ciphertext = encrypt(&epoch_keys.k_enc, &nonce, plaintext, &aad)
-            .map_err(|_| PacketError::DecryptionFailed)?;
+            .map_err(|_| PacketError::EncryptionFailed)?;
 
         // Step 2: Create MAC over ciphertext (includes epoch in binding)
         let mac_hash = create_mac(&epoch_keys.k_mac, &ciphertext);
@@ -357,7 +392,7 @@ impl PacketBuilder {
     ///
     /// Uses TopicID-derived keys with epoch 0. This is the standard
     /// method for Tier 1 (Open Topics).
-    pub fn build(&self, plaintext: &[u8], packet_id: [u8; 32]) -> Result<SendPacket, PacketError> {
+    pub fn build(&self, plaintext: &[u8], packet_id: PacketId) -> Result<SendPacket, PacketError> {
         let epoch_keys = EpochKeys::derive_from_topic(&self.topic_id, 0);
         self.build_with_epoch(plaintext, &epoch_keys, packet_id)
     }
@@ -367,8 +402,8 @@ impl PacketBuilder {
 ///
 /// Use this to generate a packet_id at send time, then pass it to both
 /// direct delivery and seal functions for deduplication.
-pub fn generate_packet_id() -> [u8; PACKET_ID_SIZE] {
-    let mut id = [0u8; PACKET_ID_SIZE];
+pub fn generate_packet_id() -> PacketId {
+    let mut id: PacketId = [0u8; PACKET_ID_SIZE];
     use rand::RngCore;
     rand::rngs::OsRng.fill_bytes(&mut id);
     id
@@ -391,7 +426,7 @@ pub fn create_packet_with_epoch(
     sender_public_key: &[u8; 32],
     plaintext: &[u8],
     epoch_keys: &EpochKeys,
-    packet_id: [u8; 32],
+    packet_id: PacketId,
 ) -> Result<SendPacket, PacketError> {
     PacketBuilder::new(*topic_id, *sender_private_key, *sender_public_key)
         .build_with_epoch(plaintext, epoch_keys, packet_id)
@@ -413,9 +448,10 @@ pub fn create_packet(
     sender_private_key: &[u8; 32],
     sender_public_key: &[u8; 32],
     plaintext: &[u8],
-    packet_id: [u8; 32],
+    packet_id: PacketId,
 ) -> Result<SendPacket, PacketError> {
-    PacketBuilder::new(*topic_id, *sender_private_key, *sender_public_key).build(plaintext, packet_id)
+    PacketBuilder::new(*topic_id, *sender_private_key, *sender_public_key)
+        .build(plaintext, packet_id)
 }
 
 /// Verification mode for packets
@@ -603,15 +639,23 @@ pub fn verify_for_storage(
     claimed_harbor_id: &[u8; 32],
     claimed_sender_id: &[u8; 32],
 ) -> Result<SendPacket, PacketError> {
-    // Check packet size before parsing
-    // Minimum: packet_id(32) + harbor_id(32) + endpoint_id(32) + nonce(12) +
-    //          ciphertext(16 min for tag) + mac(32) + signature(64) = 220 bytes
-    if packet_bytes.len() < 220 {
+    const MAX_VARINT_U64_BYTES: usize = 10;
+    const FIXED_PACKET_FIELDS_SIZE: usize = PACKET_ID_SIZE + 32 + 32 + 1 + 12 + 32 + 64;
+
+    // Check packet size before parsing.
+    // postcard minimum (epoch=0, empty topic payload): fixed fields + epoch varint(1)
+    // + ciphertext len varint(1) + topic tag-only ciphertext(16).
+    const MIN_PACKET_SIZE: usize = FIXED_PACKET_FIELDS_SIZE + 1 + 1 + MIN_TOPIC_CIPHERTEXT_SIZE;
+    if packet_bytes.len() < MIN_PACKET_SIZE {
         return Err(PacketError::InvalidFormat("packet too small".to_string()));
     }
 
-    // Check maximum size (header + max payload + AEAD tag)
-    let max_packet_size = 220 + MAX_PAYLOAD_SIZE;
+    // Conservative postcard maximum:
+    // fixed fields + worst-case u64/usize varints + max DM ciphertext.
+    let max_packet_size = FIXED_PACKET_FIELDS_SIZE
+        + MAX_VARINT_U64_BYTES
+        + MAX_VARINT_U64_BYTES
+        + MAX_DM_CIPHERTEXT_SIZE;
     if packet_bytes.len() > max_packet_size {
         return Err(PacketError::PayloadTooLarge {
             size: packet_bytes.len(),
@@ -621,6 +665,27 @@ pub fn verify_for_storage(
 
     // Parse the packet
     let packet = SendPacket::from_bytes(packet_bytes)?;
+
+    // Validate ciphertext bounds for packet type.
+    let (min_ciphertext, max_ciphertext) = if packet.is_dm() {
+        (MIN_DM_CIPHERTEXT_SIZE, MAX_DM_CIPHERTEXT_SIZE)
+    } else {
+        (MIN_TOPIC_CIPHERTEXT_SIZE, MAX_TOPIC_CIPHERTEXT_SIZE)
+    };
+
+    if packet.ciphertext.len() < min_ciphertext {
+        return Err(PacketError::InvalidFormat(format!(
+            "ciphertext too small: {} < {}",
+            packet.ciphertext.len(),
+            min_ciphertext
+        )));
+    }
+    if packet.ciphertext.len() > max_ciphertext {
+        return Err(PacketError::PayloadTooLarge {
+            size: packet.ciphertext.len(),
+            max: max_ciphertext,
+        });
+    }
 
     // Verify HarborID matches claim
     if packet.harbor_id != *claimed_harbor_id {
@@ -677,7 +742,7 @@ pub fn create_dm_packet(
     sender_public_key: &[u8; 32],
     recipient_public_key: &[u8; 32],
     plaintext: &[u8],
-    packet_id: [u8; 32],
+    packet_id: PacketId,
 ) -> Result<SendPacket, PacketError> {
     if plaintext.len() > MAX_PAYLOAD_SIZE {
         return Err(PacketError::PayloadTooLarge {
@@ -694,12 +759,7 @@ pub fn create_dm_packet(
 
     // Sign the packet (nonce is embedded in ciphertext for DM, use zeroed nonce field)
     let nonce = [0u8; 12];
-    let signature = sign_packet(
-        sender_private_key,
-        sender_public_key,
-        &nonce,
-        &ciphertext,
-    );
+    let signature = sign_packet(sender_private_key, sender_public_key, &nonce, &ciphertext);
 
     Ok(SendPacket {
         packet_id,
@@ -726,6 +786,10 @@ pub fn verify_and_decrypt_dm_packet(
     packet: &SendPacket,
     recipient_private_key: &[u8; 32],
 ) -> Result<Vec<u8>, PacketError> {
+    if !packet.is_dm() {
+        return Err(PacketError::InvalidFormat("not a DM packet".to_string()));
+    }
+
     // Verify signature
     if !verify_packet(
         &packet.endpoint_id,
@@ -738,8 +802,12 @@ pub fn verify_and_decrypt_dm_packet(
     }
 
     // ECDH decrypt
-    dm_open(recipient_private_key, &packet.endpoint_id, &packet.ciphertext)
-        .map_err(|_| PacketError::DecryptionFailed)
+    dm_open(
+        recipient_private_key,
+        &packet.endpoint_id,
+        &packet.ciphertext,
+    )
+    .map_err(|_| PacketError::DecryptionFailed)
 }
 
 #[cfg(test)]
@@ -758,7 +826,14 @@ mod tests {
         let plaintext = b"Hello, Harbor!";
 
         // Create packet
-        let packet = create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Verify fields
         assert_eq!(packet.harbor_id, harbor_id_from_topic(&topic_id));
@@ -779,8 +854,14 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"Test message";
 
-        let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Serialize and deserialize
         let bytes = packet.to_bytes().unwrap();
@@ -805,7 +886,13 @@ mod tests {
         let kp = generate_key_pair();
         let huge_payload = vec![0u8; MAX_PAYLOAD_SIZE + 1];
 
-        let result = create_packet(&topic_id, &kp.private_key, &kp.public_key, &huge_payload, generate_packet_id());
+        let result = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            &huge_payload,
+            generate_packet_id(),
+        );
 
         assert!(matches!(result, Err(PacketError::PayloadTooLarge { .. })));
     }
@@ -816,7 +903,13 @@ mod tests {
         let kp = generate_key_pair();
         let max_payload = vec![0u8; MAX_PAYLOAD_SIZE];
 
-        let result = create_packet(&topic_id, &kp.private_key, &kp.public_key, &max_payload, generate_packet_id());
+        let result = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            &max_payload,
+            generate_packet_id(),
+        );
         assert!(result.is_ok());
     }
 
@@ -827,8 +920,14 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"Secret message";
 
-        let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Verify with wrong topic should fail at HarborID mismatch
         let result = verify_and_decrypt_packet(&packet, &wrong_topic);
@@ -841,8 +940,14 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"Secret message";
 
-        let mut packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let mut packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Tamper with ciphertext
         packet.ciphertext[0] ^= 0xFF;
@@ -858,8 +963,14 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"Secret message";
 
-        let mut packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let mut packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Tamper with MAC
         packet.mac[0] ^= 0xFF;
@@ -874,8 +985,14 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"Secret message";
 
-        let mut packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let mut packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Tamper with signature
         packet.signature[0] ^= 0xFF;
@@ -891,8 +1008,14 @@ mod tests {
         let kp2 = generate_key_pair();
         let plaintext = b"Secret message";
 
-        let mut packet =
-            create_packet(&topic_id, &kp1.private_key, &kp1.public_key, plaintext, generate_packet_id()).unwrap();
+        let mut packet = create_packet(
+            &topic_id,
+            &kp1.private_key,
+            &kp1.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Replace endpoint_id with different key
         packet.endpoint_id = kp2.public_key;
@@ -908,8 +1031,14 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"";
 
-        let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
         let decrypted = verify_and_decrypt_packet(&packet, &topic_id).unwrap();
 
         assert_eq!(decrypted, plaintext);
@@ -921,8 +1050,14 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"Hello, Harbor!";
 
-        let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Size should be reasonable
         let size = packet.size();
@@ -938,14 +1073,21 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"Join message";
 
-        let mut packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let mut packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Tamper with signature
         packet.signature[0] ^= 0xFF;
 
         // Full mode should fail
-        let result = verify_and_decrypt_packet_with_mode(&packet, &topic_id, VerificationMode::Full);
+        let result =
+            verify_and_decrypt_packet_with_mode(&packet, &topic_id, VerificationMode::Full);
         assert!(matches!(result, Err(PacketError::InvalidSignature)));
 
         // MAC-only mode should succeed (signature not checked)
@@ -961,8 +1103,14 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"Test message";
 
-        let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Get epoch keys for epoch 0 (default)
         let epoch_keys = EpochKeys::derive_from_topic(&topic_id, 0);
@@ -995,17 +1143,15 @@ mod tests {
             plaintext,
             &epoch_keys,
             generate_packet_id(),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(packet.epoch, 5);
 
         // Should decrypt with correct epoch keys
-        let decrypted = verify_and_decrypt_with_epoch(
-            &packet,
-            &topic_id,
-            &epoch_keys,
-            VerificationMode::Full,
-        ).unwrap();
+        let decrypted =
+            verify_and_decrypt_with_epoch(&packet, &topic_id, &epoch_keys, VerificationMode::Full)
+                .unwrap();
         assert_eq!(decrypted, plaintext);
 
         // Should fail with wrong epoch keys
@@ -1054,7 +1200,8 @@ mod tests {
             plaintext,
             &epoch_1_keys,
             generate_packet_id(),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Late joiner who only has epoch 5 keys cannot decrypt
         let epoch_5_keys = EpochKeys::derive_from_topic(&topic_id, 5);
@@ -1074,8 +1221,14 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"Test message";
 
-        let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
         let packet_bytes = packet.to_bytes().unwrap();
 
         // Should verify successfully
@@ -1089,8 +1242,14 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"Test message";
 
-        let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
         let packet_bytes = packet.to_bytes().unwrap();
 
         let wrong_harbor_id = [0u8; 32];
@@ -1104,8 +1263,14 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"Test message";
 
-        let packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
         let packet_bytes = packet.to_bytes().unwrap();
 
         let wrong_sender = [0u8; 32];
@@ -1119,8 +1284,14 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"Test message";
 
-        let mut packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let mut packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Tamper with signature
         packet.signature[0] ^= 0xFF;
@@ -1128,6 +1299,46 @@ mod tests {
         let packet_bytes = packet.to_bytes().unwrap();
         let result = verify_for_storage(&packet_bytes, &packet.harbor_id, &packet.endpoint_id);
         assert!(matches!(result, Err(PacketError::InvalidSignature)));
+    }
+
+    #[test]
+    fn test_verify_for_storage_max_topic_payload() {
+        let topic_id = test_topic_id();
+        let kp = generate_key_pair();
+        let plaintext = vec![0u8; MAX_PAYLOAD_SIZE];
+
+        let packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            &plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
+        let packet_bytes = packet.to_bytes().unwrap();
+
+        let result = verify_for_storage(&packet_bytes, &packet.harbor_id, &packet.endpoint_id);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_for_storage_max_dm_payload() {
+        let sender = generate_key_pair();
+        let recipient = generate_key_pair();
+        let plaintext = vec![0u8; MAX_PAYLOAD_SIZE];
+
+        let packet = create_dm_packet(
+            &sender.private_key,
+            &sender.public_key,
+            &recipient.public_key,
+            &plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
+        let packet_bytes = packet.to_bytes().unwrap();
+
+        let result = verify_for_storage(&packet_bytes, &packet.harbor_id, &packet.endpoint_id);
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1164,8 +1375,14 @@ mod tests {
         let kp = generate_key_pair();
         let plaintext = b"Test message";
 
-        let mut packet =
-            create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, generate_packet_id()).unwrap();
+        let mut packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Tamper with harbor_id
         packet.harbor_id = [0u8; 32];
@@ -1177,16 +1394,36 @@ mod tests {
     #[test]
     fn test_error_display() {
         assert!(PacketError::InvalidMac.to_string().contains("MAC"));
-        assert!(PacketError::InvalidSignature.to_string().contains("signature"));
-        assert!(PacketError::DecryptionFailed.to_string().contains("decryption"));
-        assert!(PacketError::HarborIdMismatch.to_string().contains("HarborID"));
+        assert!(
+            PacketError::InvalidSignature
+                .to_string()
+                .contains("signature")
+        );
+        assert!(
+            PacketError::EncryptionFailed
+                .to_string()
+                .contains("encryption")
+        );
+        assert!(
+            PacketError::DecryptionFailed
+                .to_string()
+                .contains("decryption")
+        );
+        assert!(
+            PacketError::HarborIdMismatch
+                .to_string()
+                .contains("HarborID")
+        );
         assert!(PacketError::SenderIdMismatch.to_string().contains("sender"));
 
         let payload_err = PacketError::PayloadTooLarge { size: 100, max: 50 };
         assert!(payload_err.to_string().contains("100"));
         assert!(payload_err.to_string().contains("50"));
 
-        let epoch_err = PacketError::EpochMismatch { packet_epoch: 5, key_epoch: 3 };
+        let epoch_err = PacketError::EpochMismatch {
+            packet_epoch: 5,
+            key_epoch: 3,
+        };
         assert!(epoch_err.to_string().contains("epoch"));
         assert!(epoch_err.to_string().contains("5"));
         assert!(epoch_err.to_string().contains("3"));
@@ -1194,6 +1431,46 @@ mod tests {
         let no_key_err = PacketError::NoEpochKey { epoch: 7 };
         assert!(no_key_err.to_string().contains("epoch"));
         assert!(no_key_err.to_string().contains("7"));
+    }
+
+    #[test]
+    fn test_create_and_verify_dm_packet() {
+        let sender = generate_key_pair();
+        let recipient = generate_key_pair();
+        let plaintext = b"hello dm";
+
+        let packet = create_dm_packet(
+            &sender.private_key,
+            &sender.public_key,
+            &recipient.public_key,
+            plaintext,
+            generate_packet_id(),
+        )
+        .unwrap();
+
+        assert!(packet.is_dm());
+        assert_eq!(packet.harbor_id, recipient.public_key);
+
+        let decrypted = verify_and_decrypt_dm_packet(&packet, &recipient.private_key).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_verify_dm_rejects_non_dm_packet() {
+        let topic_id = test_topic_id();
+        let sender = generate_key_pair();
+
+        let packet = create_packet(
+            &topic_id,
+            &sender.private_key,
+            &sender.public_key,
+            b"not dm",
+            generate_packet_id(),
+        )
+        .unwrap();
+
+        let result = verify_and_decrypt_dm_packet(&packet, &sender.private_key);
+        assert!(matches!(result, Err(PacketError::InvalidFormat(_))));
     }
 
     // =========================================================================
@@ -1205,7 +1482,7 @@ mod tests {
         // Scenario (Tier 2+): Alice sends message at epoch 1
         // Bob joins at epoch 5 and only has epoch 5 keys
         // Bob should NOT be able to decrypt Alice's epoch 1 message
-        
+
         let topic_id = test_topic_id();
         let alice = generate_key_pair();
         let secret_message = b"This message was sent before Bob joined";
@@ -1219,11 +1496,12 @@ mod tests {
             secret_message,
             &epoch_1_keys,
             generate_packet_id(),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Bob only has epoch 5 keys (joined at epoch 5)
         let epoch_5_keys = EpochKeys::derive_from_topic(&topic_id, 5);
-        
+
         // Bob attempts to decrypt - should fail with EpochMismatch
         let result = verify_and_decrypt_with_epoch(
             &packet,
@@ -1231,11 +1509,14 @@ mod tests {
             &epoch_5_keys,
             VerificationMode::Full,
         );
-        
-        assert!(matches!(result, Err(PacketError::EpochMismatch { 
-            packet_epoch: 1, 
-            key_epoch: 5 
-        })));
+
+        assert!(matches!(
+            result,
+            Err(PacketError::EpochMismatch {
+                packet_epoch: 1,
+                key_epoch: 5
+            })
+        ));
     }
 
     #[test]
@@ -1243,7 +1524,7 @@ mod tests {
         // Scenario: Alice is removed at epoch 3
         // Charlie sends message at epoch 4
         // Alice (with only epoch 0-3 keys) cannot decrypt epoch 4 messages
-        
+
         let topic_id = test_topic_id();
         let charlie = generate_key_pair();
         let message = b"Message after Alice was removed";
@@ -1257,11 +1538,12 @@ mod tests {
             message,
             &epoch_4_keys,
             generate_packet_id(),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Alice only has up to epoch 3 keys
         let epoch_3_keys = EpochKeys::derive_from_topic(&topic_id, 3);
-        
+
         // Alice attempts to decrypt - should fail
         let result = verify_and_decrypt_with_epoch(
             &packet,
@@ -1269,18 +1551,21 @@ mod tests {
             &epoch_3_keys,
             VerificationMode::Full,
         );
-        
-        assert!(matches!(result, Err(PacketError::EpochMismatch { 
-            packet_epoch: 4, 
-            key_epoch: 3 
-        })));
+
+        assert!(matches!(
+            result,
+            Err(PacketError::EpochMismatch {
+                packet_epoch: 4,
+                key_epoch: 3
+            })
+        ));
     }
 
     #[test]
     fn test_epoch_keys_cryptographic_isolation() {
         // Verify that epoch keys are truly independent
         // Same plaintext encrypted with different epochs should be completely different
-        
+
         let topic_id = test_topic_id();
         let kp = generate_key_pair();
         let plaintext = b"Same message, different epochs";
@@ -1289,49 +1574,93 @@ mod tests {
         let epoch_2_keys = EpochKeys::derive_from_topic(&topic_id, 2);
 
         let packet_1 = create_packet_with_epoch(
-            &topic_id, &kp.private_key, &kp.public_key, plaintext, &epoch_1_keys, generate_packet_id()
-        ).unwrap();
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            &epoch_1_keys,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         let packet_2 = create_packet_with_epoch(
-            &topic_id, &kp.private_key, &kp.public_key, plaintext, &epoch_2_keys, generate_packet_id()
-        ).unwrap();
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            &epoch_2_keys,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Ciphertexts should be different (different keys + different nonces)
         assert_ne!(packet_1.ciphertext, packet_2.ciphertext);
-        
+
         // MACs should be different (different MAC keys)
         assert_ne!(packet_1.mac, packet_2.mac);
-        
+
         // Epochs should be recorded correctly
         assert_eq!(packet_1.epoch, 1);
         assert_eq!(packet_2.epoch, 2);
 
         // Each packet should only decrypt with its own epoch keys
-        assert!(verify_and_decrypt_with_epoch(&packet_1, &topic_id, &epoch_1_keys, VerificationMode::Full).is_ok());
-        assert!(verify_and_decrypt_with_epoch(&packet_2, &topic_id, &epoch_2_keys, VerificationMode::Full).is_ok());
-        
+        assert!(
+            verify_and_decrypt_with_epoch(
+                &packet_1,
+                &topic_id,
+                &epoch_1_keys,
+                VerificationMode::Full
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_and_decrypt_with_epoch(
+                &packet_2,
+                &topic_id,
+                &epoch_2_keys,
+                VerificationMode::Full
+            )
+            .is_ok()
+        );
+
         // Cross-epoch decryption should fail
-        assert!(verify_and_decrypt_with_epoch(&packet_1, &topic_id, &epoch_2_keys, VerificationMode::Full).is_err());
-        assert!(verify_and_decrypt_with_epoch(&packet_2, &topic_id, &epoch_1_keys, VerificationMode::Full).is_err());
+        assert!(
+            verify_and_decrypt_with_epoch(
+                &packet_1,
+                &topic_id,
+                &epoch_2_keys,
+                VerificationMode::Full
+            )
+            .is_err()
+        );
+        assert!(
+            verify_and_decrypt_with_epoch(
+                &packet_2,
+                &topic_id,
+                &epoch_1_keys,
+                VerificationMode::Full
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_epoch_keys_derive_from_secret() {
         // Test deriving epoch keys from an epoch secret (Tier 2+)
         let epoch_secret = [42u8; 32]; // Simulated admin-distributed epoch secret
-        
+
         let keys = EpochKeys::derive_from_secret(10, &epoch_secret);
-        
+
         assert_eq!(keys.epoch, 10);
         assert_ne!(keys.k_enc, epoch_secret); // Should be derived, not raw
         assert_ne!(keys.k_mac, epoch_secret);
         assert_ne!(keys.k_enc, keys.k_mac); // enc and mac keys should differ
-        
+
         // Same secret + epoch should produce same keys (deterministic)
         let keys2 = EpochKeys::derive_from_secret(10, &epoch_secret);
         assert_eq!(keys.k_enc, keys2.k_enc);
         assert_eq!(keys.k_mac, keys2.k_mac);
-        
+
         // Different epoch should produce different keys
         let keys3 = EpochKeys::derive_from_secret(11, &epoch_secret);
         assert_ne!(keys.k_enc, keys3.k_enc);
@@ -1343,10 +1672,10 @@ mod tests {
         // Keys for same epoch but different topics should be different
         let topic_a = [1u8; 32];
         let topic_b = [2u8; 32];
-        
+
         let keys_a = EpochKeys::derive_from_topic(&topic_a, 5);
         let keys_b = EpochKeys::derive_from_topic(&topic_b, 5);
-        
+
         assert_ne!(keys_a.k_enc, keys_b.k_enc);
         assert_ne!(keys_a.k_mac, keys_b.k_mac);
     }
@@ -1355,10 +1684,10 @@ mod tests {
     fn test_historical_epoch_decryption() {
         // Member should be able to decrypt old messages if they have historical keys
         // This simulates offline member catching up
-        
+
         let topic_id = test_topic_id();
         let sender = generate_key_pair();
-        
+
         // Store messages from different epochs
         let mut packets = Vec::new();
         for epoch in 0..5 {
@@ -1371,7 +1700,8 @@ mod tests {
                 msg.as_bytes(),
                 &keys,
                 generate_packet_id(),
-            ).unwrap();
+            )
+            .unwrap();
             packets.push((epoch, packet));
         }
 
@@ -1379,11 +1709,10 @@ mod tests {
         // should be able to decrypt all messages
         for (epoch, packet) in &packets {
             let keys = EpochKeys::derive_from_topic(&topic_id, *epoch);
-            let result = verify_and_decrypt_with_epoch(
-                packet, &topic_id, &keys, VerificationMode::Full
-            );
+            let result =
+                verify_and_decrypt_with_epoch(packet, &topic_id, &keys, VerificationMode::Full);
             assert!(result.is_ok(), "Should decrypt epoch {} message", epoch);
-            
+
             let decrypted = result.unwrap();
             let expected = format!("Message from epoch {}", epoch);
             assert_eq!(decrypted, expected.as_bytes());
@@ -1395,15 +1724,22 @@ mod tests {
             if *epoch >= join_epoch {
                 // Has keys - should decrypt
                 let keys = EpochKeys::derive_from_topic(&topic_id, *epoch);
-                assert!(verify_and_decrypt_with_epoch(
-                    packet, &topic_id, &keys, VerificationMode::Full
-                ).is_ok());
+                assert!(
+                    verify_and_decrypt_with_epoch(packet, &topic_id, &keys, VerificationMode::Full)
+                        .is_ok()
+                );
             } else {
                 // Doesn't have keys - attempting with wrong epoch should fail
                 let wrong_keys = EpochKeys::derive_from_topic(&topic_id, join_epoch);
-                assert!(verify_and_decrypt_with_epoch(
-                    packet, &topic_id, &wrong_keys, VerificationMode::Full
-                ).is_err());
+                assert!(
+                    verify_and_decrypt_with_epoch(
+                        packet,
+                        &topic_id,
+                        &wrong_keys,
+                        VerificationMode::Full
+                    )
+                    .is_err()
+                );
             }
         }
     }
@@ -1412,18 +1748,27 @@ mod tests {
     fn test_epoch_embedded_in_aad() {
         // Verify that epoch is included in AAD (authenticated associated data)
         // Tampering with epoch field should cause decryption failure
-        
+
         let topic_id = test_topic_id();
         let kp = generate_key_pair();
         let plaintext = b"AAD test message";
 
         let keys = EpochKeys::derive_from_topic(&topic_id, 7);
         let mut packet = create_packet_with_epoch(
-            &topic_id, &kp.private_key, &kp.public_key, plaintext, &keys, generate_packet_id()
-        ).unwrap();
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            &keys,
+            generate_packet_id(),
+        )
+        .unwrap();
 
         // Verify normal decryption works
-        assert!(verify_and_decrypt_with_epoch(&packet, &topic_id, &keys, VerificationMode::Full).is_ok());
+        assert!(
+            verify_and_decrypt_with_epoch(&packet, &topic_id, &keys, VerificationMode::Full)
+                .is_ok()
+        );
 
         // Tamper with epoch field in packet
         packet.epoch = 8; // Change from 7 to 8
@@ -1431,8 +1776,13 @@ mod tests {
         // Decryption should fail even with "correct" epoch 8 keys
         // because the ciphertext was authenticated with epoch 7 in AAD
         let epoch_8_keys = EpochKeys::derive_from_topic(&topic_id, 8);
-        let result = verify_and_decrypt_with_epoch(&packet, &topic_id, &epoch_8_keys, VerificationMode::Full);
-        
+        let result = verify_and_decrypt_with_epoch(
+            &packet,
+            &topic_id,
+            &epoch_8_keys,
+            VerificationMode::Full,
+        );
+
         // Should fail at MAC verification (epoch in MAC key derivation)
         // or decryption (epoch in AAD)
         assert!(result.is_err());
@@ -1446,17 +1796,28 @@ mod tests {
         let plaintext = b"Legacy message";
         let packet_id = generate_packet_id();
 
-        let packet = create_packet(&topic_id, &kp.private_key, &kp.public_key, plaintext, packet_id).unwrap();
-        
+        let packet = create_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            packet_id,
+        )
+        .unwrap();
+
         assert_eq!(packet.epoch, 0);
-        
+
         // Should decrypt with epoch 0 keys
         let epoch_0_keys = EpochKeys::derive_from_topic(&topic_id, 0);
         let decrypted = verify_and_decrypt_with_epoch(
-            &packet, &topic_id, &epoch_0_keys, VerificationMode::Full
-        ).unwrap();
+            &packet,
+            &topic_id,
+            &epoch_0_keys,
+            VerificationMode::Full,
+        )
+        .unwrap();
         assert_eq!(decrypted, plaintext);
-        
+
         // Legacy verify_and_decrypt_packet should also work
         let decrypted2 = verify_and_decrypt_packet(&packet, &topic_id).unwrap();
         assert_eq!(decrypted2, plaintext);
@@ -1471,8 +1832,14 @@ mod tests {
 
         let keys = EpochKeys::derive_from_topic(&topic_id, 42);
         let packet = create_packet_with_epoch(
-            &topic_id, &kp.private_key, &kp.public_key, plaintext, &keys, packet_id
-        ).unwrap();
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            plaintext,
+            &keys,
+            packet_id,
+        )
+        .unwrap();
 
         // Serialize and deserialize
         let bytes = packet.to_bytes().unwrap();
@@ -1486,9 +1853,9 @@ mod tests {
         assert_eq!(restored.mac, packet.mac);
 
         // Should still decrypt
-        let decrypted = verify_and_decrypt_with_epoch(
-            &restored, &topic_id, &keys, VerificationMode::Full
-        ).unwrap();
+        let decrypted =
+            verify_and_decrypt_with_epoch(&restored, &topic_id, &keys, VerificationMode::Full)
+                .unwrap();
         assert_eq!(decrypted, plaintext);
     }
 }

@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::resilience::ProofOfWork;
+use crate::security::PacketId;
 
 /// ALPN for Harbor protocol
 pub const HARBOR_ALPN: &[u8] = b"harbor/store/0";
@@ -29,9 +30,14 @@ pub enum HarborMessage {
 }
 
 impl HarborMessage {
+    /// Encode message to bytes (fallible)
+    pub fn try_encode(&self) -> Result<Vec<u8>, DecodeError> {
+        postcard::to_allocvec(self).map_err(|e| DecodeError::InvalidMessage(e.to_string()))
+    }
+
     /// Encode message to bytes
     pub fn encode(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("serialization should not fail")
+        self.try_encode().expect("serialization should not fail")
     }
 
     /// Decode message from bytes
@@ -50,7 +56,7 @@ pub struct StoreRequest {
     /// The serialized SendPacket (opaque encrypted bytes)
     pub packet_data: Vec<u8>,
     /// Packet ID (for deduplication)
-    pub packet_id: [u8; 32],
+    pub packet_id: PacketId,
     /// HarborID (for routing)
     pub harbor_id: [u8; 32],
     /// Sender's EndpointID
@@ -65,7 +71,7 @@ pub struct StoreRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreResponse {
     /// Packet ID being acknowledged
-    pub packet_id: [u8; 32],
+    pub packet_id: PacketId,
     /// Whether the store was successful
     pub success: bool,
     /// Error message if failed
@@ -85,7 +91,7 @@ pub struct PullRequest {
     /// (used for new members who shouldn't get old packets)
     pub since_timestamp: i64,
     /// Packet IDs the client already has (to avoid re-sending)
-    pub already_have: Vec<[u8; 32]>,
+    pub already_have: Vec<PacketId>,
     /// Optional relay URL for member discovery
     /// Used by Harbor Nodes to track member connectivity info
     #[serde(default)]
@@ -108,7 +114,7 @@ pub struct PullResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PacketInfo {
     /// Packet ID
-    pub packet_id: [u8; 32],
+    pub packet_id: PacketId,
     /// Sender's EndpointID
     pub sender_id: [u8; 32],
     /// Serialized packet data (opaque encrypted bytes)
@@ -121,7 +127,7 @@ pub struct PacketInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryAck {
     /// Packet ID being acknowledged
-    pub packet_id: [u8; 32],
+    pub packet_id: PacketId,
     /// Recipient who received it
     pub recipient_id: [u8; 32],
 }
@@ -132,7 +138,7 @@ pub struct SyncRequest {
     /// HarborID to sync
     pub harbor_id: [u8; 32],
     /// Packet IDs we already have
-    pub have_packets: Vec<[u8; 32]>,
+    pub have_packets: Vec<PacketId>,
     /// Delivery status updates (packet_id -> delivered recipients)
     pub delivery_updates: Vec<DeliveryUpdate>,
     /// Member entries we have (for sync)
@@ -154,7 +160,7 @@ pub struct MemberSyncEntry {
 /// Delivery status update for sync
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryUpdate {
-    pub packet_id: [u8; 32],
+    pub packet_id: PacketId,
     pub delivered_to: Vec<[u8; 32]>,
 }
 
@@ -220,7 +226,7 @@ mod tests {
     fn test_store_request_roundtrip() {
         let msg = HarborMessage::Store(StoreRequest {
             packet_data: b"encrypted packet data".to_vec(),
-            packet_id: [1u8; 32],
+            packet_id: [1u8; 16],
             harbor_id: [2u8; 32],
             sender_id: [3u8; 32],
             recipients: vec![[10u8; 32], [11u8; 32]],
@@ -231,7 +237,7 @@ mod tests {
         let decoded = HarborMessage::decode(&encoded).unwrap();
 
         if let HarborMessage::Store(req) = decoded {
-            assert_eq!(req.packet_id, [1u8; 32]);
+            assert_eq!(req.packet_id, [1u8; 16]);
             assert_eq!(req.harbor_id, [2u8; 32]);
             assert_eq!(req.recipients.len(), 2);
         } else {
@@ -242,7 +248,7 @@ mod tests {
     #[test]
     fn test_store_response_roundtrip() {
         let msg = HarborMessage::StoreResponse(StoreResponse {
-            packet_id: [1u8; 32],
+            packet_id: [1u8; 16],
             success: true,
             error: None,
             required_difficulty: None,
@@ -264,7 +270,7 @@ mod tests {
             harbor_id: [1u8; 32],
             recipient_id: [2u8; 32],
             since_timestamp: 1704067200,
-            already_have: vec![[10u8; 32]],
+            already_have: vec![[10u8; 16]],
             relay_url: None,
         });
 
@@ -294,7 +300,10 @@ mod tests {
         let decoded = HarborMessage::decode(&encoded).unwrap();
 
         if let HarborMessage::Pull(req) = decoded {
-            assert_eq!(req.relay_url, Some("https://relay.example.com/".to_string()));
+            assert_eq!(
+                req.relay_url,
+                Some("https://relay.example.com/".to_string())
+            );
         } else {
             panic!("wrong message type");
         }
@@ -306,13 +315,13 @@ mod tests {
             harbor_id: [1u8; 32],
             packets: vec![
                 PacketInfo {
-                    packet_id: [10u8; 32],
+                    packet_id: [10u8; 16],
                     sender_id: [20u8; 32],
                     packet_data: b"packet 1".to_vec(),
                     created_at: 1704067200,
                 },
                 PacketInfo {
-                    packet_id: [11u8; 32],
+                    packet_id: [11u8; 16],
                     sender_id: [21u8; 32],
                     packet_data: b"packet 2".to_vec(),
                     created_at: 1704067201,
@@ -333,7 +342,7 @@ mod tests {
     #[test]
     fn test_delivery_ack_roundtrip() {
         let msg = HarborMessage::Ack(DeliveryAck {
-            packet_id: [1u8; 32],
+            packet_id: [1u8; 16],
             recipient_id: [2u8; 32],
         });
 
@@ -341,7 +350,7 @@ mod tests {
         let decoded = HarborMessage::decode(&encoded).unwrap();
 
         if let HarborMessage::Ack(ack) = decoded {
-            assert_eq!(ack.packet_id, [1u8; 32]);
+            assert_eq!(ack.packet_id, [1u8; 16]);
             assert_eq!(ack.recipient_id, [2u8; 32]);
         } else {
             panic!("wrong message type");
@@ -352,9 +361,9 @@ mod tests {
     fn test_sync_request_roundtrip() {
         let msg = HarborMessage::SyncRequest(SyncRequest {
             harbor_id: [1u8; 32],
-            have_packets: vec![[10u8; 32], [11u8; 32]],
+            have_packets: vec![[10u8; 16], [11u8; 16]],
             delivery_updates: vec![DeliveryUpdate {
-                packet_id: [10u8; 32],
+                packet_id: [10u8; 16],
                 delivered_to: vec![[100u8; 32]],
             }],
             member_entries: vec![],
@@ -433,13 +442,13 @@ mod tests {
         let msg = HarborMessage::SyncResponse(SyncResponse {
             harbor_id: [1u8; 32],
             missing_packets: vec![PacketInfo {
-                packet_id: [10u8; 32],
+                packet_id: [10u8; 16],
                 sender_id: [20u8; 32],
                 packet_data: b"packet data".to_vec(),
                 created_at: 1704067200,
             }],
             delivery_updates: vec![DeliveryUpdate {
-                packet_id: [11u8; 32],
+                packet_id: [11u8; 16],
                 delivered_to: vec![[100u8; 32], [101u8; 32]],
             }],
             members: vec![],
@@ -506,7 +515,7 @@ mod tests {
     #[test]
     fn test_store_response_with_error() {
         let msg = HarborMessage::StoreResponse(StoreResponse {
-            packet_id: [1u8; 32],
+            packet_id: [1u8; 16],
             success: false,
             error: Some("packet too large".to_string()),
             required_difficulty: None,
@@ -523,5 +532,58 @@ mod tests {
         }
     }
 
-}
+    #[test]
+    fn test_try_encode_matches_encode() {
+        let msg = HarborMessage::Ack(DeliveryAck {
+            packet_id: [1u8; 16],
+            recipient_id: [2u8; 32],
+        });
 
+        let a = msg.encode();
+        let b = msg.try_encode().unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_pull_request_decode_missing_relay_url_rejected() {
+        let legacy = ([1u8; 32], [2u8; 32], 1704067200i64, vec![[3u8; 16]]);
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let decoded: Result<PullRequest, _> = postcard::from_bytes(&bytes);
+        assert!(decoded.is_err());
+    }
+
+    #[test]
+    fn test_sync_request_decode_missing_member_entries_rejected() {
+        let legacy = (
+            [1u8; 32],
+            vec![[10u8; 16], [11u8; 16]],
+            vec![DeliveryUpdate {
+                packet_id: [11u8; 16],
+                delivered_to: vec![[100u8; 32]],
+            }],
+        );
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let decoded: Result<SyncRequest, _> = postcard::from_bytes(&bytes);
+        assert!(decoded.is_err());
+    }
+
+    #[test]
+    fn test_sync_response_decode_missing_members_rejected() {
+        let legacy = (
+            [1u8; 32],
+            vec![PacketInfo {
+                packet_id: [10u8; 16],
+                sender_id: [20u8; 32],
+                packet_data: b"packet data".to_vec(),
+                created_at: 1704067200,
+            }],
+            vec![DeliveryUpdate {
+                packet_id: [11u8; 16],
+                delivered_to: vec![[100u8; 32]],
+            }],
+        );
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let decoded: Result<SyncResponse, _> = postcard::from_bytes(&bytes);
+        assert!(decoded.is_err());
+    }
+}

@@ -8,8 +8,8 @@
 //!   harbor-cli --serve --bootstrap <id>:<relay>     # Use custom bootstrap node
 //!   harbor-cli --serve --no-default-bootstrap       # Don't use default bootstrap
 
-mod http;
 mod events;
+mod http;
 
 use std::collections::HashMap;
 use std::env;
@@ -33,7 +33,10 @@ fn db_key_from_env() -> [u8; 32] {
         std::process::exit(1);
     });
     if bytes.len() != 32 {
-        eprintln!("Error: HARBOR_DB_KEY must be exactly 64 hex characters (32 bytes), got {}.", hex_str.len());
+        eprintln!(
+            "Error: HARBOR_DB_KEY must be exactly 64 hex characters (32 bytes), got {}.",
+            hex_str.len()
+        );
         std::process::exit(1);
     }
     let mut key = [0u8; 32];
@@ -53,12 +56,16 @@ fn print_usage() {
     println!("Options:");
     println!("  --serve, -s                 Run in serve mode (required)");
     println!("  --db-path <PATH>            Database path (default: harbor.db)");
-    println!("  --blob-path <PATH>          Blob storage path (default: .harbor_blobs/ next to db)");
+    println!(
+        "  --blob-path <PATH>          Blob storage path (default: .harbor_blobs/ next to db)"
+    );
     println!("  --api-port <PORT>           Enable HTTP API on this port");
     println!("  --max-storage <SIZE>        Max harbor storage (default: 10GB, e.g., 50GB, 100MB)");
     println!("  --bootstrap <ID:RELAY>      Use this bootstrap node (replaces defaults)");
     println!("  --no-default-bootstrap      Don't use any bootstrap (for first node)");
-    println!("  --testing                   Use shorter intervals (5-10s) for testing, enables sync");
+    println!(
+        "  --testing                   Use shorter intervals (5-10s) for testing, enables sync"
+    );
     println!("  --sync                      Enable CRDT sync feature");
     println!("  --help, -h                  Show this help");
     println!();
@@ -95,9 +102,13 @@ fn print_usage() {
     println!("  POST /api/dm/share          Share a file via DM (JSON: recipient, file_path)");
     println!();
     println!("Control Endpoints (peer connections & topic invites):");
-    println!("  POST /api/control/connect          Request peer connection (JSON: peer, relay_url?, display_name?, token?)");
+    println!(
+        "  POST /api/control/connect          Request peer connection (JSON: peer, relay_url?, display_name?, token?)"
+    );
     println!("  POST /api/control/accept           Accept connection request (JSON: request_id)");
-    println!("  POST /api/control/decline          Decline connection request (JSON: request_id, reason?)");
+    println!(
+        "  POST /api/control/decline          Decline connection request (JSON: request_id, reason?)"
+    );
     println!("  POST /api/control/invite           Generate connect invite (QR code)");
     println!("  POST /api/control/connect-with-invite  Connect using invite (JSON: invite)");
     println!("  POST /api/control/block            Block a peer (JSON: peer)");
@@ -108,7 +119,9 @@ fn print_usage() {
     println!("  POST /api/control/topic-decline    Decline topic invite (JSON: message_id)");
     println!("  POST /api/control/leave            Leave topic (JSON: topic)");
     println!("  POST /api/control/remove-member    Remove member from topic (JSON: topic, member)");
-    println!("  POST /api/control/suggest          Suggest peer introduction (JSON: to_peer, suggested_peer, note?)");
+    println!(
+        "  POST /api/control/suggest          Suggest peer introduction (JSON: to_peer, suggested_peer, note?)"
+    );
     println!("  GET  /api/control/pending-invites  List pending topic invites");
     println!();
     println!("Environment:");
@@ -121,7 +134,9 @@ fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim().to_uppercase();
 
     // Find where the number ends and unit begins
-    let num_end = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
+    let num_end = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
     let (num_str, unit) = s.split_at(num_end);
 
     let num: f64 = num_str.parse().ok()?;
@@ -158,7 +173,10 @@ fn parse_bootstrap_arg(arg: &str) -> Option<(String, Option<String>)> {
     if arg.len() == 64 && arg.chars().all(|c| c.is_ascii_hexdigit()) {
         Some((arg.to_string(), None))
     } else {
-        eprintln!("⚠️  Invalid bootstrap format: {}...", &arg[..arg.len().min(32)]);
+        eprintln!(
+            "⚠️  Invalid bootstrap format: {}...",
+            &arg[..arg.len().min(32)]
+        );
         eprintln!("   Expected: <64-hex-endpoint-id> or <64-hex-endpoint-id>:<relay-url>");
         None
     }
@@ -175,43 +193,49 @@ async fn main() {
     let testing_mode = args.iter().any(|a| a == "--testing");
 
     // Parse --db-path
-    let db_path: PathBuf = args.windows(2)
+    let db_path: PathBuf = args
+        .windows(2)
         .find(|w| w[0] == "--db-path")
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or_else(|| PathBuf::from("harbor.db"));
 
     // Parse --blob-path (default: hidden folder next to db)
-    let blob_path: PathBuf = args.windows(2)
+    let blob_path: PathBuf = args
+        .windows(2)
         .find(|w| w[0] == "--blob-path")
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or_else(|| {
             // Default: .harbor_blobs/ in same directory as database
-            db_path.parent()
+            db_path
+                .parent()
                 .map(|p| p.join(".harbor_blobs"))
                 .unwrap_or_else(|| PathBuf::from(".harbor_blobs"))
         });
 
     // Parse --api-port
-    let api_port: Option<u16> = args.windows(2)
+    let api_port: Option<u16> = args
+        .windows(2)
         .find(|w| w[0] == "--api-port")
         .and_then(|w| w[1].parse().ok());
 
     // Parse --bootstrap (can be specified multiple times)
-    let custom_bootstraps: Vec<(String, Option<String>)> = args.windows(2)
+    let custom_bootstraps: Vec<(String, Option<String>)> = args
+        .windows(2)
         .filter(|w| w[0] == "--bootstrap")
         .filter_map(|w| parse_bootstrap_arg(&w[1]))
         .collect();
 
     // Parse --max-storage
-    let max_storage: Option<u64> = args.windows(2)
-        .find(|w| w[0] == "--max-storage")
-        .and_then(|w| {
-            parse_size(&w[1]).or_else(|| {
-                eprintln!("⚠️  Invalid --max-storage value: {}", w[1]);
-                eprintln!("   Expected format: 50GB, 100MB, 1TB, etc.");
-                None
-            })
-        });
+    let max_storage: Option<u64> =
+        args.windows(2)
+            .find(|w| w[0] == "--max-storage")
+            .and_then(|w| {
+                parse_size(&w[1]).or_else(|| {
+                    eprintln!("⚠️  Invalid --max-storage value: {}", w[1]);
+                    eprintln!("   Expected format: 50GB, 100MB, 1TB, etc.");
+                    None
+                })
+            });
 
     if show_help {
         print_usage();
@@ -255,7 +279,10 @@ async fn main() {
     if let Some(bytes) = max_storage {
         config = config.with_max_storage(bytes);
         let display = if bytes >= 1024 * 1024 * 1024 * 1024 {
-            format!("{:.1} TB", bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0))
+            format!(
+                "{:.1} TB",
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0)
+            )
         } else if bytes >= 1024 * 1024 * 1024 {
             format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
         } else if bytes >= 1024 * 1024 {
@@ -285,7 +312,10 @@ async fn main() {
             if let Some(relay) = relay_url {
                 println!("Bootstrap: {}... @ {}", &endpoint_id[..16], relay);
             } else {
-                println!("Bootstrap: {}...", &endpoint_id[..16.min(endpoint_id.len())]);
+                println!(
+                    "Bootstrap: {}...",
+                    &endpoint_id[..16.min(endpoint_id.len())]
+                );
             }
         }
     } else if no_default_bootstrap {

@@ -10,9 +10,11 @@ use std::time::{Duration, Instant};
 /// Configuration for rate limiting
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
-    /// Maximum requests per window for a single connection
+    /// Maximum requests per window for a single connection.
+    /// Set to 0 to deny all connection-scoped requests.
     pub max_requests_per_connection: u32,
-    /// Maximum store requests per window for a single HarborID
+    /// Maximum store requests per window for a single HarborID.
+    /// Set to 0 to deny all store requests for every HarborID.
     pub max_stores_per_harbor_id: u32,
     /// Window duration
     pub window_duration: Duration,
@@ -72,7 +74,8 @@ impl SlidingWindow {
         if self.requests.len() >= self.max_requests as usize {
             // Rate limited - calculate retry time
             if let Some(&oldest) = self.requests.first() {
-                let retry_after = self.window_duration
+                let retry_after = self
+                    .window_duration
                     .saturating_sub(now.duration_since(oldest));
                 return RateLimitResult::Limited { retry_after };
             }
@@ -87,7 +90,7 @@ impl SlidingWindow {
     }
 
     /// Check without recording (peek)
-    /// 
+    ///
     /// Useful for read-only checks where you don't want to consume the rate limit.
     /// Currently unused but kept for future use cases like:
     /// - Checking if a request WOULD be allowed before doing expensive work
@@ -99,7 +102,8 @@ impl SlidingWindow {
 
         if active_count >= self.max_requests as usize {
             if let Some(&oldest) = self.requests.iter().find(|&&t| t > cutoff) {
-                let retry_after = self.window_duration
+                let retry_after = self
+                    .window_duration
                     .saturating_sub(now.duration_since(oldest));
                 return RateLimitResult::Limited { retry_after };
             }
@@ -120,9 +124,14 @@ pub struct RateLimiter {
     connection_limits: HashMap<[u8; 32], SlidingWindow>,
     /// Per-HarborID rate limits for store operations
     harbor_limits: HashMap<[u8; 32], SlidingWindow>,
+    /// Number of rate-limit checks since construction.
+    check_counter: u64,
 }
 
 impl RateLimiter {
+    /// Run opportunistic cleanup after this many checks.
+    const AUTO_CLEANUP_CHECK_INTERVAL: u64 = 64;
+
     /// Create a new rate limiter with default config
     pub fn new() -> Self {
         Self::with_config(RateLimitConfig::default())
@@ -134,6 +143,14 @@ impl RateLimiter {
             config,
             connection_limits: HashMap::new(),
             harbor_limits: HashMap::new(),
+            check_counter: 0,
+        }
+    }
+
+    fn maybe_cleanup(&mut self, now: Instant) {
+        self.check_counter = self.check_counter.saturating_add(1);
+        if self.check_counter % Self::AUTO_CLEANUP_CHECK_INTERVAL == 0 {
+            self.cleanup_with_now(now);
         }
     }
 
@@ -144,14 +161,19 @@ impl RateLimiter {
         }
 
         let now = Instant::now();
-        let window = self.connection_limits
+        let window = self
+            .connection_limits
             .entry(*endpoint_id)
-            .or_insert_with(|| SlidingWindow::new(
-                self.config.max_requests_per_connection,
-                self.config.window_duration,
-            ));
+            .or_insert_with(|| {
+                SlidingWindow::new(
+                    self.config.max_requests_per_connection,
+                    self.config.window_duration,
+                )
+            });
 
-        window.check_and_record(now)
+        let result = window.check_and_record(now);
+        self.maybe_cleanup(now);
+        result
     }
 
     /// Check if a store request for a specific HarborID is allowed
@@ -161,17 +183,22 @@ impl RateLimiter {
         }
 
         let now = Instant::now();
-        let window = self.harbor_limits
-            .entry(*harbor_id)
-            .or_insert_with(|| SlidingWindow::new(
+        let window = self.harbor_limits.entry(*harbor_id).or_insert_with(|| {
+            SlidingWindow::new(
                 self.config.max_stores_per_harbor_id,
                 self.config.window_duration,
-            ));
+            )
+        });
 
-        window.check_and_record(now)
+        let result = window.check_and_record(now);
+        self.maybe_cleanup(now);
+        result
     }
 
     /// Check both connection and store limits for a store request
+    ///
+    /// Note: Connection checks run first and consume connection budget even if
+    /// the subsequent HarborID check rejects the request.
     pub fn check_store_request(
         &mut self,
         endpoint_id: &[u8; 32],
@@ -189,20 +216,24 @@ impl RateLimiter {
 
     /// Clean up old entries to prevent memory bloat
     pub fn cleanup(&mut self) {
-        let now = Instant::now();
-        let window_duration = self.config.window_duration;
+        self.cleanup_with_now(Instant::now());
+    }
 
+    fn cleanup_with_now(&mut self, now: Instant) {
+        let stale_after = self.config.window_duration.saturating_mul(2);
         // Remove entries with no recent activity
         self.connection_limits.retain(|_, window| {
-            window.requests.iter().any(|&t| {
-                now.duration_since(t) < window_duration * 2
-            })
+            window
+                .requests
+                .iter()
+                .any(|&t| now.saturating_duration_since(t) < stale_after)
         });
 
         self.harbor_limits.retain(|_, window| {
-            window.requests.iter().any(|&t| {
-                now.duration_since(t) < window_duration * 2
-            })
+            window
+                .requests
+                .iter()
+                .any(|&t| now.saturating_duration_since(t) < stale_after)
         });
     }
 
@@ -235,6 +266,12 @@ mod tests {
 
     fn test_id(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    fn test_id_u16(seed: u16) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[..2].copy_from_slice(&seed.to_le_bytes());
+        id
     }
 
     #[test]
@@ -290,15 +327,24 @@ mod tests {
         let mut limiter = RateLimiter::with_config(config);
 
         // Connection 1 uses its limit
-        assert_eq!(limiter.check_connection(&test_id(1)), RateLimitResult::Allowed);
-        assert_eq!(limiter.check_connection(&test_id(1)), RateLimitResult::Allowed);
+        assert_eq!(
+            limiter.check_connection(&test_id(1)),
+            RateLimitResult::Allowed
+        );
+        assert_eq!(
+            limiter.check_connection(&test_id(1)),
+            RateLimitResult::Allowed
+        );
         assert!(matches!(
             limiter.check_connection(&test_id(1)),
             RateLimitResult::Limited { .. }
         ));
 
         // Connection 2 should still be allowed
-        assert_eq!(limiter.check_connection(&test_id(2)), RateLimitResult::Allowed);
+        assert_eq!(
+            limiter.check_connection(&test_id(2)),
+            RateLimitResult::Allowed
+        );
     }
 
     #[test]
@@ -334,8 +380,14 @@ mod tests {
         let mut limiter = RateLimiter::with_config(config);
 
         // Use up the limit
-        assert_eq!(limiter.check_connection(&test_id(1)), RateLimitResult::Allowed);
-        assert_eq!(limiter.check_connection(&test_id(1)), RateLimitResult::Allowed);
+        assert_eq!(
+            limiter.check_connection(&test_id(1)),
+            RateLimitResult::Allowed
+        );
+        assert_eq!(
+            limiter.check_connection(&test_id(1)),
+            RateLimitResult::Allowed
+        );
         assert!(matches!(
             limiter.check_connection(&test_id(1)),
             RateLimitResult::Limited { .. }
@@ -345,7 +397,10 @@ mod tests {
         sleep(Duration::from_millis(60));
 
         // Should be allowed again
-        assert_eq!(limiter.check_connection(&test_id(1)), RateLimitResult::Allowed);
+        assert_eq!(
+            limiter.check_connection(&test_id(1)),
+            RateLimitResult::Allowed
+        );
     }
 
     #[test]
@@ -360,7 +415,10 @@ mod tests {
 
         // Should always allow when disabled
         for _ in 0..100 {
-            assert_eq!(limiter.check_connection(&test_id(1)), RateLimitResult::Allowed);
+            assert_eq!(
+                limiter.check_connection(&test_id(1)),
+                RateLimitResult::Allowed
+            );
             assert_eq!(limiter.check_store(&test_id(1)), RateLimitResult::Allowed);
         }
     }
@@ -424,5 +482,98 @@ mod tests {
         assert_eq!(limiter.stats().tracked_connections, 0);
         assert_eq!(limiter.stats().tracked_harbors, 0);
     }
-}
 
+    #[test]
+    fn test_auto_cleanup_runs_during_checks() {
+        let config = RateLimitConfig {
+            max_requests_per_connection: 10,
+            max_stores_per_harbor_id: 10,
+            window_duration: Duration::from_millis(5),
+            enabled: true,
+        };
+        let mut limiter = RateLimiter::with_config(config);
+
+        // Add many distinct connection keys.
+        for i in 0..100 {
+            assert_eq!(
+                limiter.check_connection(&test_id_u16(i)),
+                RateLimitResult::Allowed
+            );
+        }
+        assert_eq!(limiter.stats().tracked_connections, 100);
+
+        // Let those entries become stale.
+        sleep(Duration::from_millis(15));
+
+        // Trigger opportunistic cleanup via repeated checks.
+        for _ in 0..RateLimiter::AUTO_CLEANUP_CHECK_INTERVAL {
+            let _ = limiter.check_connection(&test_id(250));
+        }
+
+        // Stale entries should be gone; only actively-used key remains.
+        assert_eq!(limiter.stats().tracked_connections, 1);
+    }
+
+    #[test]
+    fn test_cleanup_handles_extreme_window_duration() {
+        let config = RateLimitConfig {
+            max_requests_per_connection: 10,
+            max_stores_per_harbor_id: 10,
+            window_duration: Duration::MAX,
+            enabled: true,
+        };
+        let mut limiter = RateLimiter::with_config(config);
+
+        let _ = limiter.check_connection(&test_id(1));
+        let _ = limiter.check_store(&test_id(2));
+
+        // Should not panic or overflow.
+        limiter.cleanup();
+
+        assert_eq!(limiter.stats().tracked_connections, 1);
+        assert_eq!(limiter.stats().tracked_harbors, 1);
+    }
+
+    #[test]
+    fn test_check_store_request_consumes_connection_budget_first() {
+        let config = RateLimitConfig {
+            max_requests_per_connection: 1,
+            max_stores_per_harbor_id: 0, // Harbor limit denies all store requests.
+            window_duration: Duration::from_secs(10),
+            enabled: true,
+        };
+        let mut limiter = RateLimiter::with_config(config);
+        let endpoint = test_id(7);
+
+        // Harbor limit rejects, but connection budget is still consumed first.
+        assert!(matches!(
+            limiter.check_store_request(&endpoint, &test_id(10)),
+            RateLimitResult::Limited { .. }
+        ));
+        assert_eq!(limiter.stats().tracked_connections, 1);
+        assert!(matches!(
+            limiter.check_connection(&endpoint),
+            RateLimitResult::Limited { .. }
+        ));
+    }
+
+    #[test]
+    fn test_zero_limits_deny_all() {
+        let config = RateLimitConfig {
+            max_requests_per_connection: 0,
+            max_stores_per_harbor_id: 0,
+            window_duration: Duration::from_secs(1),
+            enabled: true,
+        };
+        let mut limiter = RateLimiter::with_config(config);
+
+        assert!(matches!(
+            limiter.check_connection(&test_id(1)),
+            RateLimitResult::Limited { .. }
+        ));
+        assert!(matches!(
+            limiter.check_store(&test_id(2)),
+            RateLimitResult::Limited { .. }
+        ));
+    }
+}

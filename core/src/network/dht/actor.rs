@@ -14,18 +14,18 @@
 use std::collections::{HashMap, HashSet};
 
 use irpc::channel::mpsc;
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use tokio::task::JoinSet;
-use tokio::time::{interval, Interval};
+use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, trace};
 
 use super::internal::api::ApiMessage;
 use super::internal::config::DhtConfig;
 use super::internal::distance::Id;
 use super::internal::pool::{DhtPool, DhtPoolError as PoolError, DialInfo};
-use super::internal::routing::{AddNodeResult, Buckets, RoutingTable, BUCKET_COUNT};
-use super::protocol::NodeInfo;
+use super::internal::routing::{AddNodeResult, BUCKET_COUNT, Buckets, RoutingTable};
+use super::protocol::{MAX_FIND_NODE_RESULTS, NodeInfo};
 use super::service::{DhtService, WeakDhtService};
 
 /// DHT node state
@@ -173,7 +173,7 @@ impl DhtActor {
                 }
             }
         }
-        
+
         debug!("DHT actor shutting down");
     }
 
@@ -235,12 +235,12 @@ impl DhtActor {
     /// Returns Ok(()) if node responds, Err if unreachable.
     async fn ping_node(&self, node: &Id) -> Result<(), PoolError> {
         let dial_info = DialInfo::from_node_id(
-            iroh::EndpointId::from_bytes(node.as_bytes()).expect("valid node id")
+            iroh::EndpointId::from_bytes(node.as_bytes()).expect("valid node id"),
         );
 
         // Try to get/establish connection
         let (conn, _relay_confirmed) = self.pool.get_connection(&dial_info).await?;
-        
+
         // Send a FindNode RPC to verify the node is actually responsive
         // Use a random target - we don't care about the result, just that it responds
         let random_target = Id::new(rand::random());
@@ -251,13 +251,20 @@ impl DhtActor {
         };
         let relay_url = self.pool.home_relay_url();
 
-        DhtService::send_find_node_on_conn(&conn, random_target, requester, relay_url).await?;
+        DhtService::send_find_node_on_conn(
+            &conn,
+            random_target,
+            *self.node.local_id().as_bytes(),
+            requester,
+            relay_url,
+        )
+        .await?;
 
         Ok(())
     }
 
     /// Verify candidate nodes by attempting to connect to them
-    /// 
+    ///
     /// Only nodes that we can successfully connect to are promoted
     /// to the routing table. This prevents Sybil attacks.
     async fn verify_candidates(&mut self) {
@@ -272,7 +279,8 @@ impl DhtActor {
         );
 
         // Take up to max_candidates_per_verify candidates
-        let to_verify: Vec<Id> = self.candidates
+        let to_verify: Vec<Id> = self
+            .candidates
             .iter()
             .take(self.config.max_candidates_per_verify)
             .copied()
@@ -288,9 +296,12 @@ impl DhtActor {
         }
 
         // Collect known relay URLs for candidates being verified
-        let candidate_relay_urls: HashMap<Id, String> = to_verify.iter()
+        let candidate_relay_urls: HashMap<Id, String> = to_verify
+            .iter()
             .filter_map(|id| {
-                self.node_relay_urls.get(id).map(|(url, _)| (*id, url.clone()))
+                self.node_relay_urls
+                    .get(id)
+                    .map(|(url, _)| (*id, url.clone()))
             })
             .collect();
 
@@ -323,7 +334,14 @@ impl DhtActor {
                             Some(*local_id.as_bytes())
                         };
 
-                        match DhtService::send_find_node_on_conn(&conn, random_target, requester, home_relay_url.clone()).await {
+                        match DhtService::send_find_node_on_conn(
+                            &conn,
+                            random_target,
+                            *local_id.as_bytes(),
+                            requester,
+                            home_relay_url.clone(),
+                        )
+                        .await {
                             Ok(_) => {
                                 trace!(node = %id, relay_confirmed = relay_confirmed, "candidate verified - FindNode RPC succeeded");
                                 verified.push(*id.as_bytes());
@@ -432,30 +450,31 @@ impl DhtActor {
             }
 
             ApiMessage::Lookup(msg) => {
-                let initial = msg.initial.as_ref()
+                let initial = msg
+                    .initial
+                    .as_ref()
                     .map(|ids| ids.iter().map(|id| Id::new(*id)).collect())
                     .unwrap_or_else(|| {
-                        self.node.routing_table.find_closest_nodes(&msg.target, self.config.k)
+                        self.node
+                            .routing_table
+                            .find_closest_nodes(&msg.target, self.config.k)
                     });
 
                 let pool = self.pool.clone();
                 let config = self.config.clone();
-                let service = self.service.clone().unwrap_or_else(|| {
-                    panic!("DhtActor::set_service must be called before run()")
-                });
+                let service = self
+                    .service
+                    .clone()
+                    .unwrap_or_else(|| panic!("DhtActor::set_service must be called before run()"));
                 let target = msg.target;
                 let local_id = *self.node.local_id();
                 let tx = msg.tx;
 
                 self.tasks.spawn(async move {
                     let result = DhtService::iterative_find_node(
-                        target,
-                        initial,
-                        local_id,
-                        pool,
-                        config,
-                        service,
-                    ).await;
+                        target, initial, local_id, pool, config, service,
+                    )
+                    .await;
 
                     let ids: Vec<[u8; 32]> = result.into_iter().map(|id| *id.as_bytes()).collect();
                     tx.send(ids).await.ok();
@@ -465,7 +484,10 @@ impl DhtActor {
             ApiMessage::GetRoutingTable(msg) => {
                 let buckets: Vec<Vec<[u8; 32]>> = (0..BUCKET_COUNT)
                     .map(|i| {
-                        self.node.routing_table.buckets.get(i)
+                        self.node
+                            .routing_table
+                            .buckets
+                            .get(i)
                             .nodes()
                             .iter()
                             .map(|id| *id.as_bytes())
@@ -476,7 +498,8 @@ impl DhtActor {
             }
 
             ApiMessage::GetNodeRelayUrls(msg) => {
-                let relay_urls: Vec<([u8; 32], String, Option<i64>)> = self.node_relay_urls
+                let relay_urls: Vec<([u8; 32], String, Option<i64>)> = self
+                    .node_relay_urls
                     .iter()
                     .map(|(id, (url, verified_at))| (*id.as_bytes(), url.clone(), *verified_at))
                     .collect();
@@ -489,7 +512,10 @@ impl DhtActor {
                     let id = Id::new(*id_bytes);
                     self.node_relay_urls.insert(id, (url.clone(), *verified_at));
                 }
-                debug!(count = self.node_relay_urls.len(), "restored node relay URLs from database");
+                debug!(
+                    count = self.node_relay_urls.len(),
+                    "restored node relay URLs from database"
+                );
             }
 
             ApiMessage::ConfirmRelayUrls(msg) => {
@@ -507,41 +533,58 @@ impl DhtActor {
                     }
                 }
                 if !msg.confirmed.is_empty() {
-                    debug!(count = msg.confirmed.len(), "updated relay URL verification status");
+                    debug!(
+                        count = msg.confirmed.len(),
+                        "updated relay URL verification status"
+                    );
                 }
             }
 
             ApiMessage::SelfLookup(msg) => {
                 let local_id = *self.node.local_id();
-                let initial = self.node.routing_table.find_closest_nodes(&local_id, self.config.k);
+                let initial = self
+                    .node
+                    .routing_table
+                    .find_closest_nodes(&local_id, self.config.k);
 
                 let pool = self.pool.clone();
                 let config = self.config.clone();
-                let service = self.service.clone().unwrap_or_else(|| {
-                    panic!("DhtActor::set_service must be called before run()")
-                });
+                let service = self
+                    .service
+                    .clone()
+                    .unwrap_or_else(|| panic!("DhtActor::set_service must be called before run()"));
                 let tx = msg.tx;
 
                 self.tasks.spawn(async move {
-                    DhtService::iterative_find_node(local_id, initial, local_id, pool, config, service).await;
+                    DhtService::iterative_find_node(
+                        local_id, initial, local_id, pool, config, service,
+                    )
+                    .await;
                     tx.send(()).await.ok();
                 });
             }
 
             ApiMessage::RandomLookup(msg) => {
                 let random_id = Id::new(self.rng.r#gen());
-                let initial = self.node.routing_table.find_closest_nodes(&random_id, self.config.k);
+                let initial = self
+                    .node
+                    .routing_table
+                    .find_closest_nodes(&random_id, self.config.k);
 
                 let pool = self.pool.clone();
                 let config = self.config.clone();
-                let service = self.service.clone().unwrap_or_else(|| {
-                    panic!("DhtActor::set_service must be called before run()")
-                });
+                let service = self
+                    .service
+                    .clone()
+                    .unwrap_or_else(|| panic!("DhtActor::set_service must be called before run()"));
                 let local_id = *self.node.local_id();
                 let tx = msg.tx;
 
                 self.tasks.spawn(async move {
-                    DhtService::iterative_find_node(random_id, initial, local_id, pool, config, service).await;
+                    DhtService::iterative_find_node(
+                        random_id, initial, local_id, pool, config, service,
+                    )
+                    .await;
                     tx.send(()).await.ok();
                 });
             }
@@ -557,7 +600,7 @@ impl DhtActor {
             ApiMessage::HandleFindNodeRequest(msg) => {
                 // Handle incoming FindNode request - this is the canonical handler
                 // that includes relay URLs in the response
-                
+
                 // If requester provided their ID, add them to routing table
                 if let Some(requester_id) = msg.requester {
                     if !self.config.transient {
@@ -565,7 +608,7 @@ impl DhtActor {
                         if id != *self.node.local_id() {
                             // Add directly - they connected to us, so they're verified
                             self.add_node_with_eviction(id).await;
-                            
+
                             // Store their relay URL if provided
                             // Only log if this is a new relay URL (avoid spam)
                             if let Some(ref relay_url) = msg.requester_relay_url {
@@ -585,14 +628,17 @@ impl DhtActor {
                                         }
                                     }
                                 };
-                                
+
                                 if is_new {
                                     // ALSO register with DhtPool so we can connect back to them
                                     let node_id = iroh::EndpointId::from_bytes(&requester_id)
                                         .expect("valid node id");
-                                    let dial_info = DialInfo::from_node_id_with_relay(node_id, relay_url.clone());
+                                    let dial_info = DialInfo::from_node_id_with_relay(
+                                        node_id,
+                                        relay_url.clone(),
+                                    );
                                     self.pool.register_dial_info(dial_info).await;
-                                    
+
                                     info!(
                                         requester = %id,
                                         relay = %relay_url,
@@ -603,9 +649,12 @@ impl DhtActor {
                         }
                     }
                 }
-                
+
                 // Find closest nodes and include relay URLs
-                let closest = self.node.routing_table.find_closest_nodes(&msg.target, self.config.k);
+                let closest = self
+                    .node
+                    .routing_table
+                    .find_closest_nodes(&msg.target, self.config.k.min(MAX_FIND_NODE_RESULTS));
                 let nodes: Vec<NodeInfo> = closest
                     .iter()
                     .map(|id| {
@@ -613,7 +662,7 @@ impl DhtActor {
                         NodeInfo::from_id_with_relay(id, relay_url)
                     })
                     .collect();
-                
+
                 // Log how many have relay URLs
                 let with_relay = nodes.iter().filter(|n| n.relay_url.is_some()).count();
                 debug!(
@@ -622,7 +671,7 @@ impl DhtActor {
                     with_relay = with_relay,
                     "handled FindNode request via API"
                 );
-                
+
                 msg.tx.send(nodes).await.ok();
             }
         }
@@ -631,11 +680,13 @@ impl DhtActor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::protocol::{FindNode, FindNodeResponse};
-    use super::super::internal::config::{DEFAULT_CANDIDATE_VERIFY_INTERVAL, MAX_CANDIDATES_PER_VERIFY};
+    use super::super::internal::config::{
+        DEFAULT_CANDIDATE_VERIFY_INTERVAL, MAX_CANDIDATES_PER_VERIFY,
+    };
     use super::super::internal::distance::Distance;
-    use super::super::internal::routing::{K, ALPHA};
+    use super::super::internal::routing::{ALPHA, K};
+    use super::super::protocol::{FindNode, FindNodeResponse};
+    use super::*;
     use crate::resilience::ProofOfWork;
     use std::collections::BTreeSet;
     use std::time::Duration;
@@ -659,7 +710,10 @@ mod tests {
         assert_eq!(config.k, K);
         assert_eq!(config.alpha, ALPHA);
         assert!(!config.transient);
-        assert_eq!(config.candidate_verify_interval, DEFAULT_CANDIDATE_VERIFY_INTERVAL);
+        assert_eq!(
+            config.candidate_verify_interval,
+            DEFAULT_CANDIDATE_VERIFY_INTERVAL
+        );
         assert_eq!(config.max_candidates_per_verify, MAX_CANDIDATES_PER_VERIFY);
     }
 
@@ -689,27 +743,27 @@ mod tests {
     #[test]
     fn test_candidate_set_basic_operations() {
         let mut candidates: HashSet<Id> = HashSet::new();
-        
+
         let id1 = make_id(1);
         let id2 = make_id(2);
         let id3 = make_id(3);
-        
+
         // Insert returns true for new entries
         assert!(candidates.insert(id1));
         assert!(candidates.insert(id2));
-        
+
         // Insert returns false for duplicates
         assert!(!candidates.insert(id1));
-        
+
         // Contains works
         assert!(candidates.contains(&id1));
         assert!(candidates.contains(&id2));
         assert!(!candidates.contains(&id3));
-        
+
         // Remove works
         assert!(candidates.remove(&id1));
         assert!(!candidates.contains(&id1));
-        
+
         // Can't remove what's not there
         assert!(!candidates.remove(&id3));
     }
@@ -718,9 +772,9 @@ mod tests {
     fn test_candidate_set_does_not_contain_self() {
         let local_id = make_id(1);
         let other_id = make_id(2);
-        
+
         let mut candidates: HashSet<Id> = HashSet::new();
-        
+
         // Should not add self
         if other_id != local_id {
             candidates.insert(other_id);
@@ -728,7 +782,7 @@ mod tests {
         if local_id != local_id {
             candidates.insert(local_id);
         }
-        
+
         assert!(candidates.contains(&other_id));
         assert!(!candidates.contains(&local_id));
     }
@@ -736,47 +790,47 @@ mod tests {
     #[test]
     fn test_candidate_batch_selection() {
         let mut candidates: HashSet<Id> = HashSet::new();
-        
+
         // Add 15 candidates
         for i in 0..15 {
             candidates.insert(make_id(i));
         }
-        
+
         assert_eq!(candidates.len(), 15);
-        
+
         // Take up to MAX_CANDIDATES_PER_VERIFY (10)
         let to_verify: Vec<Id> = candidates
             .iter()
             .take(MAX_CANDIDATES_PER_VERIFY)
             .copied()
             .collect();
-        
+
         assert_eq!(to_verify.len(), MAX_CANDIDATES_PER_VERIFY);
-        
+
         // Remove verified from candidates
         for id in &to_verify {
             candidates.remove(id);
         }
-        
+
         assert_eq!(candidates.len(), 5);
     }
 
     #[test]
     fn test_candidate_batch_selection_fewer_than_max() {
         let mut candidates: HashSet<Id> = HashSet::new();
-        
+
         // Add only 3 candidates
         for i in 0..3 {
             candidates.insert(make_id(i));
         }
-        
+
         // Take up to MAX but only get 3
         let to_verify: Vec<Id> = candidates
             .iter()
             .take(MAX_CANDIDATES_PER_VERIFY)
             .copied()
             .collect();
-        
+
         assert_eq!(to_verify.len(), 3);
     }
 
@@ -785,7 +839,7 @@ mod tests {
         // Transient nodes should not add requesters to candidates
         let config = DhtConfig::transient();
         assert!(config.transient);
-        
+
         // In handle_rpc, we check: if !self.config.transient
         // So transient nodes skip adding to candidates entirely
     }
@@ -935,7 +989,7 @@ mod tests {
 
         let bytes = postcard::to_allocvec(&response).unwrap();
         let decoded: FindNodeResponse = postcard::from_bytes(&bytes).unwrap();
-        
+
         assert_eq!(decoded.nodes.len(), 2);
         assert_eq!(decoded.nodes[0].node_id, [1u8; 32]);
         assert_eq!(decoded.nodes[0].addresses.len(), 1);
@@ -948,10 +1002,10 @@ mod tests {
     #[test]
     fn test_find_node_response_empty() {
         let response = FindNodeResponse { nodes: vec![] };
-        
+
         let bytes = postcard::to_allocvec(&response).unwrap();
         let decoded: FindNodeResponse = postcard::from_bytes(&bytes).unwrap();
-        
+
         assert!(decoded.nodes.is_empty());
     }
 
@@ -967,10 +1021,10 @@ mod tests {
             .collect();
 
         let response = FindNodeResponse { nodes };
-        
+
         let bytes = postcard::to_allocvec(&response).unwrap();
         let decoded: FindNodeResponse = postcard::from_bytes(&bytes).unwrap();
-        
+
         assert_eq!(decoded.nodes.len(), K);
     }
 
@@ -981,19 +1035,20 @@ mod tests {
             .map(|i| NodeInfo {
                 node_id: [i; 32],
                 // Realistic address list
-                addresses: vec![
-                    "192.168.1.1:4433".to_string(),
-                    "10.0.0.1:4433".to_string(),
-                ],
+                addresses: vec!["192.168.1.1:4433".to_string(), "10.0.0.1:4433".to_string()],
                 relay_url: Some("https://relay.iroh.link/".to_string()),
             })
             .collect();
 
         let response = FindNodeResponse { nodes };
         let bytes = postcard::to_allocvec(&response).unwrap();
-        
+
         // Should be well under 64KB
-        assert!(bytes.len() < 65536, "Response too large: {} bytes", bytes.len());
+        assert!(
+            bytes.len() < 65536,
+            "Response too large: {} bytes",
+            bytes.len()
+        );
         // But should have reasonable size
         assert!(bytes.len() > 100, "Response suspiciously small");
     }
@@ -1002,11 +1057,11 @@ mod tests {
     fn test_node_info_conversion() {
         let id = make_id(42);
         let info = NodeInfo::from_id(&id);
-        
+
         assert_eq!(info.node_id, [42u8; 32]);
         assert!(info.addresses.is_empty());
         assert!(info.relay_url.is_none());
-        
+
         // Convert back
         let back = info.to_id();
         assert_eq!(back, id);
@@ -1016,22 +1071,22 @@ mod tests {
     fn test_iterative_lookup_candidate_ordering() {
         // Test that candidates are ordered by distance
         let target = make_id(0);
-        
+
         let mut candidates: BTreeSet<(Distance, Id)> = BTreeSet::new();
-        
+
         // Add nodes with different distances
-        let node1 = make_id(1);   // Distance from target
+        let node1 = make_id(1); // Distance from target
         let node2 = make_id(128); // Different distance
         let node3 = make_id(255); // Different distance
-        
+
         candidates.insert((target.distance(&node1), node1));
         candidates.insert((target.distance(&node2), node2));
         candidates.insert((target.distance(&node3), node3));
-        
+
         // First element should be closest to target
         let first = candidates.first().unwrap();
         let closest_dist = first.0;
-        
+
         for (dist, _) in candidates.iter().skip(1) {
             assert!(*dist >= closest_dist, "Candidates not sorted by distance");
         }
@@ -1042,19 +1097,19 @@ mod tests {
         // Test that queried nodes are not re-queried
         let mut queried: HashSet<Id> = HashSet::new();
         let local_id = make_id(0);
-        
+
         queried.insert(local_id); // Local is always pre-added
-        
+
         let node1 = make_id(1);
         let node2 = make_id(2);
-        
+
         // First time should be queryable
         assert!(!queried.contains(&node1));
         queried.insert(node1);
-        
+
         // Second time should be skipped
         assert!(queried.contains(&node1));
-        
+
         // Different node still queryable
         assert!(!queried.contains(&node2));
     }
@@ -1064,20 +1119,20 @@ mod tests {
         // Test that results are truncated to K
         let target = make_id(0);
         let mut results: BTreeSet<(Distance, Id)> = BTreeSet::new();
-        
+
         // Add more than K results
         for i in 0..(K + 5) as u8 {
             let id = make_id(i);
             results.insert((target.distance(&id), id));
         }
-        
+
         assert!(results.len() > K);
-        
+
         // Truncate to K
         while results.len() > K {
             results.pop_last();
         }
-        
+
         assert_eq!(results.len(), K);
     }
 
@@ -1086,25 +1141,28 @@ mod tests {
         // Test the termination logic
         let config = DhtConfig::default();
         let target = make_id(0);
-        
+
         // Simulate having K results
         let mut results: BTreeSet<(Distance, Id)> = BTreeSet::new();
         for i in 1..=K as u8 {
             let id = make_id(i);
             results.insert((target.distance(&id), id));
         }
-        
+
         // Get the K-th best distance
         let kth_best = results.iter().nth(config.k - 1).map(|(d, _)| *d);
-        
+
         // If best candidate has worse distance, we should terminate
         let worse_candidate = make_id(200);
         let worse_dist = target.distance(&worse_candidate);
-        
+
         if let Some(kth) = kth_best {
             // This simulates the termination check
             let should_terminate = worse_dist >= kth;
-            assert!(should_terminate, "Should terminate when no better candidates");
+            assert!(
+                should_terminate,
+                "Should terminate when no better candidates"
+            );
         }
     }
 
@@ -1115,7 +1173,7 @@ mod tests {
             k: 0,
             ..Default::default()
         };
-        
+
         // The code should handle k=0 by breaking early
         // This test just verifies the guard exists in the logic
         assert_eq!(config.k, 0);

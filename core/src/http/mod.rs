@@ -2,19 +2,19 @@
 //!
 //! This module provides a simple HTTP API for testing and development.
 
-mod parse;
 mod handlers;
+mod parse;
 
 pub use handlers::{ActiveTracks, BootstrapInfo};
 
 use std::sync::Arc;
-use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, warn, trace};
+use tokio::net::TcpListener;
+use tracing::{info, trace, warn};
 
-use harbor_core::Protocol;
-use parse::{find_header_end, parse_content_length, http_response};
 use handlers::*;
+use harbor_core::Protocol;
+use parse::{find_header_end, http_response, parse_content_length};
 
 /// Run the HTTP API server
 pub async fn run_api_server(
@@ -185,15 +185,21 @@ async fn handle_request(
         ("POST", "/api/control/accept") => handle_control_accept(protocol, body).await,
         ("POST", "/api/control/decline") => handle_control_decline(protocol, body).await,
         ("POST", "/api/control/invite") => handle_control_generate_invite(protocol).await,
-        ("POST", "/api/control/connect-with-invite") => handle_control_connect_with_invite(protocol, body).await,
+        ("POST", "/api/control/connect-with-invite") => {
+            handle_control_connect_with_invite(protocol, body).await
+        }
         ("POST", "/api/control/block") => handle_control_block(protocol, body).await,
         ("POST", "/api/control/unblock") => handle_control_unblock(protocol, body).await,
         ("GET", "/api/control/connections") => handle_control_list_connections(protocol).await,
         ("POST", "/api/control/topic-invite") => handle_control_topic_invite(protocol, body).await,
         ("POST", "/api/control/topic-accept") => handle_control_topic_accept(protocol, body).await,
-        ("POST", "/api/control/topic-decline") => handle_control_topic_decline(protocol, body).await,
+        ("POST", "/api/control/topic-decline") => {
+            handle_control_topic_decline(protocol, body).await
+        }
         ("POST", "/api/control/leave") => handle_control_leave(protocol, body).await,
-        ("POST", "/api/control/remove-member") => handle_control_remove_member(protocol, body).await,
+        ("POST", "/api/control/remove-member") => {
+            handle_control_remove_member(protocol, body).await
+        }
         ("POST", "/api/control/suggest") => handle_control_suggest(protocol, body).await,
         ("GET", "/api/control/pending-invites") => handle_control_pending_invites(protocol).await,
         ("GET", "/api/stats") => handle_stats(protocol).await,

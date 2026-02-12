@@ -16,14 +16,12 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::data::{
-    get_blob, get_blobs_for_scope, get_section_peer_suggestion,
-    get_all_topics, BlobState, BlobStore, CHUNK_SIZE,
-};
-use crate::network::share::protocol::{
-    ChunkRequest, ShareMessage,
+    BlobState, BlobStore, CHUNK_SIZE, get_all_topics, get_blob, get_blobs_for_scope,
+    get_section_peer_suggestion,
 };
 use crate::network::share::ShareService;
-use crate::protocol::{ProtocolEvent, FileProgressEvent, FileCompleteEvent};
+use crate::network::share::protocol::{ChunkRequest, ShareMessage};
+use crate::protocol::{FileCompleteEvent, FileProgressEvent, ProtocolEvent};
 
 /// Tracks retry state for a blob
 #[derive(Debug)]
@@ -57,9 +55,7 @@ impl BlobRetryState {
         self.attempts += 1;
         self.last_attempt = Instant::now();
         // Exponential backoff: 5s, 10s, 20s, 40s, 80s, max 5 minutes
-        self.backoff = Duration::from_secs(
-            std::cmp::min(300, 5 * (1 << self.attempts.min(6)))
-        );
+        self.backoff = Duration::from_secs(std::cmp::min(300, 5 * (1 << self.attempts.min(6))));
     }
 
     /// Record a successful chunk reception, reset backoff
@@ -160,7 +156,10 @@ pub async fn run_share_pull_task(
                     }
                     // Get blob info for the event
                     let blob_info = get_blob(&db_lock, &hash).ok().flatten();
-                    blob_name = blob_info.as_ref().map(|b| b.display_name.clone()).unwrap_or_default();
+                    blob_name = blob_info
+                        .as_ref()
+                        .map(|b| b.display_name.clone())
+                        .unwrap_or_default();
                     blob_size = blob_info.as_ref().map(|b| b.total_size).unwrap_or(0);
                 }
                 retry_states.remove(&hash);
@@ -168,7 +167,7 @@ pub async fn run_share_pull_task(
                     hash = hex::encode(&hash[..8]),
                     "Blob complete (via pull task)"
                 );
-                
+
                 // Emit FileComplete event
                 let complete_event = ProtocolEvent::FileComplete(FileCompleteEvent {
                     hash,
@@ -176,7 +175,7 @@ pub async fn run_share_pull_task(
                     total_size: blob_size,
                 });
                 let _ = event_tx.send(complete_event).await;
-                
+
                 continue;
             }
 
@@ -197,18 +196,19 @@ pub async fn run_share_pull_task(
                 &source_id,
                 &missing_chunks,
                 our_id,
-            ).await;
+            )
+            .await;
 
             if success {
                 state.record_success();
-                
+
                 // Emit FileProgress event
                 // Recalculate chunks_complete after pull
                 let chunks_complete = match blob_store.get_chunk_bitfield(&hash, total_chunks) {
                     Ok(bitfield) => bitfield.iter().filter(|&&has| has).count() as u32,
                     Err(_) => total_chunks - missing_chunks.len() as u32,
                 };
-                
+
                 let progress_event = ProtocolEvent::FileProgress(FileProgressEvent {
                     hash,
                     chunks_complete,
@@ -438,7 +438,8 @@ async fn pull_section(
     match share_service.connect_for_share(target_node_id).await {
         Ok(conn) => {
             // Request chunks
-            let result = request_chunks_from_peer(&conn, blob_store, hash, chunks, total_size).await;
+            let result =
+                request_chunks_from_peer(&conn, blob_store, hash, chunks, total_size).await;
             chunks_received += result.received;
 
             if result.received > 0 {
@@ -477,10 +478,17 @@ async fn pull_section(
                         Ok(id) => id,
                         Err(_) => continue,
                     };
-                    if let Ok(suggested_conn) = share_service.connect_for_share(suggested_node_id).await {
-                        let suggested_result =
-                            request_chunks_from_peer(&suggested_conn, blob_store, hash, chunks, total_size)
-                                .await;
+                    if let Ok(suggested_conn) =
+                        share_service.connect_for_share(suggested_node_id).await
+                    {
+                        let suggested_result = request_chunks_from_peer(
+                            &suggested_conn,
+                            blob_store,
+                            hash,
+                            chunks,
+                            total_size,
+                        )
+                        .await;
                         chunks_received += suggested_result.received;
 
                         if suggested_result.received > 0 {
@@ -580,12 +588,9 @@ async fn request_chunks_from_peer(
         match ShareMessage::decode(&response_data) {
             Ok(ShareMessage::ChunkResponse(resp)) => {
                 if &resp.hash == hash {
-                    if let Err(e) = blob_store.write_chunk(
-                        hash,
-                        resp.chunk_index,
-                        &resp.data,
-                        total_size,
-                    ) {
+                    if let Err(e) =
+                        blob_store.write_chunk(hash, resp.chunk_index, &resp.data, total_size)
+                    {
                         warn!(error = %e, chunk = resp.chunk_index, "Failed to write chunk");
                     } else {
                         received += 1;
@@ -604,7 +609,10 @@ async fn request_chunks_from_peer(
         }
     }
 
-    ChunkRequestResult { received, suggested_peers }
+    ChunkRequestResult {
+        received,
+        suggested_peers,
+    }
 }
 
 #[cfg(test)]
@@ -619,7 +627,7 @@ mod tests {
     #[test]
     fn test_retry_state_default_allows_immediate_retry() {
         let state = BlobRetryState::default();
-        
+
         // Default state should allow immediate retry (last_attempt is 1 hour ago)
         assert!(state.ready_for_retry());
         assert_eq!(state.attempts, 0);
@@ -629,9 +637,9 @@ mod tests {
     #[test]
     fn test_retry_state_not_ready_immediately_after_failure() {
         let mut state = BlobRetryState::default();
-        
+
         state.record_failure();
-        
+
         // Immediately after failure, should NOT be ready
         assert!(!state.ready_for_retry());
         assert_eq!(state.attempts, 1);
@@ -640,37 +648,37 @@ mod tests {
     #[test]
     fn test_retry_state_exponential_backoff() {
         let mut state = BlobRetryState::default();
-        
+
         // First failure: backoff should be 10s (5 * 2^1)
         state.record_failure();
         assert_eq!(state.backoff, Duration::from_secs(10));
         assert_eq!(state.attempts, 1);
-        
+
         // Second failure: backoff should be 20s (5 * 2^2)
         state.record_failure();
         assert_eq!(state.backoff, Duration::from_secs(20));
         assert_eq!(state.attempts, 2);
-        
+
         // Third failure: backoff should be 40s (5 * 2^3)
         state.record_failure();
         assert_eq!(state.backoff, Duration::from_secs(40));
         assert_eq!(state.attempts, 3);
-        
+
         // Fourth failure: backoff should be 80s (5 * 2^4)
         state.record_failure();
         assert_eq!(state.backoff, Duration::from_secs(80));
         assert_eq!(state.attempts, 4);
-        
+
         // Fifth failure: backoff should be 160s (5 * 2^5)
         state.record_failure();
         assert_eq!(state.backoff, Duration::from_secs(160));
         assert_eq!(state.attempts, 5);
-        
+
         // Sixth failure: backoff should be 300s (capped at 5 minutes)
         state.record_failure();
         assert_eq!(state.backoff, Duration::from_secs(300));
         assert_eq!(state.attempts, 6);
-        
+
         // Seventh failure: still capped at 300s
         state.record_failure();
         assert_eq!(state.backoff, Duration::from_secs(300));
@@ -680,14 +688,14 @@ mod tests {
     #[test]
     fn test_retry_state_success_resets() {
         let mut state = BlobRetryState::default();
-        
+
         // Simulate several failures
         state.record_failure();
         state.record_failure();
         state.record_failure();
         assert_eq!(state.attempts, 3);
         assert_eq!(state.backoff, Duration::from_secs(40));
-        
+
         // Success should reset
         state.record_success();
         assert_eq!(state.attempts, 0);
@@ -697,17 +705,17 @@ mod tests {
     #[test]
     fn test_retry_state_ready_after_backoff_elapsed() {
         let mut state = BlobRetryState::default();
-        
+
         // Set a very short backoff for testing
         state.backoff = Duration::from_millis(50);
         state.last_attempt = Instant::now();
-        
+
         // Not ready immediately
         assert!(!state.ready_for_retry());
-        
+
         // Wait for backoff
         thread::sleep(Duration::from_millis(60));
-        
+
         // Now should be ready
         assert!(state.ready_for_retry());
     }
@@ -715,12 +723,12 @@ mod tests {
     #[test]
     fn test_retry_state_backoff_max_cap() {
         let mut state = BlobRetryState::default();
-        
+
         // Simulate many failures
         for _ in 0..20 {
             state.record_failure();
         }
-        
+
         // Backoff should be capped at 300 seconds (5 minutes)
         assert_eq!(state.backoff, Duration::from_secs(300));
         assert_eq!(state.attempts, 20);
@@ -729,12 +737,12 @@ mod tests {
     #[test]
     fn test_retry_state_attempts_overflow_protection() {
         let mut state = BlobRetryState::default();
-        
+
         // The min(6) in the backoff calculation prevents overflow
         // Even with max attempts, backoff calculation should work
         state.attempts = u32::MAX - 1;
         state.record_failure();
-        
+
         // Should not panic, backoff should be capped
         assert_eq!(state.backoff, Duration::from_secs(300));
     }
@@ -747,7 +755,7 @@ mod tests {
     fn test_find_incomplete_blobs_empty_db() {
         // Create in-memory test database
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        
+
         // Initialize schema (topics table needed)
         conn.execute(
             "CREATE TABLE topics (
@@ -756,8 +764,9 @@ mod tests {
                 created_at INTEGER
             )",
             [],
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         // Should return empty vec for empty DB
         let result = find_incomplete_blobs(&conn);
         assert!(result.is_empty());
@@ -767,7 +776,7 @@ mod tests {
     fn test_find_incomplete_blobs_with_partial_blob() {
         // Create in-memory test database
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        
+
         // Initialize schema
         conn.execute(
             "CREATE TABLE topics (
@@ -776,7 +785,8 @@ mod tests {
                 created_at INTEGER DEFAULT (strftime('%s', 'now'))
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute(
             "CREATE TABLE peers (
@@ -787,7 +797,7 @@ mod tests {
             [],
         )
         .unwrap();
-        
+
         conn.execute(
             "CREATE TABLE blobs (
                 hash BLOB PRIMARY KEY,
@@ -802,17 +812,19 @@ mod tests {
                 FOREIGN KEY (source_peer_id) REFERENCES peers(id)
             )",
             [],
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         let topic_id = [1u8; 32];
         let hash = [2u8; 32];
         let source_id = [3u8; 32];
-        
+
         // Insert topic
         conn.execute(
             "INSERT INTO topics (topic_id, harbor_id) VALUES (?1, ?2)",
             rusqlite::params![topic_id.as_slice(), [0u8; 32].as_slice()],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Insert source peer
         conn.execute(
@@ -820,14 +832,14 @@ mod tests {
             rusqlite::params![source_id.as_slice()],
         )
         .unwrap();
-        
+
         // Insert partial blob (state = 0 = Partial)
         conn.execute(
             "INSERT INTO blobs (hash, scope_id, source_peer_id, display_name, total_size, total_chunks, state)
              VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3), 'test.bin', 1048576, 2, 0)",
             rusqlite::params![hash.as_slice(), topic_id.as_slice(), source_id.as_slice()],
         ).unwrap();
-        
+
         let result = find_incomplete_blobs(&conn);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, hash);
@@ -840,7 +852,7 @@ mod tests {
     fn test_find_incomplete_blobs_ignores_complete() {
         // Create in-memory test database
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        
+
         // Initialize schema
         conn.execute(
             "CREATE TABLE topics (
@@ -849,7 +861,8 @@ mod tests {
                 created_at INTEGER DEFAULT (strftime('%s', 'now'))
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute(
             "CREATE TABLE peers (
@@ -860,7 +873,7 @@ mod tests {
             [],
         )
         .unwrap();
-        
+
         conn.execute(
             "CREATE TABLE blobs (
                 hash BLOB PRIMARY KEY,
@@ -875,17 +888,19 @@ mod tests {
                 FOREIGN KEY (source_peer_id) REFERENCES peers(id)
             )",
             [],
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         let topic_id = [1u8; 32];
         let hash = [2u8; 32];
         let source_id = [3u8; 32];
-        
+
         // Insert topic
         conn.execute(
             "INSERT INTO topics (topic_id, harbor_id) VALUES (?1, ?2)",
             rusqlite::params![topic_id.as_slice(), [0u8; 32].as_slice()],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Insert source peer
         conn.execute(
@@ -893,14 +908,14 @@ mod tests {
             rusqlite::params![source_id.as_slice()],
         )
         .unwrap();
-        
+
         // Insert complete blob (state = 1 = Complete)
         conn.execute(
             "INSERT INTO blobs (hash, scope_id, source_peer_id, display_name, total_size, total_chunks, state)
              VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3), 'test.bin', 1048576, 2, 1)",
             rusqlite::params![hash.as_slice(), topic_id.as_slice(), source_id.as_slice()],
         ).unwrap();
-        
+
         let result = find_incomplete_blobs(&conn);
         assert!(result.is_empty(), "Complete blobs should be ignored");
     }
@@ -909,7 +924,7 @@ mod tests {
     fn test_find_incomplete_blobs_multiple_topics() {
         // Create in-memory test database
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        
+
         // Initialize schema
         conn.execute(
             "CREATE TABLE topics (
@@ -918,7 +933,8 @@ mod tests {
                 created_at INTEGER DEFAULT (strftime('%s', 'now'))
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute(
             "CREATE TABLE peers (
@@ -929,7 +945,7 @@ mod tests {
             [],
         )
         .unwrap();
-        
+
         conn.execute(
             "CREATE TABLE blobs (
                 hash BLOB PRIMARY KEY,
@@ -944,24 +960,27 @@ mod tests {
                 FOREIGN KEY (source_peer_id) REFERENCES peers(id)
             )",
             [],
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         let topic1 = [1u8; 32];
         let topic2 = [2u8; 32];
         let hash1 = [10u8; 32];
         let hash2 = [20u8; 32];
         let hash3 = [30u8; 32];
         let source = [99u8; 32];
-        
+
         // Insert topics
         conn.execute(
             "INSERT INTO topics (topic_id, harbor_id) VALUES (?1, ?2)",
             rusqlite::params![topic1.as_slice(), [0u8; 32].as_slice()],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO topics (topic_id, harbor_id) VALUES (?1, ?2)",
             rusqlite::params![topic2.as_slice(), [0u8; 32].as_slice()],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Insert source peer
         conn.execute(
@@ -969,7 +988,7 @@ mod tests {
             rusqlite::params![source.as_slice()],
         )
         .unwrap();
-        
+
         // Insert partial blobs in both topics
         conn.execute(
             "INSERT INTO blobs (hash, scope_id, source_peer_id, display_name, total_size, total_chunks, state)
@@ -986,10 +1005,10 @@ mod tests {
              VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3), 'file3.bin', 3145728, 6, 0)",
             rusqlite::params![hash3.as_slice(), topic2.as_slice(), source.as_slice()],
         ).unwrap();
-        
+
         let result = find_incomplete_blobs(&conn);
         assert_eq!(result.len(), 3);
-        
+
         // Verify all hashes are found
         let hashes: Vec<[u8; 32]> = result.iter().map(|r| r.0).collect();
         assert!(hashes.contains(&hash1));
@@ -1007,7 +1026,7 @@ mod tests {
             received: 0,
             suggested_peers: vec![],
         };
-        
+
         assert_eq!(result.received, 0);
         assert!(result.suggested_peers.is_empty());
     }
@@ -1018,7 +1037,7 @@ mod tests {
             received: 5,
             suggested_peers: vec![],
         };
-        
+
         assert_eq!(result.received, 5);
         assert!(result.suggested_peers.is_empty());
     }
@@ -1027,12 +1046,12 @@ mod tests {
     fn test_chunk_request_result_with_suggestions() {
         let peer1 = [1u8; 32];
         let peer2 = [2u8; 32];
-        
+
         let result = ChunkRequestResult {
             received: 2,
             suggested_peers: vec![peer1, peer2],
         };
-        
+
         assert_eq!(result.received, 2);
         assert_eq!(result.suggested_peers.len(), 2);
         assert_eq!(result.suggested_peers[0], peer1);
@@ -1043,12 +1062,12 @@ mod tests {
     fn test_chunk_request_result_partial_success_with_fallback() {
         // Simulates scenario where we got some chunks but peer suggested others
         let suggested = [3u8; 32];
-        
+
         let result = ChunkRequestResult {
             received: 3, // Got 3 of 10 requested
             suggested_peers: vec![suggested],
         };
-        
+
         // Caller should try suggested peer for remaining 7 chunks
         assert!(result.received < 10);
         assert!(!result.suggested_peers.is_empty());
@@ -1058,12 +1077,12 @@ mod tests {
     fn test_chunk_request_result_multiple_suggestions() {
         // Peer might suggest multiple alternatives
         let peers: Vec<[u8; 32]> = (1..=5).map(|i| [i as u8; 32]).collect();
-        
+
         let result = ChunkRequestResult {
             received: 0,
             suggested_peers: peers.clone(),
         };
-        
+
         assert_eq!(result.suggested_peers.len(), 5);
         for (i, peer) in result.suggested_peers.iter().enumerate() {
             assert_eq!(*peer, [(i + 1) as u8; 32]);

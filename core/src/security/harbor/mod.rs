@@ -13,4 +13,3 @@ pub mod sign;
 pub use authenticate::create_mac;
 pub use encrypt::{decrypt, encrypt, generate_nonce};
 pub use sign::{sign_packet, verify_packet};
-

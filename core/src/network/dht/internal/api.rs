@@ -5,7 +5,7 @@
 //! - NodesSeen: Update routing table when nodes are verified
 //! - NodesDead: Remove unresponsive nodes from routing table
 
-use irpc::channel::{oneshot, none::NoSender};
+use irpc::channel::{none::NoSender, oneshot};
 use irpc::rpc_requests;
 use serde::{Deserialize, Serialize};
 
@@ -90,7 +90,7 @@ pub enum ApiProtocol {
     },
 
     /// Handle an incoming FindNode request (returns NodeInfo with relay URLs)
-    /// 
+    ///
     /// This also handles adding the requester to the routing table if they provided their ID.
     #[rpc(tx = oneshot::Sender<Vec<NodeInfo>>)]
     #[wrap(HandleFindNodeRequest)]
@@ -103,7 +103,6 @@ pub enum ApiProtocol {
         requester_relay_url: Option<String>,
     },
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -212,6 +211,4 @@ mod tests {
         assert_eq!(decoded.ids.len(), 3);
         assert_eq!(decoded.ids[0], [1u8; 32]);
     }
-
 }
-

@@ -5,7 +5,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::network::dht::{Id, RoutingTable};
-use crate::security::create_key_pair::{generate_key_pair, KeyPair};
+use crate::security::PacketId;
+use crate::security::create_key_pair::{KeyPair, generate_key_pair};
 use crate::security::send::packet::SendPacket;
 use crate::security::topic_keys::TopicKeys;
 
@@ -25,11 +26,11 @@ pub struct TestNode {
     /// Outgoing message queue (for verification)
     pub outbox: VecDeque<OutgoingMessage>,
     /// Read receipts received
-    pub receipts_received: Vec<([u8; 32], [u8; 32])>, // (packet_id, from)
+    pub receipts_received: Vec<(PacketId, [u8; 32])>, // (packet_id, from)
     /// Packets waiting for receipts: packet_id -> pending recipients
-    pub pending_receipts: HashMap<[u8; 32], Vec<[u8; 32]>>,
+    pub pending_receipts: HashMap<PacketId, Vec<[u8; 32]>>,
     /// Simulated Harbor cache: (packet_id, harbor_id, packet_data, pending_recipients)
-    pub harbor_cache: Vec<([u8; 32], [u8; 32], Vec<u8>, Vec<[u8; 32]>)>,
+    pub harbor_cache: Vec<(PacketId, [u8; 32], Vec<u8>, Vec<[u8; 32]>)>,
 }
 
 /// Topic membership info
@@ -54,15 +55,9 @@ pub enum IncomingMessage {
         plaintext: Option<Vec<u8>>,
     },
     /// A receipt
-    Receipt {
-        from: [u8; 32],
-        packet_id: [u8; 32],
-    },
+    Receipt { from: [u8; 32], packet_id: PacketId },
     /// A DHT FindNode request
-    FindNode {
-        from: [u8; 32],
-        target: Id,
-    },
+    FindNode { from: [u8; 32], target: Id },
     /// A DHT FindNode response
     FindNodeResponse {
         from: [u8; 32],
@@ -74,25 +69,13 @@ pub enum IncomingMessage {
 #[derive(Debug, Clone)]
 pub enum OutgoingMessage {
     /// A Send packet
-    Packet {
-        to: [u8; 32],
-        packet: SendPacket,
-    },
+    Packet { to: [u8; 32], packet: SendPacket },
     /// A receipt
-    Receipt {
-        to: [u8; 32],
-        packet_id: [u8; 32],
-    },
+    Receipt { to: [u8; 32], packet_id: PacketId },
     /// A DHT FindNode request
-    FindNode {
-        to: [u8; 32],
-        target: Id,
-    },
+    FindNode { to: [u8; 32], target: Id },
     /// A DHT FindNode response
-    FindNodeResponse {
-        to: [u8; 32],
-        nodes: Vec<[u8; 32]>,
-    },
+    FindNodeResponse { to: [u8; 32], nodes: Vec<[u8; 32]> },
 }
 
 impl TestNode {
@@ -100,7 +83,7 @@ impl TestNode {
     pub fn new(id: usize) -> Self {
         let key_pair = generate_key_pair();
         let node_id = Id::new(key_pair.public_key);
-        
+
         Self {
             id,
             key_pair,
@@ -121,10 +104,10 @@ impl TestNode {
         secret[0] = seed;
         secret[1] = (id & 0xFF) as u8;
         secret[2] = ((id >> 8) & 0xFF) as u8;
-        
+
         let key_pair = crate::security::create_key_pair::key_pair_from_bytes(&secret);
         let node_id = Id::new(key_pair.public_key);
-        
+
         Self {
             id,
             key_pair,
@@ -151,11 +134,14 @@ impl TestNode {
     /// Subscribe to a topic
     pub fn subscribe(&mut self, topic_id: [u8; 32], members: Vec<[u8; 32]>) {
         let keys = TopicKeys::derive(&topic_id);
-        self.topics.insert(topic_id, TopicMembership {
+        self.topics.insert(
             topic_id,
-            keys,
-            members,
-        });
+            TopicMembership {
+                topic_id,
+                keys,
+                members,
+            },
+        );
     }
 
     /// Unsubscribe from a topic
@@ -199,7 +185,8 @@ impl TestNode {
         })?;
 
         // Verify and decrypt
-        let plaintext = crate::security::verify_and_decrypt_packet(&packet, &topic.topic_id).ok()?;
+        let plaintext =
+            crate::security::verify_and_decrypt_packet(&packet, &topic.topic_id).ok()?;
 
         // Store in inbox
         self.inbox.push_back(IncomingMessage::Packet {
@@ -228,7 +215,8 @@ impl TestNode {
 
         // Track pending receipts
         if let Some(membership) = self.topics.get(topic_id) {
-            let recipients: Vec<[u8; 32]> = membership.members
+            let recipients: Vec<[u8; 32]> = membership
+                .members
                 .iter()
                 .filter(|m| **m != self.endpoint_id())
                 .copied()
@@ -240,9 +228,9 @@ impl TestNode {
     }
 
     /// Process an incoming receipt
-    pub fn process_receipt(&mut self, from: [u8; 32], packet_id: [u8; 32]) {
+    pub fn process_receipt(&mut self, from: [u8; 32], packet_id: PacketId) {
         self.receipts_received.push((packet_id, from));
-        
+
         // Remove from pending
         if let Some(pending) = self.pending_receipts.get_mut(&packet_id) {
             pending.retain(|p| *p != from);
@@ -250,7 +238,7 @@ impl TestNode {
     }
 
     /// Check if all receipts received for a packet
-    pub fn all_receipts_received(&self, packet_id: &[u8; 32]) -> bool {
+    pub fn all_receipts_received(&self, packet_id: &PacketId) -> bool {
         self.pending_receipts
             .get(packet_id)
             .map(|p| p.is_empty())
@@ -281,7 +269,7 @@ mod tests {
     #[test]
     fn test_node_creation() {
         let node = TestNode::new(0);
-        
+
         assert_eq!(node.id, 0);
         assert_eq!(node.endpoint_id().len(), 32);
         assert!(node.topics.is_empty());
@@ -292,10 +280,10 @@ mod tests {
     fn test_node_deterministic_creation() {
         let node1 = TestNode::new_with_seed(0, 42);
         let node2 = TestNode::new_with_seed(0, 42);
-        
+
         // Same seed = same keys
         assert_eq!(node1.endpoint_id(), node2.endpoint_id());
-        
+
         // Different seed = different keys
         let node3 = TestNode::new_with_seed(0, 43);
         assert_ne!(node1.endpoint_id(), node3.endpoint_id());
@@ -305,12 +293,12 @@ mod tests {
     fn test_subscribe_unsubscribe() {
         let mut node = TestNode::new(0);
         let topic_id = [42u8; 32];
-        
+
         assert!(!node.is_subscribed(&topic_id));
-        
+
         node.subscribe(topic_id, vec![[1u8; 32], [2u8; 32]]);
         assert!(node.is_subscribed(&topic_id));
-        
+
         node.unsubscribe(&topic_id);
         assert!(!node.is_subscribed(&topic_id));
     }
@@ -319,7 +307,7 @@ mod tests {
     fn test_add_peer_to_routing() {
         let mut node = TestNode::new(0);
         let peer = [1u8; 32];
-        
+
         assert!(node.add_peer(peer));
         assert!(node.routing_table.contains(&Id::new(peer)));
     }
@@ -328,20 +316,20 @@ mod tests {
     fn test_create_and_process_packet() {
         let mut alice = TestNode::new(0);
         let mut bob = TestNode::new(1);
-        
+
         let topic_id = [42u8; 32];
         let members = vec![alice.endpoint_id(), bob.endpoint_id()];
-        
+
         // Both subscribe
         alice.subscribe(topic_id, members.clone());
         bob.subscribe(topic_id, members);
-        
+
         // Alice creates packet
         let packet = alice.create_packet(&topic_id, b"Hello Bob!").unwrap();
-        
+
         // Bob processes it
         let plaintext = bob.process_packet(alice.endpoint_id(), packet);
-        
+
         assert_eq!(plaintext, Some(b"Hello Bob!".to_vec()));
     }
 
@@ -350,24 +338,23 @@ mod tests {
         let mut alice = TestNode::new(0);
         let bob_id = [1u8; 32];
         let carol_id = [2u8; 32];
-        
+
         let topic_id = [42u8; 32];
         alice.subscribe(topic_id, vec![alice.endpoint_id(), bob_id, carol_id]);
-        
+
         // Create packet
         let packet = alice.create_packet(&topic_id, b"Hello!").unwrap();
         let packet_id = packet.packet_id;
-        
+
         // Not all receipts yet
         assert!(!alice.all_receipts_received(&packet_id));
-        
+
         // Bob sends receipt
         alice.process_receipt(bob_id, packet_id);
         assert!(!alice.all_receipts_received(&packet_id));
-        
+
         // Carol sends receipt
         alice.process_receipt(carol_id, packet_id);
         assert!(alice.all_receipts_received(&packet_id));
     }
 }
-

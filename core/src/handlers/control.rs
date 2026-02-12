@@ -6,8 +6,8 @@
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tracing::{debug, trace};
 
-use crate::network::control::protocol::{ControlRpcMessage, ControlRpcProtocol};
 use crate::network::control::ControlService;
+use crate::network::control::protocol::{ControlRpcMessage, ControlRpcProtocol};
 
 impl ProtocolHandler for ControlService {
     async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {

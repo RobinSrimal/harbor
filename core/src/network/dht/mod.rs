@@ -8,28 +8,33 @@
 //! Top-level modules:
 //! - `protocol`: Wire format for DHT messages (FindNode, FindNodeResponse)
 //! - `actor`: Actor that manages DHT state and handles messages
+//! - `service`: Runtime entry point that owns pool/client and drives lookups
 //!
 //! Internal modules (in `internal/`):
 //! - `api`: High-level API for DHT operations
 //! - `bootstrap`: Bootstrap node configuration
 //! - `config`: DHT configuration and factory functions
 //! - `distance`: XOR distance metric implementation
-//! - `lookup`: Kademlia iterative lookup algorithm
+//! - `lookup`: Compatibility shim module (iterative lookup lives in `service`)
 //! - `pool`: Connection pool with relay/DNS fallback
 //! - `routing`: In-memory routing table with K-buckets
 //!
 //! # Example
 //!
 //! ```ignore
-//! use harbor::network::dht::{DhtConfig, create_dht_node, Id};
+//! use std::sync::Arc;
+//! use tokio::sync::Mutex;
+//! use harbor::network::dht::{DhtService, Id};
 //!
-//! // Create a DHT node
-//! let local_id = Id::from_hash(b"my-node-id");
-//! let (rpc, api) = create_dht_node(local_id, pool, DhtConfig::persistent(), bootstrap);
+//! // Start DHT service
+//! let bootstrap: Vec<String> = vec![];
+//! let db = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+//! let our_id = [7u8; 32];
+//! let dht = DhtService::start(endpoint, &bootstrap, db, our_id).await;
 //!
 //! // Perform a lookup
-//! let target = Id::from_hash(b"target-key");
-//! let closest = api.lookup(target, None).await?;
+//! let target = Id::new([9u8; 32]);
+//! let closest = dht.lookup(target, None).await?;
 //! ```
 
 pub mod actor;
@@ -38,11 +43,14 @@ pub mod protocol;
 pub mod service;
 
 // Re-export commonly used items from internal modules
-pub use internal::bootstrap::{BootstrapConfig, BootstrapNode, default_bootstrap_nodes, bootstrap_node_ids, bootstrap_dial_info};
+pub use internal::bootstrap::{
+    BootstrapConfig, BootstrapNode, bootstrap_dial_info, bootstrap_node_ids,
+    default_bootstrap_nodes,
+};
 pub use internal::config::{DhtConfig, create_dht_actor, create_dht_actor_with_buckets};
 pub use internal::distance::{Distance, Id};
-pub use internal::pool::{DhtPool, DhtPoolConfig, DhtPoolError, DialInfo, DHT_ALPN};
-pub use internal::routing::{Buckets, RoutingTable, K, ALPHA, BUCKET_COUNT};
+pub use internal::pool::{DHT_ALPN, DhtPool, DhtPoolConfig, DhtPoolError, DialInfo};
+pub use internal::routing::{ALPHA, BUCKET_COUNT, Buckets, K, RoutingTable};
 pub use service::{DhtService, WeakDhtService};
 
 #[cfg(test)]
@@ -51,8 +59,8 @@ mod tests {
     //!
     //! These tests use in-memory clients without actual network connections.
 
-    use super::*;
     use super::internal::routing::KBucket;
+    use super::*;
     use crate::resilience::ProofOfWork;
 
     fn make_id(seed: u8) -> Id {
@@ -106,12 +114,14 @@ mod tests {
         let local = make_id(0);
 
         // Test that different XOR distances map to different buckets
-        let buckets: Vec<Option<usize>> = (0..8).map(|bit| {
-            let mut bytes = [0u8; 32];
-            bytes[0] = 1 << (7 - bit); // Set bit at position 'bit'
-            let remote = Id::new(bytes);
-            local.distance(&remote).bucket_index()
-        }).collect();
+        let buckets: Vec<Option<usize>> = (0..8)
+            .map(|bit| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = 1 << (7 - bit); // Set bit at position 'bit'
+                let remote = Id::new(bytes);
+                local.distance(&remote).bucket_index()
+            })
+            .collect();
 
         // Each should be in a different bucket
         for (i, bucket) in buckets.iter().enumerate() {
@@ -350,11 +360,13 @@ mod tests {
         use super::protocol::NodeInfo;
 
         let response = FindNodeResponse {
-            nodes: (0..5).map(|i| NodeInfo {
-                node_id: [i; 32],
-                addresses: vec![format!("192.168.1.{}:4433", i)],
-                relay_url: None,
-            }).collect(),
+            nodes: (0..5)
+                .map(|i| NodeInfo {
+                    node_id: [i; 32],
+                    addresses: vec![format!("192.168.1.{}:4433", i)],
+                    relay_url: None,
+                })
+                .collect(),
         };
 
         let bytes = postcard::to_allocvec(&response).unwrap();
@@ -390,12 +402,17 @@ mod tests {
 
     #[test]
     fn test_dht_config_candidate_defaults() {
-        use super::internal::config::{DEFAULT_CANDIDATE_VERIFY_INTERVAL, MAX_CANDIDATES_PER_VERIFY};
+        use super::internal::config::{
+            DEFAULT_CANDIDATE_VERIFY_INTERVAL, MAX_CANDIDATES_PER_VERIFY,
+        };
         use std::time::Duration;
 
         let config = DhtConfig::default();
 
-        assert_eq!(config.candidate_verify_interval, DEFAULT_CANDIDATE_VERIFY_INTERVAL);
+        assert_eq!(
+            config.candidate_verify_interval,
+            DEFAULT_CANDIDATE_VERIFY_INTERVAL
+        );
         assert_eq!(config.max_candidates_per_verify, MAX_CANDIDATES_PER_VERIFY);
         assert_eq!(DEFAULT_CANDIDATE_VERIFY_INTERVAL, Duration::from_secs(30));
         assert_eq!(MAX_CANDIDATES_PER_VERIFY, 10);
@@ -436,8 +453,8 @@ mod tests {
 
     #[test]
     fn test_candidate_batch_limits() {
-        use std::collections::HashSet;
         use super::internal::config::MAX_CANDIDATES_PER_VERIFY;
+        use std::collections::HashSet;
 
         let mut candidates: HashSet<Id> = HashSet::new();
 

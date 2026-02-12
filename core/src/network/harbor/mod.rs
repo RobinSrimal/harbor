@@ -6,7 +6,7 @@
 //!
 //! - **Harbor Node**: Any node can act as a Harbor Node for HarborIDs close to it
 //! - **Finding nodes**: Use DHT to find 30 closest nodes to HarborID
-//! - **Replication**: Store packets on 10 Harbor Nodes when direct delivery fails
+//! - **Replication**: Store packets on a configured number of Harbor Nodes when direct delivery fails
 //! - **Sync**: Harbor Nodes sync among themselves every 5 minutes
 //!
 //! # Protocol Flow
@@ -14,7 +14,7 @@
 //! ## Storing a packet:
 //! 1. Send packet fails to reach all members
 //! 2. Find Harbor Nodes via DHT lookup on HarborID
-//! 3. Store packet on 10 Harbor Nodes with recipient list
+//! 3. Store packet on configured Harbor Nodes with recipient list
 //!
 //! ## Pulling packets:
 //! 1. Client comes online
@@ -44,6 +44,7 @@ pub mod network;
 pub mod protocol;
 pub mod service;
 
-pub use protocol::{HarborMessage, StoreRequest, PullRequest, PullResponse, DeliveryAck, HARBOR_ALPN};
-pub use service::{HarborService, HarborError};
-
+pub use protocol::{
+    DeliveryAck, HARBOR_ALPN, HarborMessage, PullRequest, PullResponse, StoreRequest,
+};
+pub use service::{HarborError, HarborService};

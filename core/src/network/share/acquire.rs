@@ -9,19 +9,65 @@
 use iroh::EndpointId;
 use tracing::{debug, info, warn};
 
-use crate::data::{
-    get_blob, get_section_peer_suggestion, get_section_traces, mark_blob_complete,
-    record_section_received, BlobMetadata, BlobState, CHUNK_SIZE,
-};
 use super::protocol::{
     ChunkMapRequest, ChunkMapResponse, ChunkRequest, ChunkResponse, PeerChunks, PeerSuggestion,
     ShareMessage,
 };
 use super::service::{ChunkProcessResult, PeerAssignment, PullPlan, ShareError, ShareService};
+use crate::data::{
+    BlobMetadata, BlobState, CHUNK_SIZE, get_blob, get_section_peer_suggestion, get_section_traces,
+    mark_blob_complete, record_section_received,
+};
 
-/// Helper to calculate number of sections (same as in service.rs)
+/// Legacy fallback when section metadata is unavailable.
 fn calculate_num_sections(total_chunks: u32) -> u8 {
     std::cmp::min(5, std::cmp::max(1, total_chunks)) as u8
+}
+
+fn total_chunks_from_size(total_size: u64) -> Result<u32, ShareError> {
+    let total_chunks_u64 = total_size.div_ceil(CHUNK_SIZE);
+    u32::try_from(total_chunks_u64)
+        .map_err(|_| ShareError::Protocol("total_size exceeds share chunk index space".to_string()))
+}
+
+fn calculate_section_id_for_layout(chunk_index: u32, total_chunks: u32, num_sections: u8) -> u8 {
+    if total_chunks == 0 || num_sections == 0 {
+        return 0;
+    }
+
+    let chunks_per_section = total_chunks.div_ceil(num_sections as u32).max(1);
+    let section = chunk_index / chunks_per_section;
+    section.min((num_sections - 1) as u32) as u8
+}
+
+fn validate_chunk_response(
+    resp: &ChunkResponse,
+    expected_hash: &[u8; 32],
+    expected_chunk_index: u32,
+) -> Result<(), ShareError> {
+    if resp.hash != *expected_hash {
+        return Err(ShareError::Protocol(
+            "chunk response hash mismatch".to_string(),
+        ));
+    }
+    if resp.chunk_index != expected_chunk_index {
+        return Err(ShareError::Protocol(
+            "chunk response index mismatch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_chunk_map_response(
+    resp: &ChunkMapResponse,
+    expected_hash: &[u8; 32],
+) -> Result<(), ShareError> {
+    if resp.hash != *expected_hash {
+        return Err(ShareError::Protocol(
+            "chunk map response hash mismatch".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 impl ShareService {
@@ -60,7 +106,9 @@ impl ShareService {
         peers_with_chunks: &[PeerChunks],
     ) -> Result<PullPlan, ShareError> {
         // Get our current bitfield
-        let local_bitfield = self.blob_store.get_chunk_bitfield(hash, metadata.total_chunks)?;
+        let local_bitfield = self
+            .blob_store
+            .get_chunk_bitfield(hash, metadata.total_chunks)?;
 
         // Find missing chunks
         let missing_chunks: Vec<u32> = local_bitfield
@@ -122,10 +170,7 @@ impl ShareService {
         total_chunks: u32,
     ) -> Result<ChunkProcessResult, ShareError> {
         // Verify chunk
-        let valid = self
-            .blob_store
-            .verify_chunk(hash, chunk_index, data)
-            .unwrap_or(false);
+        let valid = self.blob_store.verify_chunk(hash, chunk_index, data)?;
 
         if !valid {
             return Ok(ChunkProcessResult {
@@ -168,8 +213,17 @@ impl ShareService {
     /// Calculate section ID from chunk index
     pub fn calculate_section_id(&self, chunk_index: u32, total_chunks: u32) -> u8 {
         let num_sections = calculate_num_sections(total_chunks);
-        let chunks_per_section = (total_chunks + num_sections as u32 - 1) / num_sections as u32;
-        (chunk_index / chunks_per_section) as u8
+        self.calculate_section_id_with_sections(chunk_index, total_chunks, num_sections)
+    }
+
+    /// Calculate section ID from chunk index using explicit section layout.
+    pub fn calculate_section_id_with_sections(
+        &self,
+        chunk_index: u32,
+        total_chunks: u32,
+        num_sections: u8,
+    ) -> u8 {
+        calculate_section_id_for_layout(chunk_index, total_chunks, num_sections)
     }
 
     /// Request a single chunk from a peer (1:1 RPC)
@@ -204,13 +258,21 @@ impl ShareService {
 
         // Read single response
         let max_size = CHUNK_SIZE as usize + 1024;
-        let data = recv
-            .read_to_end(max_size)
+        let data = tokio::time::timeout(self.config.chunk_timeout, recv.read_to_end(max_size))
             .await
+            .map_err(|_| {
+                ShareError::Connection(format!(
+                    "chunk response timed out after {:?}",
+                    self.config.chunk_timeout
+                ))
+            })?
             .map_err(|e| ShareError::Connection(e.to_string()))?;
 
         match ShareMessage::decode(&data) {
-            Ok(ShareMessage::ChunkResponse(resp)) => Ok(resp),
+            Ok(ShareMessage::ChunkResponse(resp)) => {
+                validate_chunk_response(&resp, hash, chunk_index)?;
+                Ok(resp)
+            }
             _ => Err(ShareError::Protocol("invalid chunk response".to_string())),
         }
     }
@@ -221,8 +283,8 @@ impl ShareService {
         source_id: &[u8; 32],
         hash: &[u8; 32],
     ) -> Result<ChunkMapResponse, ShareError> {
-        let node_id = EndpointId::from_bytes(source_id)
-            .map_err(|e| ShareError::Connection(e.to_string()))?;
+        let node_id =
+            EndpointId::from_bytes(source_id).map_err(|e| ShareError::Connection(e.to_string()))?;
 
         let conn = self.connect_for_share(node_id).await?;
 
@@ -239,13 +301,21 @@ impl ShareService {
         send.finish()
             .map_err(|e| ShareError::Connection(e.to_string()))?;
 
-        let data = recv
-            .read_to_end(64 * 1024)
+        let data = tokio::time::timeout(self.config.chunk_timeout, recv.read_to_end(64 * 1024))
             .await
+            .map_err(|_| {
+                ShareError::Connection(format!(
+                    "chunk map response timed out after {:?}",
+                    self.config.chunk_timeout
+                ))
+            })?
             .map_err(|e| ShareError::Connection(e.to_string()))?;
 
         match ShareMessage::decode(&data) {
-            Ok(ShareMessage::ChunkMapResponse(resp)) => Ok(resp),
+            Ok(ShareMessage::ChunkMapResponse(resp)) => {
+                validate_chunk_map_response(&resp, hash)?;
+                Ok(resp)
+            }
             _ => Err(ShareError::Protocol(
                 "invalid chunk map response".to_string(),
             )),
@@ -335,20 +405,27 @@ impl ShareService {
 
             // Record section trace
             if !assignment.chunks.is_empty() {
-                let section_id =
-                    self.calculate_section_id(assignment.chunks[0], metadata.total_chunks);
-                let _ = self
+                let section_id = self.calculate_section_id_with_sections(
+                    assignment.chunks[0],
+                    metadata.total_chunks,
+                    metadata.num_sections,
+                );
+                if let Err(e) = self
                     .record_section_trace(hash, section_id, &assignment.peer_id)
-                    .await;
+                    .await
+                {
+                    warn!(
+                        error = %e,
+                        section = section_id,
+                        peer = hex::encode(&assignment.peer_id[..8]),
+                        "Failed to record section trace"
+                    );
+                }
             }
         }
 
         // 4. Check completion
-        if self
-            .blob_store
-            .is_complete(hash, metadata.total_chunks)
-            .unwrap_or(false)
-        {
+        if self.blob_store.is_complete(hash, metadata.total_chunks)? {
             self.mark_complete(hash).await?;
 
             info!(
@@ -360,7 +437,9 @@ impl ShareService {
             // Announce we can seed
             match self.get_can_seed_recipients(&metadata.scope_id).await {
                 Ok(recipients) => {
-                    if let Err(e) = self.announce_can_seed(&metadata.scope_id, hash, &recipients).await
+                    if let Err(e) = self
+                        .announce_can_seed(&metadata.scope_id, hash, &recipients)
+                        .await
                     {
                         warn!(error = %e, "Failed to announce can seed");
                     }
@@ -372,8 +451,7 @@ impl ShareService {
         } else {
             let bitfield = self
                 .blob_store
-                .get_chunk_bitfield(hash, metadata.total_chunks)
-                .unwrap_or_default();
+                .get_chunk_bitfield(hash, metadata.total_chunks)?;
             let have = bitfield.iter().filter(|&&b| b).count();
             info!(
                 hash = hex::encode(&hash[..8]),
@@ -395,8 +473,8 @@ impl ShareService {
         total_size: u64,
         from_peer: &[u8; 32],
     ) -> Result<bool, ShareError> {
-        // Verify chunk (simplified - would use bao-tree for full verification)
-        // For now just verify it's not empty and not too large
+        // Basic structural validation before write; full verification is handled
+        // by outboard chunk hash checks in process_pull_chunk/requested chunk flow.
         if data.is_empty() || data.len() > CHUNK_SIZE as usize {
             return Err(ShareError::Protocol("invalid chunk size".to_string()));
         }
@@ -413,28 +491,41 @@ impl ShareService {
         );
 
         // Check if this completes a section (for trace recording)
-        let total_chunks = ((total_size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
+        let total_chunks = total_chunks_from_size(total_size)?;
         let bitfield = self.blob_store.get_chunk_bitfield(hash, total_chunks)?;
 
         // Check which sections are complete
         {
             let db_lock = self.db.lock().await;
-            if let Ok(traces) = get_section_traces(&db_lock, hash) {
-                for trace in traces {
-                    // Check if all chunks in section are present
-                    let section_complete = (trace.chunk_start..trace.chunk_end)
-                        .all(|i| bitfield.get(i as usize).copied().unwrap_or(false));
+            match get_section_traces(&db_lock, hash) {
+                Ok(traces) => {
+                    for trace in traces {
+                        // Check if all chunks in section are present
+                        let section_complete = (trace.chunk_start..trace.chunk_end)
+                            .all(|i| bitfield.get(i as usize).copied().unwrap_or(false));
 
-                    if section_complete && trace.received_from.is_none() {
-                        // Record trace
-                        let _ = record_section_received(&db_lock, hash, trace.section_id, from_peer);
-                        debug!(
-                            hash = %hex::encode(&hash[..8]),
-                            section = trace.section_id,
-                            from = %hex::encode(&from_peer[..8]),
-                            "section complete, recorded trace"
-                        );
+                        if section_complete && trace.received_from.is_none() {
+                            if let Err(e) =
+                                record_section_received(&db_lock, hash, trace.section_id, from_peer)
+                            {
+                                warn!(
+                                    error = %e,
+                                    section = trace.section_id,
+                                    "failed to record section trace"
+                                );
+                            } else {
+                                debug!(
+                                    hash = %hex::encode(&hash[..8]),
+                                    section = trace.section_id,
+                                    from = %hex::encode(&from_peer[..8]),
+                                    "section complete, recorded trace"
+                                );
+                            }
+                        }
                     }
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to load section traces");
                 }
             }
         }
@@ -476,7 +567,9 @@ impl ShareService {
         }
 
         // Add ourselves if we're the source
-        if let Ok(Some(blob)) = get_blob(&db_lock, hash) {
+        if let Some(blob) =
+            get_blob(&db_lock, hash).map_err(|e| ShareError::Database(e.to_string()))?
+        {
             if blob.source_id == self.identity.public_key && blob.state == BlobState::Complete {
                 peers.push(PeerChunks {
                     endpoint_id: self.identity.public_key,
@@ -486,10 +579,7 @@ impl ShareService {
             }
         }
 
-        Ok(ChunkMapResponse {
-            hash: *hash,
-            peers,
-        })
+        Ok(ChunkMapResponse { hash: *hash, peers })
     }
 
     /// Get peer suggestion for a section (when we're busy)
@@ -523,5 +613,67 @@ impl ShareService {
             .connect_with_timeout(&endpoint_id_bytes, self.config.connect_timeout)
             .await
             .map_err(|e| ShareError::Connection(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_hash(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    #[test]
+    fn test_calculate_section_id_for_layout_bounds() {
+        assert_eq!(calculate_section_id_for_layout(0, 10, 3), 0);
+        assert_eq!(calculate_section_id_for_layout(3, 10, 3), 0);
+        assert_eq!(calculate_section_id_for_layout(4, 10, 3), 1);
+        assert_eq!(calculate_section_id_for_layout(8, 10, 3), 2);
+        assert_eq!(calculate_section_id_for_layout(9, 10, 3), 2);
+    }
+
+    #[test]
+    fn test_calculate_section_id_for_layout_handles_zero_inputs() {
+        assert_eq!(calculate_section_id_for_layout(0, 0, 3), 0);
+        assert_eq!(calculate_section_id_for_layout(0, 10, 0), 0);
+    }
+
+    #[test]
+    fn test_validate_chunk_response_accepts_matching_fields() {
+        let hash = test_hash(1);
+        let resp = ChunkResponse {
+            hash,
+            chunk_index: 7,
+            data: vec![1, 2, 3],
+        };
+        assert!(validate_chunk_response(&resp, &hash, 7).is_ok());
+    }
+
+    #[test]
+    fn test_validate_chunk_response_rejects_mismatch() {
+        let hash = test_hash(2);
+        let resp = ChunkResponse {
+            hash,
+            chunk_index: 3,
+            data: vec![9],
+        };
+        let err = validate_chunk_response(&resp, &test_hash(7), 3).expect_err("hash mismatch");
+        assert!(matches!(err, ShareError::Protocol(_)));
+
+        let err = validate_chunk_response(&resp, &hash, 4).expect_err("index mismatch");
+        assert!(matches!(err, ShareError::Protocol(_)));
+    }
+
+    #[test]
+    fn test_validate_chunk_map_response_rejects_hash_mismatch() {
+        let resp = ChunkMapResponse {
+            hash: test_hash(5),
+            peers: Vec::new(),
+        };
+        assert!(matches!(
+            validate_chunk_map_response(&resp, &test_hash(6)),
+            Err(ShareError::Protocol(_))
+        ));
     }
 }

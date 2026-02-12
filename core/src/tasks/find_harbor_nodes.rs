@@ -71,7 +71,8 @@ impl Protocol {
 
             // Refresh cache for each harbor_id
             for harbor_id in harbor_ids {
-                let nodes = HarborService::find_harbor_nodes_dht(&Some(dht.clone()), &harbor_id).await;
+                let nodes =
+                    HarborService::find_harbor_nodes_dht(&Some(dht.clone()), &harbor_id).await;
 
                 if nodes.is_empty() {
                     debug!(

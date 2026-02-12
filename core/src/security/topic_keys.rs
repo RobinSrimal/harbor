@@ -16,7 +16,7 @@ use std::fmt;
 pub struct TopicKeys {
     /// 32-byte encryption key for AEAD (ChaCha20-Poly1305)
     pub k_enc: [u8; 32],
-    /// 32-byte MAC key for HMAC authentication
+    /// 32-byte MAC key for BLAKE3 keyed MAC authentication
     pub k_mac: [u8; 32],
 }
 
@@ -241,6 +241,36 @@ mod tests {
 
         assert_eq!(keys1.k_enc, keys2.k_enc);
         assert_eq!(keys1.k_mac, keys2.k_mac);
+    }
+
+    #[test]
+    fn test_topic_key_known_vectors() {
+        let topic_id = [42u8; 32];
+        let keys = TopicKeys::derive(&topic_id);
+
+        let expected_k_enc: [u8; 32] = [
+            185, 42, 147, 25, 76, 145, 7, 13, 180, 161, 75, 130, 33, 188, 172, 8, 216, 73, 45, 12,
+            112, 84, 148, 50, 98, 120, 104, 84, 133, 240, 142, 7,
+        ];
+        let expected_k_mac: [u8; 32] = [
+            67, 226, 52, 11, 186, 5, 203, 26, 195, 119, 229, 240, 87, 137, 162, 113, 55, 8, 155,
+            217, 108, 172, 109, 249, 119, 206, 117, 188, 192, 156, 17, 94,
+        ];
+
+        assert_eq!(keys.k_enc, expected_k_enc);
+        assert_eq!(keys.k_mac, expected_k_mac);
+    }
+
+    #[test]
+    fn test_harbor_id_known_vector() {
+        let topic_id = [42u8; 32];
+        let harbor_id = harbor_id_from_topic(&topic_id);
+        let expected_harbor_id: [u8; 32] = [
+            67, 52, 16, 1, 167, 38, 35, 224, 13, 89, 14, 139, 247, 127, 144, 185, 239, 153, 183,
+            179, 28, 145, 232, 11, 130, 13, 78, 112, 98, 247, 57, 55,
+        ];
+
+        assert_eq!(harbor_id, expected_harbor_id);
     }
 
     #[test]

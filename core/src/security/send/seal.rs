@@ -1,13 +1,17 @@
 //! Seal functions for Harbor storage
 //!
-//! These functions apply the full crypto stack (encryption + MAC + signature)
-//! to raw payloads before sending to Harbor nodes for offline storage.
+//! These functions seal raw payloads before sending to Harbor nodes for
+//! offline storage.
+//!
+//! Topic packets use the full stack (encryption + MAC + signature).
+//! DM packets use ECDH-derived encryption + signature (no topic MAC).
 //!
 //! Direct delivery uses QUIC TLS only - these functions are only called
 //! during harbor_replication for packets that couldn't be delivered directly.
 
 use crate::security::send::packet::{
-    create_packet, create_packet_with_epoch, create_dm_packet, PacketError, SendPacket, EpochKeys,
+    EpochKeys, PacketError, PacketId, SendPacket, create_dm_packet, create_packet,
+    create_packet_with_epoch,
 };
 
 /// Seal a raw topic message for Harbor storage.
@@ -31,9 +35,15 @@ pub fn seal_topic_packet(
     sender_private_key: &[u8; 32],
     sender_public_key: &[u8; 32],
     raw_payload: &[u8],
-    packet_id: [u8; 32],
+    packet_id: PacketId,
 ) -> Result<SendPacket, PacketError> {
-    create_packet(topic_id, sender_private_key, sender_public_key, raw_payload, packet_id)
+    create_packet(
+        topic_id,
+        sender_private_key,
+        sender_public_key,
+        raw_payload,
+        packet_id,
+    )
 }
 
 /// Seal a raw topic message with specific epoch keys for Harbor storage.
@@ -57,9 +67,16 @@ pub fn seal_topic_packet_with_epoch(
     sender_public_key: &[u8; 32],
     raw_payload: &[u8],
     epoch_keys: &EpochKeys,
-    packet_id: [u8; 32],
+    packet_id: PacketId,
 ) -> Result<SendPacket, PacketError> {
-    create_packet_with_epoch(topic_id, sender_private_key, sender_public_key, raw_payload, epoch_keys, packet_id)
+    create_packet_with_epoch(
+        topic_id,
+        sender_private_key,
+        sender_public_key,
+        raw_payload,
+        epoch_keys,
+        packet_id,
+    )
 }
 
 /// Seal a raw topic message and serialize to bytes for Harbor storage.
@@ -80,9 +97,15 @@ pub fn seal_topic_packet_bytes(
     sender_private_key: &[u8; 32],
     sender_public_key: &[u8; 32],
     raw_payload: &[u8],
-    packet_id: [u8; 32],
+    packet_id: PacketId,
 ) -> Result<Vec<u8>, PacketError> {
-    let packet = seal_topic_packet(topic_id, sender_private_key, sender_public_key, raw_payload, packet_id)?;
+    let packet = seal_topic_packet(
+        topic_id,
+        sender_private_key,
+        sender_public_key,
+        raw_payload,
+        packet_id,
+    )?;
     packet.to_bytes()
 }
 
@@ -107,9 +130,15 @@ pub fn seal_dm_packet(
     sender_public_key: &[u8; 32],
     recipient_public_key: &[u8; 32],
     raw_payload: &[u8],
-    packet_id: [u8; 32],
+    packet_id: PacketId,
 ) -> Result<SendPacket, PacketError> {
-    create_dm_packet(sender_private_key, sender_public_key, recipient_public_key, raw_payload, packet_id)
+    create_dm_packet(
+        sender_private_key,
+        sender_public_key,
+        recipient_public_key,
+        raw_payload,
+        packet_id,
+    )
 }
 
 /// Seal a raw DM and serialize to bytes for Harbor storage.
@@ -130,9 +159,15 @@ pub fn seal_dm_packet_bytes(
     sender_public_key: &[u8; 32],
     recipient_public_key: &[u8; 32],
     raw_payload: &[u8],
-    packet_id: [u8; 32],
+    packet_id: PacketId,
 ) -> Result<Vec<u8>, PacketError> {
-    let packet = seal_dm_packet(sender_private_key, sender_public_key, recipient_public_key, raw_payload, packet_id)?;
+    let packet = seal_dm_packet(
+        sender_private_key,
+        sender_public_key,
+        recipient_public_key,
+        raw_payload,
+        packet_id,
+    )?;
     packet.to_bytes()
 }
 
@@ -140,7 +175,10 @@ pub fn seal_dm_packet_bytes(
 mod tests {
     use super::*;
     use crate::security::create_key_pair::generate_key_pair;
-    use crate::security::send::packet::{verify_and_decrypt_packet, verify_and_decrypt_dm_packet, generate_packet_id};
+    use crate::security::send::packet::{
+        MAX_PAYLOAD_SIZE, VerificationMode, generate_packet_id, verify_and_decrypt_dm_packet,
+        verify_and_decrypt_packet, verify_and_decrypt_with_epoch,
+    };
 
     fn test_topic_id() -> [u8; 32] {
         [42u8; 32]
@@ -159,7 +197,8 @@ mod tests {
             &kp.public_key,
             raw_payload,
             packet_id,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should be a valid sealed packet
         assert!(!packet.is_dm());
@@ -169,6 +208,58 @@ mod tests {
         // Should decrypt correctly
         let decrypted = verify_and_decrypt_packet(&packet, &topic_id).unwrap();
         assert_eq!(decrypted, raw_payload);
+    }
+
+    #[test]
+    fn test_seal_topic_packet_with_epoch() {
+        let topic_id = test_topic_id();
+        let kp = generate_key_pair();
+        let raw_payload = b"Epoch-sealed payload";
+        let packet_id = generate_packet_id();
+
+        let epoch_secret = [7u8; 32];
+        let epoch_keys = EpochKeys::derive_from_secret(7, &epoch_secret);
+
+        let packet = seal_topic_packet_with_epoch(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            raw_payload,
+            &epoch_keys,
+            packet_id,
+        )
+        .unwrap();
+
+        assert!(!packet.is_dm());
+        assert_eq!(packet.packet_id, packet_id);
+        assert_eq!(packet.epoch, epoch_keys.epoch);
+
+        let decrypted =
+            verify_and_decrypt_with_epoch(&packet, &topic_id, &epoch_keys, VerificationMode::Full)
+                .unwrap();
+        assert_eq!(decrypted, raw_payload);
+    }
+
+    #[test]
+    fn test_seal_topic_packet_payload_too_large() {
+        let topic_id = test_topic_id();
+        let kp = generate_key_pair();
+        let oversized_payload = vec![0u8; MAX_PAYLOAD_SIZE + 1];
+        let packet_id = generate_packet_id();
+
+        let result = seal_topic_packet(
+            &topic_id,
+            &kp.private_key,
+            &kp.public_key,
+            &oversized_payload,
+            packet_id,
+        );
+
+        assert!(matches!(
+            result,
+            Err(PacketError::PayloadTooLarge { size, max })
+            if size == MAX_PAYLOAD_SIZE + 1 && max == MAX_PAYLOAD_SIZE
+        ));
     }
 
     #[test]
@@ -184,7 +275,8 @@ mod tests {
             &kp.public_key,
             raw_payload,
             packet_id,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should deserialize back to a valid packet
         let packet = SendPacket::from_bytes(&bytes).unwrap();
@@ -206,7 +298,8 @@ mod tests {
             &recipient.public_key,
             raw_payload,
             packet_id,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should be a DM packet
         assert!(packet.is_dm());
@@ -217,6 +310,28 @@ mod tests {
         // Should decrypt correctly
         let decrypted = verify_and_decrypt_dm_packet(&packet, &recipient.private_key).unwrap();
         assert_eq!(decrypted, raw_payload);
+    }
+
+    #[test]
+    fn test_seal_dm_packet_payload_too_large() {
+        let sender = generate_key_pair();
+        let recipient = generate_key_pair();
+        let oversized_payload = vec![0u8; MAX_PAYLOAD_SIZE + 1];
+        let packet_id = generate_packet_id();
+
+        let result = seal_dm_packet(
+            &sender.private_key,
+            &sender.public_key,
+            &recipient.public_key,
+            &oversized_payload,
+            packet_id,
+        );
+
+        assert!(matches!(
+            result,
+            Err(PacketError::PayloadTooLarge { size, max })
+            if size == MAX_PAYLOAD_SIZE + 1 && max == MAX_PAYLOAD_SIZE
+        ));
     }
 
     #[test]
@@ -232,7 +347,8 @@ mod tests {
             &recipient.public_key,
             raw_payload,
             packet_id,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should deserialize back to a valid DM packet
         let packet = SendPacket::from_bytes(&bytes).unwrap();

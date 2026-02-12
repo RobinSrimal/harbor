@@ -75,10 +75,11 @@ impl StreamService {
 
         // 4. Perform MOQ handshake as server
         //    Destination only consumes — no .with_publish() to avoid bidirectional subscribe loops
-        let moq_server = moq_lite::Server::new()
-            .with_consume(origin.producer.clone());
+        let moq_server = moq_lite::Server::new().with_consume(origin.producer.clone());
 
-        let moq_session = moq_server.accept(wt_session).await
+        let moq_session = moq_server
+            .accept(wt_session)
+            .await
             .map_err(|e| StreamError::Moq(e.to_string()))?;
 
         info!(
@@ -104,6 +105,7 @@ impl StreamService {
         // 6. Emit StreamConnected for destination side
         let event = crate::protocol::ProtocolEvent::StreamConnected(
             crate::protocol::StreamConnectedEvent {
+                broadcast_id: pending.broadcast_id,
                 request_id: pending.request_id,
                 topic_id: crate::network::stream::optional_topic_id(&pending.topic_id),
                 peer_id,

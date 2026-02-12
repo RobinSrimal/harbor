@@ -44,7 +44,7 @@ impl Protocol {
             }
 
             tokio::time::sleep(sync_interval).await;
-            
+
             info!("Harbor sync: starting sync cycle");
 
             // Get all HarborIDs we're storing packets for
@@ -84,11 +84,16 @@ impl Protocol {
 
                 // Fallback to DHT lookup if cache is empty
                 if harbor_nodes.is_empty() {
-                    harbor_nodes = HarborService::find_harbor_nodes_dht(&dht_service, &harbor_id).await;
+                    harbor_nodes =
+                        HarborService::find_harbor_nodes_dht(&dht_service, &harbor_id).await;
                     // Cache the result for next time
                     if !harbor_nodes.is_empty() {
                         let db_lock = db.lock().await;
-                        let _ = crate::data::harbor::replace_harbor_nodes(&db_lock, &harbor_id, &harbor_nodes);
+                        let _ = crate::data::harbor::replace_harbor_nodes(
+                            &db_lock,
+                            &harbor_id,
+                            &harbor_nodes,
+                        );
                     }
                 }
 
@@ -129,7 +134,7 @@ impl Protocol {
                     let mut rng = rand::thread_rng();
                     *candidates.choose(&mut rng).unwrap()
                 };
-                
+
                 let partner_hex = hex::encode(sync_partner);
                 info!(
                     harbor_id = %harbor_id_hex,
@@ -139,11 +144,14 @@ impl Protocol {
                 );
 
                 // Connect and sync
-                match harbor_service.send_harbor_sync(&sync_partner, &sync_request).await {
+                match harbor_service
+                    .send_harbor_sync(&sync_partner, &sync_request)
+                    .await
+                {
                     Ok(response) => {
                         let missing_count = response.missing_packets.len();
                         let delivery_updates = response.delivery_updates.len();
-                        
+
                         // Apply the response
                         let mut db_lock = db.lock().await;
                         if let Err(e) = harbor_service.apply_sync_response(&mut db_lock, response) {
@@ -191,4 +199,3 @@ impl Protocol {
         info!("Harbor sync loop stopped");
     }
 }
-

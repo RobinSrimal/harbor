@@ -41,11 +41,6 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 dirs = "5.0"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 
-# MLS (Messaging Layer Security) for Tier 3 group encryption (forward secrecy + PCS)
-# Uncomment when implementing Tier 3 - see MEMBERSHIP-MANAGEMENT-TIERS.md
-# mls-rs = "0.51"
-# mls-rs-crypto-rustcrypto = "0.19"
-
 # Async utilities
 futures = "0.3"
 

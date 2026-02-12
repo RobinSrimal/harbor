@@ -10,8 +10,20 @@ use crate::protocol::{PeerSuggestedEvent, ProtocolEvent};
 
 use super::protocol::{ControlAck, ControlPacketType, Suggest};
 use super::service::{
-    compute_control_pow, generate_id, verify_sender, ControlResult, ControlService,
+    ControlError, ControlResult, ControlService, compute_control_pow, generate_id, verify_sender,
 };
+
+fn encode_control_message<T: serde::Serialize>(
+    message: &T,
+    packet_type: ControlPacketType,
+) -> ControlResult<Vec<u8>> {
+    postcard::to_allocvec(message).map_err(|e| {
+        ControlError::Rpc(format!(
+            "failed to encode {:?} control message: {}",
+            packet_type, e
+        ))
+    })
+}
 
 impl ControlService {
     /// Suggest a peer to another peer
@@ -26,10 +38,17 @@ impl ControlService {
         // Get suggested peer's relay URL from our database
         let relay_url = {
             let db = self.db().lock().await;
-            crate::data::get_peer_relay_info(&db, suggested_peer)
-                .ok()
-                .flatten()
-                .map(|(url, _)| url)
+            match crate::data::get_peer_relay_info(&db, suggested_peer) {
+                Ok(info) => info.map(|(url, _)| url),
+                Err(e) => {
+                    warn!(
+                        suggested = %hex::encode(&suggested_peer[..8]),
+                        error = %e,
+                        "failed to load relay info for suggested peer"
+                    );
+                    None
+                }
+            }
         };
 
         let pow = compute_control_pow(&self.local_id(), ControlPacketType::Suggest)?;
@@ -60,7 +79,7 @@ impl ControlService {
             &message_id,
             to_peer,
             &[*to_peer],
-            &postcard::to_allocvec(&suggest).unwrap(),
+            &encode_control_message(&suggest, ControlPacketType::Suggest)?,
             ControlPacketType::Suggest,
         )
         .await?;
@@ -69,11 +88,7 @@ impl ControlService {
     }
 
     /// Handle an incoming Suggest (peer introduction)
-    pub async fn handle_suggest(
-        &self,
-        suggest: &Suggest,
-        sender_id: [u8; 32],
-    ) -> ControlAck {
+    pub async fn handle_suggest(&self, suggest: &Suggest, sender_id: [u8; 32]) -> ControlAck {
         // Verify PoW first
         if let Err(e) = self.verify_pow(&suggest.pow, &sender_id, ControlPacketType::Suggest) {
             warn!(
@@ -107,5 +122,43 @@ impl ControlService {
         let _ = self.event_tx().send(event).await;
 
         ControlAck::success(suggest.message_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::ser::{Error as _, Serializer};
+
+    struct FailingSerialize;
+
+    impl serde::Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            Err(S::Error::custom("serialize failed"))
+        }
+    }
+
+    #[test]
+    fn test_encode_control_message_success() {
+        let ack = ControlAck::success([1u8; 32]);
+        let encoded = encode_control_message(&ack, ControlPacketType::Suggest).unwrap();
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn test_encode_control_message_maps_errors() {
+        let err = encode_control_message(&FailingSerialize, ControlPacketType::Suggest)
+            .expect_err("encoding should fail");
+
+        match err {
+            ControlError::Rpc(message) => {
+                assert!(message.contains("Suggest"));
+                assert!(message.contains("failed to encode"));
+            }
+            other => panic!("unexpected error variant: {:?}", other),
+        }
     }
 }

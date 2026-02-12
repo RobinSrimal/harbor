@@ -32,31 +32,55 @@ impl BootstrapNode {
     pub fn from_hex(hex: &str, name: Option<&'static str>) -> Option<Self> {
         let arr = Self::parse_hex(hex)?;
         let node_id = EndpointId::from_bytes(&arr).ok()?;
-        Some(Self { node_id, name, relay_url: None })
+        Some(Self {
+            node_id,
+            name,
+            relay_url: None,
+        })
     }
 
     /// Create a new bootstrap node with relay URL
-    pub fn from_hex_with_relay(hex: &str, name: Option<&'static str>, relay_url: &'static str) -> Option<Self> {
+    pub fn from_hex_with_relay(
+        hex: &str,
+        name: Option<&'static str>,
+        relay_url: &'static str,
+    ) -> Option<Self> {
         let arr = Self::parse_hex(hex)?;
         let node_id = EndpointId::from_bytes(&arr).ok()?;
-        Some(Self { node_id, name, relay_url: Some(relay_url) })
+        Some(Self {
+            node_id,
+            name,
+            relay_url: Some(relay_url),
+        })
     }
 
     /// Create from raw bytes
     pub fn from_bytes(bytes: &[u8; 32], name: Option<&'static str>) -> Option<Self> {
         let node_id = EndpointId::from_bytes(bytes).ok()?;
-        Some(Self { node_id, name, relay_url: None })
+        Some(Self {
+            node_id,
+            name,
+            relay_url: None,
+        })
     }
 
     /// Create from raw bytes with relay URL
-    pub fn from_bytes_with_relay(bytes: &[u8; 32], name: Option<&'static str>, relay_url: &'static str) -> Option<Self> {
+    pub fn from_bytes_with_relay(
+        bytes: &[u8; 32],
+        name: Option<&'static str>,
+        relay_url: &'static str,
+    ) -> Option<Self> {
         let node_id = EndpointId::from_bytes(bytes).ok()?;
-        Some(Self { node_id, name, relay_url: Some(relay_url) })
+        Some(Self {
+            node_id,
+            name,
+            relay_url: Some(relay_url),
+        })
     }
 }
 
 /// Default bootstrap nodes for the Harbor network
-/// 
+///
 /// These are maintained by the Harbor project and should be
 /// reasonably stable and well-connected.
 ///
@@ -165,7 +189,7 @@ mod tests {
         let hex = "d2248c8b350e861198eea13f5bd962257db9bca49a5fb063f9d2655e7b2f6f24";
         let node = BootstrapNode::from_hex(hex, Some("test"));
         assert!(node.is_some());
-        
+
         let node = node.unwrap();
         assert_eq!(node.name, Some("test"));
     }
@@ -183,7 +207,7 @@ mod tests {
     fn test_default_bootstrap_nodes() {
         let nodes = default_bootstrap_nodes();
         assert!(!nodes.is_empty());
-        
+
         // First node should be our primary
         assert_eq!(nodes[0].name, Some("harbor-bootstrap-1"));
     }
@@ -225,10 +249,10 @@ mod tests {
         // Use a valid Ed25519 public key (derived from a known secret)
         let secret = iroh::SecretKey::from_bytes(&[1u8; 32]);
         let bytes = *secret.public().as_bytes();
-        
+
         let node = BootstrapNode::from_bytes(&bytes, Some("test-bytes"));
         assert!(node.is_some());
-        
+
         let node = node.unwrap();
         assert_eq!(node.name, Some("test-bytes"));
         assert!(node.relay_url.is_none());
@@ -239,10 +263,14 @@ mod tests {
         // Use a valid Ed25519 public key (derived from a known secret)
         let secret = iroh::SecretKey::from_bytes(&[2u8; 32]);
         let bytes = *secret.public().as_bytes();
-        
-        let node = BootstrapNode::from_bytes_with_relay(&bytes, Some("test"), "https://relay.example.com/");
+
+        let node = BootstrapNode::from_bytes_with_relay(
+            &bytes,
+            Some("test"),
+            "https://relay.example.com/",
+        );
         assert!(node.is_some());
-        
+
         let node = node.unwrap();
         assert_eq!(node.relay_url, Some("https://relay.example.com/"));
     }
@@ -251,7 +279,7 @@ mod tests {
     fn test_bootstrap_dial_info() {
         let dial_info = bootstrap_dial_info();
         assert!(!dial_info.is_empty());
-        
+
         // First node should have a relay URL
         let (node_id, relay) = &dial_info[0];
         assert_eq!(node_id.as_bytes().len(), 32);
@@ -263,11 +291,10 @@ mod tests {
         let config = BootstrapConfig::default();
         let ids = config.all_node_ids();
         assert!(!ids.is_empty());
-        
+
         // All IDs should be 32 bytes
         for id in ids {
             assert_eq!(id.len(), 32);
         }
     }
 }
-

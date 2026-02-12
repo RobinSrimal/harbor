@@ -27,38 +27,54 @@ pub mod wire;
 
 // Re-export packet type system (application-level messages, may be Harbor-routed)
 pub use packet::{
-    PacketType, Scope, VerificationMode, HarborIdSource, EncryptionKeyType,
-    DecodeError, is_dm_message_type, is_stream_signaling_type,
+    CanSeedMessage,
+    DecodeError,
+    DmMessage,
+    DmStreamRequestMessage,
+    EncryptionKeyType,
     // Payload structs
-    FileAnnouncementMessage, CanSeedMessage, SyncUpdateMessage, StreamRequestMessage,
-    DmStreamRequestMessage, StreamAcceptMessage, StreamRejectMessage,
-    StreamQueryMessage, StreamActiveMessage, StreamEndedMessage,
+    FileAnnouncementMessage,
+    HarborIdSource,
+    PacketType,
+    Scope,
+    StreamAcceptMessage,
+    StreamActiveMessage,
+    StreamEndedMessage,
+    StreamQueryMessage,
+    StreamRejectMessage,
+    StreamRequestMessage,
+    StreamSignalingMessage,
+    SyncUpdateMessage,
     // Wrapper enums
-    TopicMessage, DmMessage, StreamSignalingMessage,
+    TopicMessage,
+    VerificationMode,
+    is_dm_message_type,
+    is_stream_signaling_type,
 };
 
 // Re-export membership proof helpers
-pub use membership::{create_membership_binding, create_membership_proof, verify_membership_proof, MembershipProof};
+pub use membership::{
+    MembershipProof, create_membership_binding, create_membership_proof, verify_membership_proof,
+};
 
 // Re-export commonly used items
-pub use harbor::{HarborError, HarborMessage, HarborService, HARBOR_ALPN};
-pub use send::{Receipt, SendConfig, SendService, SEND_ALPN};
-pub use share::{
-    FileAnnouncement, CanSeed, ShareConfig, ShareError, ShareMessage, ShareService, SHARE_ALPN,
-};
-pub use sync::{
-    SyncMessage, SyncMessageType, SyncUpdate, InitialSyncRequest, InitialSyncResponse,
-    DecodeError as SyncDecodeError, SYNC_ALPN, SyncService,
-};
-pub use stream::{StreamService, StreamError, StreamSession, STREAM_ALPN, STREAM_SIGNAL_TTL};
-pub use process::{ProcessContext, ProcessScope, ProcessError, process_packet};
-pub use gate::ConnectionGate;
 pub use connect::Connector;
 pub use control::{
-    ControlAck, ControlPacketType, ControlRpcMessage, ControlRpcProtocol, CONTROL_ALPN,
-    ConnectAccept, ConnectDecline, ConnectRequest, RemoveMember, Suggest, TopicInvite,
-    TopicJoin, TopicLeave, ControlService, ControlError, ControlResult, ConnectInvite,
-    MemberInfo,
+    CONTROL_ALPN, ConnectAccept, ConnectDecline, ConnectInvite, ConnectRequest, ControlAck,
+    ControlError, ControlPacketType, ControlResult, ControlRpcMessage, ControlRpcProtocol,
+    ControlService, MemberInfo, RemoveMember, Suggest, TopicInvite, TopicJoin, TopicLeave,
+};
+pub use gate::ConnectionGate;
+pub use harbor::{HARBOR_ALPN, HarborError, HarborMessage, HarborService};
+pub use process::{ProcessContext, ProcessError, ProcessScope, process_packet};
+pub use send::{Receipt, SEND_ALPN, SendConfig, SendService};
+pub use share::{
+    CanSeed, FileAnnouncement, SHARE_ALPN, ShareConfig, ShareError, ShareMessage, ShareService,
+};
+pub use stream::{STREAM_ALPN, STREAM_SIGNAL_TTL, StreamError, StreamService, StreamSession};
+pub use sync::{
+    DecodeError as SyncDecodeError, InitialSyncRequest, InitialSyncResponse, SYNC_ALPN,
+    SyncMessage, SyncMessageType, SyncService, SyncUpdate,
 };
 
 // Sample files are kept for reference but not compiled

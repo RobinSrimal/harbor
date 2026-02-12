@@ -4,24 +4,69 @@
 //! - Outgoing: request, accept, decline, block, unblock, token generation
 //! - Incoming: handle connect request/accept/decline from remote peers
 
+use rusqlite::Connection as DbConnection;
+use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use crate::data::{
-    consume_token, create_connect_token, get_connection, is_peer_blocked,
-    list_connections_by_state, token_exists, update_connection_state,
-    upsert_connection, ConnectionState,
+    ConnectionState, consume_token, create_connect_token, get_connection, is_peer_blocked,
+    list_connections_by_state, update_connection_state, upsert_connection,
 };
 use crate::protocol::{
     ConnectionAcceptedEvent, ConnectionDeclinedEvent, ConnectionRequestEvent, ProtocolEvent,
 };
 
 use super::protocol::{
-    ControlAck, ControlPacketType, ConnectAccept, ConnectDecline, ConnectRequest,
+    ConnectAccept, ConnectDecline, ConnectRequest, ControlAck, ControlPacketType,
 };
 use super::service::{
-    compute_control_pow, generate_id, verify_sender, ConnectInvite, ControlError, ControlResult,
-    ControlService,
+    ConnectInvite, ControlError, ControlResult, ControlService, compute_control_pow, generate_id,
+    verify_sender,
 };
+
+fn encode_control_message<T: Serialize>(
+    message: &T,
+    label: &'static str,
+) -> ControlResult<Vec<u8>> {
+    postcard::to_allocvec(message)
+        .map_err(|e| ControlError::Rpc(format!("failed to encode {}: {}", label, e)))
+}
+
+fn consume_connect_token_for_auto_accept(
+    conn: &DbConnection,
+    token: &[u8; 32],
+) -> ControlResult<bool> {
+    consume_token(conn, token).map_err(|e| ControlError::Database(e.to_string()))
+}
+
+fn persist_blocked_state(conn: &DbConnection, peer_id: &[u8; 32]) -> ControlResult<()> {
+    upsert_connection(conn, peer_id, ConnectionState::Blocked, None, None, None)
+        .map_err(|e| ControlError::Database(e.to_string()))
+}
+
+fn has_matching_pending_outgoing_request(
+    conn: &DbConnection,
+    peer_id: &[u8; 32],
+    request_id: &[u8; 32],
+) -> ControlResult<bool> {
+    match get_connection(conn, peer_id).map_err(|e| ControlError::Database(e.to_string()))? {
+        Some(existing) => Ok(existing.state == ConnectionState::PendingOutgoing
+            && existing.request_id == Some(*request_id)),
+        None => Ok(false),
+    }
+}
+
+fn mark_pending_outgoing_declined(
+    conn: &DbConnection,
+    peer_id: &[u8; 32],
+    request_id: &[u8; 32],
+) -> ControlResult<bool> {
+    if !has_matching_pending_outgoing_request(conn, peer_id, request_id)? {
+        return Ok(false);
+    }
+    update_connection_state(conn, peer_id, ConnectionState::Declined)
+        .map_err(|e| ControlError::Database(e.to_string()))
+}
 
 impl ControlService {
     // =========================================================================
@@ -40,7 +85,12 @@ impl ControlService {
         token: Option<[u8; 32]>,
     ) -> ControlResult<[u8; 32]> {
         let request_id = generate_id();
-        let our_relay = self.endpoint().addr().relay_urls().next().map(|u| u.to_string());
+        let our_relay = self
+            .endpoint()
+            .addr()
+            .relay_urls()
+            .next()
+            .map(|u| u.to_string());
         let pow = compute_control_pow(&self.local_id(), ControlPacketType::ConnectRequest)?;
 
         let req = ConnectRequest {
@@ -62,37 +112,36 @@ impl ControlService {
                 None,
                 relay_url,
                 Some(&request_id),
-            ).map_err(|e| ControlError::Database(e.to_string()))?;
+            )
+            .map_err(|e| ControlError::Database(e.to_string()))?;
         }
 
         // Try direct delivery
         match self.dial_peer(peer_id).await {
-            Ok(client) => {
-                match client.rpc(req.clone()).await {
-                    Ok(ack) => {
-                        if ack.success {
-                            info!(
-                                peer = %hex::encode(&peer_id[..8]),
-                                request_id = %hex::encode(&request_id[..8]),
-                                "connect request sent directly"
-                            );
-                        } else {
-                            warn!(
-                                peer = %hex::encode(&peer_id[..8]),
-                                reason = ?ack.reason,
-                                "connect request rejected"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        debug!(
+            Ok(client) => match client.rpc(req.clone()).await {
+                Ok(ack) => {
+                    if ack.success {
+                        info!(
                             peer = %hex::encode(&peer_id[..8]),
-                            error = %e,
-                            "failed to send connect request directly, will replicate via harbor"
+                            request_id = %hex::encode(&request_id[..8]),
+                            "connect request sent directly"
+                        );
+                    } else {
+                        warn!(
+                            peer = %hex::encode(&peer_id[..8]),
+                            reason = ?ack.reason,
+                            "connect request rejected"
                         );
                     }
                 }
-            }
+                Err(e) => {
+                    debug!(
+                        peer = %hex::encode(&peer_id[..8]),
+                        error = %e,
+                        "failed to send connect request directly, will replicate via harbor"
+                    );
+                }
+            },
             Err(e) => {
                 debug!(
                     peer = %hex::encode(&peer_id[..8]),
@@ -105,9 +154,9 @@ impl ControlService {
         // Store for harbor replication (point-to-point: harbor_id = recipient_id)
         self.store_control_packet(
             &request_id,
-            peer_id,           // harbor_id = recipient for point-to-point
-            &[*peer_id],       // single recipient
-            &postcard::to_allocvec(&req).unwrap(),
+            peer_id,     // harbor_id = recipient for point-to-point
+            &[*peer_id], // single recipient
+            &encode_control_message(&req, "ConnectRequest")?,
             ControlPacketType::ConnectRequest,
         )
         .await?;
@@ -116,16 +165,12 @@ impl ControlService {
     }
 
     /// Accept a connection request
-    pub async fn accept_connection(
-        &self,
-        request_id: &[u8; 32],
-    ) -> ControlResult<()> {
+    pub async fn accept_connection(&self, request_id: &[u8; 32]) -> ControlResult<()> {
         // Find the pending incoming connection by request_id
         let peer_id = {
             let db = self.db().lock().await;
-            let connections =
-                list_connections_by_state(&db, ConnectionState::PendingIncoming)
-                    .map_err(|e| ControlError::Database(e.to_string()))?;
+            let connections = list_connections_by_state(&db, ConnectionState::PendingIncoming)
+                .map_err(|e| ControlError::Database(e.to_string()))?;
             let conn = connections
                 .into_iter()
                 .find(|c| c.request_id == Some(*request_id))
@@ -158,7 +203,12 @@ impl ControlService {
         peer_id: &[u8; 32],
         request_id: &[u8; 32],
     ) -> ControlResult<()> {
-        let our_relay = self.endpoint().addr().relay_urls().next().map(|u| u.to_string());
+        let our_relay = self
+            .endpoint()
+            .addr()
+            .relay_urls()
+            .next()
+            .map(|u| u.to_string());
         let pow = compute_control_pow(&self.local_id(), ControlPacketType::ConnectAccept)?;
 
         let accept = ConnectAccept {
@@ -187,7 +237,7 @@ impl ControlService {
             request_id,
             peer_id, // harbor_id = recipient
             &[*peer_id],
-            &postcard::to_allocvec(&accept).unwrap(),
+            &encode_control_message(&accept, "ConnectAccept")?,
             ControlPacketType::ConnectAccept,
         )
         .await?;
@@ -204,9 +254,8 @@ impl ControlService {
         // Find the pending incoming connection
         let peer_id = {
             let db = self.db().lock().await;
-            let connections =
-                list_connections_by_state(&db, ConnectionState::PendingIncoming)
-                    .map_err(|e| ControlError::Database(e.to_string()))?;
+            let connections = list_connections_by_state(&db, ConnectionState::PendingIncoming)
+                .map_err(|e| ControlError::Database(e.to_string()))?;
             let conn = connections
                 .into_iter()
                 .find(|c| c.request_id == Some(*request_id))
@@ -239,7 +288,7 @@ impl ControlService {
             request_id,
             &peer_id,
             &[peer_id],
-            &postcard::to_allocvec(&decline).unwrap(),
+            &encode_control_message(&decline, "ConnectDecline")?,
             ControlPacketType::ConnectDecline,
         )
         .await?;
@@ -259,7 +308,12 @@ impl ControlService {
 
         let invite = ConnectInvite {
             endpoint_id: self.local_id(),
-            relay_url: self.endpoint().addr().relay_urls().next().map(|u| u.to_string()),
+            relay_url: self
+                .endpoint()
+                .addr()
+                .relay_urls()
+                .next()
+                .map(|u| u.to_string()),
             token,
         };
 
@@ -275,8 +329,7 @@ impl ControlService {
     pub async fn block_peer(&self, peer_id: &[u8; 32]) -> ControlResult<()> {
         {
             let db = self.db().lock().await;
-            update_connection_state(&db, peer_id, ConnectionState::Blocked)
-                .map_err(|e| ControlError::Database(e.to_string()))?;
+            persist_blocked_state(&db, peer_id)?;
         }
 
         // Update connection gate
@@ -292,19 +345,19 @@ impl ControlService {
     pub async fn unblock_peer(&self, peer_id: &[u8; 32]) -> ControlResult<()> {
         let was_blocked = {
             let db = self.db().lock().await;
-            // Unblocking moves back to connected (or pending if was pending)
-            if let Ok(Some(conn)) = get_connection(&db, peer_id) {
+            if let Some(conn) =
+                get_connection(&db, peer_id).map_err(|e| ControlError::Database(e.to_string()))?
+            {
                 if conn.state == ConnectionState::Blocked {
                     update_connection_state(&db, peer_id, ConnectionState::Connected)
-                        .map_err(|e| ControlError::Database(e.to_string()))?;
-                    true
+                        .map_err(|e| ControlError::Database(e.to_string()))
                 } else {
-                    false
+                    Ok(false)
                 }
             } else {
-                false
+                Ok(false)
             }
-        };
+        }?;
 
         if was_blocked {
             // Update connection gate
@@ -349,7 +402,17 @@ impl ControlService {
         // Check if peer is blocked
         let is_blocked = {
             let db = self.db().lock().await;
-            is_peer_blocked(&db, &sender_id).unwrap_or(false)
+            match is_peer_blocked(&db, &sender_id) {
+                Ok(blocked) => blocked,
+                Err(e) => {
+                    warn!(
+                        sender = %hex::encode(&sender_id[..8]),
+                        error = %e,
+                        "connect request rejected: failed to check blocked state"
+                    );
+                    return ControlAck::failure(req.request_id, "internal error");
+                }
+            }
         };
         if is_blocked {
             info!(peer = %hex::encode(&sender_id[..8]), "rejected connect request from blocked peer");
@@ -359,13 +422,23 @@ impl ControlService {
         // Check for valid token (auto-accept flow)
         let auto_accept = if let Some(token) = req.token {
             let db = self.db().lock().await;
-            if token_exists(&db, &token).unwrap_or(false) {
-                // Consume the token
-                consume_token(&db, &token).ok();
-                true
-            } else {
-                info!(peer = %hex::encode(&sender_id[..8]), "rejected connect request with invalid token");
-                return ControlAck::failure(req.request_id, "invalid token");
+            match consume_connect_token_for_auto_accept(&db, &token) {
+                Ok(true) => true,
+                Ok(false) => {
+                    info!(
+                        peer = %hex::encode(&sender_id[..8]),
+                        "rejected connect request with invalid token"
+                    );
+                    return ControlAck::failure(req.request_id, "invalid token");
+                }
+                Err(e) => {
+                    warn!(
+                        sender = %hex::encode(&sender_id[..8]),
+                        error = %e,
+                        "connect request rejected: failed to consume token"
+                    );
+                    return ControlAck::failure(req.request_id, "internal error");
+                }
             }
         } else {
             false
@@ -460,11 +533,8 @@ impl ControlService {
         // Update our outgoing request state
         {
             let db = self.db().lock().await;
-            // Check if we have a pending outgoing request for this peer
-            if let Ok(Some(conn)) = get_connection(&db, &sender_id) {
-                if conn.state == ConnectionState::PendingOutgoing
-                    && conn.request_id == Some(accept.request_id)
-                {
+            match has_matching_pending_outgoing_request(&db, &sender_id, &accept.request_id) {
+                Ok(true) => {
                     // Update to connected, store their display name and relay URL
                     if let Err(e) = upsert_connection(
                         &db,
@@ -477,11 +547,12 @@ impl ControlService {
                         warn!(error = %e, "failed to update connection state");
                         return ControlAck::failure(accept.request_id, "internal error");
                     }
-                } else {
-                    return ControlAck::failure(accept.request_id, "no pending request");
                 }
-            } else {
-                return ControlAck::failure(accept.request_id, "no pending request");
+                Ok(false) => return ControlAck::failure(accept.request_id, "no pending request"),
+                Err(e) => {
+                    warn!(error = %e, "failed to load pending outgoing connection");
+                    return ControlAck::failure(accept.request_id, "internal error");
+                }
             }
         }
 
@@ -513,7 +584,8 @@ impl ControlService {
         sender_id: [u8; 32],
     ) -> ControlAck {
         // Verify PoW first
-        if let Err(e) = self.verify_pow(&decline.pow, &sender_id, ControlPacketType::ConnectDecline) {
+        if let Err(e) = self.verify_pow(&decline.pow, &sender_id, ControlPacketType::ConnectDecline)
+        {
             warn!(
                 sender = %hex::encode(&sender_id[..8]),
                 error = %e,
@@ -531,11 +603,12 @@ impl ControlService {
         // Update our outgoing request state
         {
             let db = self.db().lock().await;
-            if let Ok(Some(conn)) = get_connection(&db, &sender_id) {
-                if conn.state == ConnectionState::PendingOutgoing
-                    && conn.request_id == Some(decline.request_id)
-                {
-                    let _ = update_connection_state(&db, &sender_id, ConnectionState::Declined);
+            match mark_pending_outgoing_declined(&db, &sender_id, &decline.request_id) {
+                Ok(true) => {}
+                Ok(false) => return ControlAck::failure(decline.request_id, "no pending request"),
+                Err(e) => {
+                    warn!(error = %e, "failed to update declined connection state");
+                    return ControlAck::failure(decline.request_id, "internal error");
                 }
             }
         }
@@ -556,5 +629,84 @@ impl ControlService {
         let _ = self.event_tx().send(event).await;
 
         ControlAck::success(decline.request_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::schema::{create_control_tables, create_peer_table};
+    use crate::data::{ConnectionState, create_connect_token, get_connection, upsert_connection};
+
+    fn setup_db() -> DbConnection {
+        let conn = DbConnection::open_in_memory().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        create_peer_table(&conn).unwrap();
+        create_control_tables(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_consume_connect_token_for_auto_accept() {
+        let conn = setup_db();
+        let token = [1u8; 32];
+        create_connect_token(&conn, &token).unwrap();
+
+        assert!(consume_connect_token_for_auto_accept(&conn, &token).unwrap());
+        assert!(!consume_connect_token_for_auto_accept(&conn, &token).unwrap());
+    }
+
+    #[test]
+    fn test_persist_blocked_state_creates_connection_row() {
+        let conn = setup_db();
+        let peer_id = [9u8; 32];
+
+        persist_blocked_state(&conn, &peer_id).unwrap();
+
+        let stored = get_connection(&conn, &peer_id).unwrap().unwrap();
+        assert_eq!(stored.state, ConnectionState::Blocked);
+    }
+
+    #[test]
+    fn test_has_matching_pending_outgoing_request() {
+        let conn = setup_db();
+        let peer_id = [2u8; 32];
+        let request_id = [3u8; 32];
+
+        upsert_connection(
+            &conn,
+            &peer_id,
+            ConnectionState::PendingOutgoing,
+            None,
+            None,
+            Some(&request_id),
+        )
+        .unwrap();
+
+        assert!(has_matching_pending_outgoing_request(&conn, &peer_id, &request_id).unwrap());
+        assert!(!has_matching_pending_outgoing_request(&conn, &peer_id, &[4u8; 32]).unwrap());
+    }
+
+    #[test]
+    fn test_mark_pending_outgoing_declined_requires_matching_request() {
+        let conn = setup_db();
+        let peer_id = [5u8; 32];
+        let request_id = [6u8; 32];
+
+        upsert_connection(
+            &conn,
+            &peer_id,
+            ConnectionState::PendingOutgoing,
+            None,
+            None,
+            Some(&request_id),
+        )
+        .unwrap();
+
+        assert!(!mark_pending_outgoing_declined(&conn, &peer_id, &[7u8; 32]).unwrap());
+        assert!(mark_pending_outgoing_declined(&conn, &peer_id, &request_id).unwrap());
+
+        let stored = get_connection(&conn, &peer_id).unwrap().unwrap();
+        assert_eq!(stored.state, ConnectionState::Declined);
     }
 }

@@ -18,29 +18,35 @@ use std::time::Duration;
 use iroh::EndpointId;
 use iroh::endpoint::Connection;
 use rusqlite::Connection as DbConnection;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
-use crate::data::send::acknowledge_receipt as db_acknowledge_receipt;
+use super::protocol::Receipt;
 use crate::data::LocalIdentity;
+use crate::data::send::acknowledge_receipt as db_acknowledge_receipt;
 use crate::network::connect::Connector;
 use crate::network::gate::ConnectionGate;
 use crate::protocol::ProtocolEvent;
-use crate::resilience::{ProofOfWork, PoWConfig, PoWResult, PoWVerifier, build_context};
-use crate::security::PacketError;
-use super::protocol::Receipt;
+use crate::resilience::{PoWConfig, PoWResult, PoWVerifier, ProofOfWork, build_context};
+use crate::security::{PacketError, PacketId};
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
-/// Configuration for the Send service
+/// Configuration knobs for Send behavior.
+///
+/// Some fields are reserved compatibility knobs and are not yet enforced
+/// directly by `SendService` runtime paths.
 #[derive(Debug, Clone)]
 pub struct SendConfig {
-    /// Timeout for sending to a single recipient (default: 5 seconds)
+    /// Target timeout for sending to a single recipient (default: 5 seconds).
+    /// Not currently enforced directly in `SendService`.
     pub send_timeout: Duration,
-    /// How long to wait for receipts before replicating to Harbor (default: 30 seconds)
+    /// Target wait time before Harbor replication (default: 30 seconds).
+    /// Not currently enforced directly in `SendService`.
     pub receipt_timeout: Duration,
-    /// Maximum concurrent sends (default: 10)
+    /// Intended cap for concurrent sends (default: 10).
+    /// Not currently enforced directly in `SendService`.
     pub max_concurrent_sends: usize,
 }
 
@@ -63,7 +69,8 @@ impl Default for SendConfig {
 pub struct SendOptions {
     /// If true, skip storing in outgoing table (direct delivery only, no harbor replication)
     pub skip_harbor: bool,
-    /// Override default harbor TTL. None = use default (PACKET_LIFETIME_SECS)
+    /// Optional Harbor retention hint.
+    /// Reserved for future use; currently not applied by send storage paths.
     pub ttl: Option<Duration>,
 }
 
@@ -90,7 +97,7 @@ impl SendOptions {
         }
     }
 
-    /// With a custom harbor TTL
+    /// Set a custom Harbor retention hint (reserved; currently not enforced).
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
         self
@@ -142,7 +149,7 @@ impl From<PacketError> for SendError {
 #[derive(Debug, Clone)]
 pub struct SendResult {
     /// The packet ID
-    pub packet_id: [u8; 32],
+    pub packet_id: PacketId,
     /// Recipients that were successfully reached
     pub delivered_to: Vec<[u8; 32]>,
     /// Recipients that failed
@@ -282,7 +289,9 @@ impl SendService {
     }
 
     /// Get the StreamService reference (if set)
-    pub(crate) async fn stream_service(&self) -> Option<Arc<crate::network::stream::StreamService>> {
+    pub(crate) async fn stream_service(
+        &self,
+    ) -> Option<Arc<crate::network::stream::StreamService>> {
         self.stream_service.read().await.clone()
     }
 
@@ -320,12 +329,17 @@ impl SendService {
         payload_len: usize,
     ) -> bool {
         let context = build_context(&[sender_id, harbor_id]);
-        let verifier = self.pow_verifier.lock().unwrap();
+        let mut verifier = lock_pow_verifier(&self.pow_verifier);
 
-        matches!(
+        if matches!(
             verifier.verify(pow, &context, sender_id, Some(payload_len as u64)),
             PoWResult::Allowed
-        )
+        ) {
+            verifier.record_request(sender_id, Some(payload_len as u64));
+            true
+        } else {
+            false
+        }
     }
 
     /// Verify Proof of Work for a DM delivery
@@ -340,18 +354,26 @@ impl SendService {
         payload_len: usize,
     ) -> bool {
         let context = build_context(&[sender_id, recipient_id]);
-        let verifier = self.pow_verifier.lock().unwrap();
+        let mut verifier = lock_pow_verifier(&self.pow_verifier);
 
-        matches!(
+        if matches!(
             verifier.verify(pow, &context, sender_id, Some(payload_len as u64)),
             PoWResult::Allowed
-        )
+        ) {
+            verifier.record_request(sender_id, Some(payload_len as u64));
+            true
+        } else {
+            false
+        }
     }
 
     // ========== Connection Management ==========
 
     /// Get or create a connection to a node
-    pub(crate) async fn get_connection(&self, node_id: EndpointId) -> Result<Connection, SendError> {
+    pub(crate) async fn get_connection(
+        &self,
+        node_id: EndpointId,
+    ) -> Result<Connection, SendError> {
         let endpoint_id_bytes: [u8; 32] = *node_id.as_bytes();
         self.connector
             .connect(&endpoint_id_bytes)
@@ -376,9 +398,18 @@ impl SendService {
     }
 }
 
-/// Generate a random packet ID (32 bytes)
-pub(super) fn generate_packet_id() -> [u8; 32] {
-    let mut id = [0u8; 32];
+fn lock_pow_verifier(
+    pow_verifier: &StdMutex<PoWVerifier>,
+) -> std::sync::MutexGuard<'_, PoWVerifier> {
+    match pow_verifier.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Generate a random packet ID (16 bytes)
+pub(super) fn generate_packet_id() -> PacketId {
+    let mut id: PacketId = [0u8; 16];
     use rand::RngCore;
     rand::rngs::OsRng.fill_bytes(&mut id);
     id
@@ -388,11 +419,16 @@ pub(super) fn generate_packet_id() -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::data::schema::create_all_tables;
-    use crate::data::send::{store_outgoing_packet, get_packets_needing_replication};
+    use crate::data::send::{get_packets_needing_replication, store_outgoing_packet};
+    use crate::security::PacketId;
     use crate::security::harbor_id_from_topic;
 
     fn test_id(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    fn test_packet_id(seed: u8) -> PacketId {
+        [seed; 16]
     }
 
     fn setup_db() -> rusqlite::Connection {
@@ -435,12 +471,12 @@ mod tests {
     #[test]
     fn test_send_result_structure() {
         let result = SendResult {
-            packet_id: [1u8; 32],
+            packet_id: [1u8; 16],
             delivered_to: vec![test_id(1), test_id(2)],
             failed: vec![(test_id(3), "timeout".to_string())],
         };
 
-        assert_eq!(result.packet_id, [1u8; 32]);
+        assert_eq!(result.packet_id, [1u8; 16]);
         assert_eq!(result.delivered_to.len(), 2);
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].1, "timeout");
@@ -466,7 +502,7 @@ mod tests {
         let mut db_conn = setup_db();
         let topic_id = test_id(100);
         let harbor_id = harbor_id_from_topic(&topic_id);
-        let packet_id = [42u8; 32];
+        let packet_id = test_packet_id(42);
         let recipient_id = test_id(2);
 
         store_outgoing_packet(
@@ -477,7 +513,8 @@ mod tests {
             b"packet data",
             &[recipient_id],
             0,
-        ).unwrap();
+        )
+        .unwrap();
 
         let receipt = Receipt::new(packet_id, recipient_id);
         let acked = SendService::process_receipt(&receipt, &db_conn).unwrap();
@@ -489,7 +526,7 @@ mod tests {
         let mut db_conn = setup_db();
         let topic_id = test_id(100);
         let harbor_id = harbor_id_from_topic(&topic_id);
-        let packet_id = [42u8; 32];
+        let packet_id = test_packet_id(42);
         let recipient_id = test_id(2);
 
         store_outgoing_packet(
@@ -500,7 +537,8 @@ mod tests {
             b"packet data",
             &[recipient_id],
             0,
-        ).unwrap();
+        )
+        .unwrap();
 
         let receipt = Receipt::new(packet_id, recipient_id);
         let acked1 = SendService::process_receipt(&receipt, &db_conn).unwrap();
@@ -515,7 +553,7 @@ mod tests {
         let mut db_conn = setup_db();
         let topic_id = test_id(100);
         let harbor_id = harbor_id_from_topic(&topic_id);
-        let packet_id = [1u8; 32];
+        let packet_id = test_packet_id(1);
         let recipients = vec![test_id(10), test_id(11), test_id(12)];
 
         // Store packet
@@ -527,10 +565,27 @@ mod tests {
             b"data",
             &recipients,
             0, // Content
-        ).unwrap();
+        )
+        .unwrap();
 
         // Get packets needing replication (none acked yet)
         let needs_replication = get_packets_needing_replication(&db_conn).unwrap();
         assert_eq!(needs_replication.len(), 1);
+    }
+
+    #[test]
+    fn test_lock_pow_verifier_recovers_from_poison() {
+        let pow_verifier = Arc::new(StdMutex::new(PoWVerifier::new(PoWConfig::send())));
+        let poisoned_ref = pow_verifier.clone();
+
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned_ref.lock().unwrap();
+            panic!("poison test mutex");
+        })
+        .join();
+
+        let sender_id = [7u8; 32];
+        let mut guard = lock_pow_verifier(pow_verifier.as_ref());
+        guard.record_request(&sender_id, Some(64));
     }
 }

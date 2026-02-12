@@ -12,9 +12,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::{Endpoint, EndpointId, RelayUrl};
 use iroh::endpoint::Connection;
-use tokio::sync::{oneshot, RwLock};
+use iroh::{Endpoint, EndpointId, RelayUrl};
+use tokio::sync::{RwLock, oneshot};
 use tracing::{debug, trace, warn};
 
 use crate::network::connect;
@@ -103,6 +103,15 @@ struct CachedConnection {
     last_used: std::time::Instant,
 }
 
+fn touch_lru(lru: &mut VecDeque<EndpointId>, node_id: EndpointId) {
+    lru.retain(|id| *id != node_id);
+    lru.push_back(node_id);
+}
+
+fn remove_lru(lru: &mut VecDeque<EndpointId>, node_id: EndpointId) {
+    lru.retain(|id| *id != node_id);
+}
+
 /// Generic connection pool for any ALPN protocol
 #[derive(Clone)]
 pub struct ConnectionPool {
@@ -146,12 +155,33 @@ impl ConnectionPool {
         relay_url: Option<&RelayUrl>,
         relay_url_last_success: Option<i64>,
     ) -> Result<(ConnectionRef, bool), PoolError> {
+        self.get_connection_with_timeout(
+            node_id,
+            relay_url,
+            relay_url_last_success,
+            self.config.connect_timeout,
+        )
+        .await
+    }
+
+    /// Get or create a connection to a peer with a caller-provided timeout.
+    pub async fn get_connection_with_timeout(
+        &self,
+        node_id: EndpointId,
+        relay_url: Option<&RelayUrl>,
+        relay_url_last_success: Option<i64>,
+        connect_timeout: Duration,
+    ) -> Result<(ConnectionRef, bool), PoolError> {
         if let Some(cached) = self.try_get_cached(node_id).await {
             return Ok((cached, false));
         }
 
+        // Keep pool capacity accurate by dropping already-closed cached entries.
+        let _ = self.prune_closed_connections().await;
+
         // Need to establish new connection
-        self.connect_smart(node_id, relay_url, relay_url_last_success).await
+        self.connect_smart(node_id, relay_url, relay_url_last_success, connect_timeout)
+            .await
     }
 
     /// Establish a new connection using smart relay/DNS logic.
@@ -160,7 +190,10 @@ impl ConnectionPool {
         node_id: EndpointId,
         relay_url: Option<&RelayUrl>,
         relay_url_last_success: Option<i64>,
+        connect_timeout: Duration,
     ) -> Result<(ConnectionRef, bool), PoolError> {
+        let _ = self.prune_closed_connections().await;
+
         // Check connection limit
         {
             let connections = self.connections.read().await;
@@ -192,7 +225,7 @@ impl ConnectionPool {
             relay_url,
             relay_url_last_success,
             self.alpn,
-            self.config.connect_timeout,
+            connect_timeout,
         )
         .await
         .map_err(|e| match e {
@@ -208,10 +241,13 @@ impl ConnectionPool {
 
     /// Try to get a cached connection without creating a new one.
     pub async fn try_get_cached(&self, node_id: EndpointId) -> Option<ConnectionRef> {
-        let connections = self.connections.read().await;
-        if let Some(cached) = connections.get(&node_id) {
-            // Check if connection is still alive
+        let mut connections = self.connections.write().await;
+        let mut lru = self.lru_order.write().await;
+
+        if let Some(cached) = connections.get_mut(&node_id) {
             if cached.connection.close_reason().is_none() {
+                cached.last_used = std::time::Instant::now();
+                touch_lru(&mut lru, node_id);
                 trace!(
                     alpn = ?std::str::from_utf8(self.alpn),
                     target = %node_id,
@@ -224,6 +260,16 @@ impl ConnectionPool {
                 });
             }
         }
+
+        if connections.remove(&node_id).is_some() {
+            remove_lru(&mut lru, node_id);
+            trace!(
+                alpn = ?std::str::from_utf8(self.alpn),
+                target = %node_id,
+                "removed closed cached connection"
+            );
+        }
+
         None
     }
 
@@ -233,6 +279,8 @@ impl ConnectionPool {
         node_id: EndpointId,
         connection: Connection,
     ) -> Result<ConnectionRef, PoolError> {
+        let _ = self.prune_closed_connections().await;
+
         // Check connection limit
         {
             let connections = self.connections.read().await;
@@ -256,14 +304,16 @@ impl ConnectionPool {
             let mut connections = self.connections.write().await;
             let mut lru = self.lru_order.write().await;
 
-            connections.insert(node_id, CachedConnection {
-                connection: connection.clone(),
-                last_used: std::time::Instant::now(),
-            });
+            connections.insert(
+                node_id,
+                CachedConnection {
+                    connection: connection.clone(),
+                    last_used: std::time::Instant::now(),
+                },
+            );
 
             // Update LRU order
-            lru.retain(|id| *id != node_id);
-            lru.push_back(node_id);
+            touch_lru(&mut lru, node_id);
         }
 
         Ok(ConnectionRef {
@@ -280,26 +330,70 @@ impl ConnectionPool {
 
         let now = std::time::Instant::now();
 
-        // Find oldest idle connection
-        if let Some(oldest_id) = lru.front().copied() {
-            if let Some(cached) = connections.get(&oldest_id) {
-                // Check if idle
-                if now.duration_since(cached.last_used) > self.config.idle_timeout {
+        // Find the oldest evictable connection.
+        while let Some(oldest_id) = lru.pop_front() {
+            let action = if let Some(cached) = connections.get(&oldest_id) {
+                if cached.connection.close_reason().is_some() {
+                    0u8
+                } else if now.duration_since(cached.last_used) > self.config.idle_timeout {
+                    1u8
+                } else {
+                    2u8
+                }
+            } else {
+                3u8
+            };
+
+            match action {
+                0 => {
+                    connections.remove(&oldest_id);
                     trace!(
                         alpn = ?std::str::from_utf8(self.alpn),
                         target = %oldest_id,
-                        "evicting idle connection"
+                        "removed closed connection during eviction"
                     );
-                    cached.connection.close(0u32.into(), b"idle");
-                    connections.remove(&oldest_id);
-                    lru.pop_front();
                 }
-                // If oldest isn't idle, none will be
-            } else {
-                // Connection not found, remove from LRU
-                lru.pop_front();
+                1 => {
+                    if let Some(cached) = connections.remove(&oldest_id) {
+                        trace!(
+                            alpn = ?std::str::from_utf8(self.alpn),
+                            target = %oldest_id,
+                            "evicting idle connection"
+                        );
+                        cached.connection.close(0u32.into(), b"idle");
+                    }
+                    return;
+                }
+                2 => {
+                    // Oldest connection is active; no idle connections remain.
+                    lru.push_front(oldest_id);
+                    return;
+                }
+                _ => {
+                    // Stale LRU entry, continue scanning.
+                }
             }
         }
+    }
+
+    async fn prune_closed_connections(&self) -> usize {
+        let mut connections = self.connections.write().await;
+        let mut lru = self.lru_order.write().await;
+
+        let before = connections.len();
+        connections.retain(|_, cached| cached.connection.close_reason().is_none());
+        let removed = before.saturating_sub(connections.len());
+
+        if removed > 0 {
+            lru.retain(|id| connections.contains_key(id));
+            trace!(
+                alpn = ?std::str::from_utf8(self.alpn),
+                removed,
+                "pruned closed cached connections"
+            );
+        }
+
+        removed
     }
 
     /// Close a specific connection
@@ -310,14 +404,18 @@ impl ConnectionPool {
         if let Some(cached) = connections.remove(&node_id) {
             cached.connection.close(0u32.into(), b"close");
         }
-        lru.retain(|id| *id != node_id);
+        remove_lru(&mut lru, node_id);
     }
 
     /// Get statistics about the pool
     pub async fn stats(&self) -> PoolStats {
         let connections = self.connections.read().await;
+        let live_connections = connections
+            .values()
+            .filter(|cached| cached.connection.close_reason().is_none())
+            .count();
         PoolStats {
-            active_connections: connections.len(),
+            active_connections: live_connections,
             max_connections: self.config.max_connections,
         }
     }
@@ -350,10 +448,7 @@ mod tests {
             PoolError::Shutdown.to_string(),
             "connection pool is shut down"
         );
-        assert_eq!(
-            PoolError::Timeout.to_string(),
-            "connection timed out"
-        );
+        assert_eq!(PoolError::Timeout.to_string(), "connection timed out");
         assert_eq!(
             PoolError::TooManyConnections.to_string(),
             "too many connections"
@@ -362,5 +457,30 @@ mod tests {
             PoolError::ConnectionFailed("test".to_string()).to_string(),
             "connection failed: test"
         );
+    }
+
+    #[test]
+    fn test_touch_lru_moves_existing_id_to_back() {
+        let a = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let b = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let c = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+
+        let mut lru = VecDeque::from([a, b, c]);
+        touch_lru(&mut lru, b);
+
+        let ordered: Vec<_> = lru.into_iter().collect();
+        assert_eq!(ordered, vec![a, c, b]);
+    }
+
+    #[test]
+    fn test_remove_lru_drops_all_matching_entries() {
+        let a = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let b = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+
+        let mut lru = VecDeque::from([a, b, a]);
+        remove_lru(&mut lru, a);
+
+        let ordered: Vec<_> = lru.into_iter().collect();
+        assert_eq!(ordered, vec![b]);
     }
 }

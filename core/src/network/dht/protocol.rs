@@ -29,7 +29,7 @@ pub struct FindNode {
     /// Optional requester relay URL (for connectivity)
     #[serde(default)]
     pub requester_relay_url: Option<String>,
-    /// Proof of Work (context: sender_id || target_bytes)
+    /// Proof of Work (context: transport sender_id || target_bytes)
     pub pow: ProofOfWork,
 }
 
@@ -70,7 +70,7 @@ impl NodeInfo {
         }
     }
 
-    /// Create NodeInfo from a EndpointAddr
+    /// Create NodeInfo from an EndpointAddr
     pub fn from_endpoint_addr(addr: &EndpointAddr) -> Self {
         Self {
             node_id: *addr.id.as_bytes(),
@@ -115,7 +115,7 @@ mod tests {
     fn test_node_info_from_id() {
         let id = make_id(42);
         let info = NodeInfo::from_id(&id);
-        
+
         assert_eq!(info.node_id, [42u8; 32]);
         assert!(info.addresses.is_empty());
         assert!(info.relay_url.is_none());
@@ -128,7 +128,7 @@ mod tests {
             addresses: vec!["192.168.1.1:4433".to_string()],
             relay_url: None,
         };
-        
+
         let id = info.to_id();
         assert_eq!(id.as_bytes(), &[1u8; 32]);
     }
@@ -152,6 +152,27 @@ mod tests {
     }
 
     #[test]
+    fn test_find_node_rejects_legacy_without_requester_relay_url() {
+        #[derive(serde::Serialize)]
+        struct LegacyFindNode {
+            target: Id,
+            requester: Option<[u8; 32]>,
+            pow: ProofOfWork,
+        }
+
+        let legacy = LegacyFindNode {
+            target: make_id(1),
+            requester: Some([2u8; 32]),
+            pow: test_pow(),
+        };
+
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let decoded = postcard::from_bytes::<FindNode>(&bytes);
+
+        assert!(decoded.is_err());
+    }
+
+    #[test]
     fn test_find_node_response_serialization() {
         let response = FindNodeResponse {
             nodes: vec![
@@ -159,10 +180,10 @@ mod tests {
                 NodeInfo::from_id(&make_id(2)),
             ],
         };
-        
+
         let bytes = postcard::to_allocvec(&response).unwrap();
         let decoded: FindNodeResponse = postcard::from_bytes(&bytes).unwrap();
-        
+
         assert_eq!(decoded.nodes.len(), 2);
         assert_eq!(decoded.nodes[0].node_id, [1u8; 32]);
         assert_eq!(decoded.nodes[1].node_id, [2u8; 32]);
@@ -171,10 +192,10 @@ mod tests {
     #[test]
     fn test_id_serialization() {
         let id = make_id(42);
-        
+
         let bytes = postcard::to_allocvec(&id).unwrap();
         let decoded: Id = postcard::from_bytes(&bytes).unwrap();
-        
+
         assert_eq!(decoded, id);
     }
 
@@ -204,9 +225,9 @@ mod tests {
     fn test_max_response_size_check() {
         const MAX_SIZE: usize = 65536;
 
-        let nodes: Vec<NodeInfo> = (0..20u8)
+        let nodes: Vec<NodeInfo> = (0..MAX_FIND_NODE_RESULTS)
             .map(|i| NodeInfo {
-                node_id: [i; 32],
+                node_id: [u8::try_from(i).expect("MAX_FIND_NODE_RESULTS must fit in u8"); 32],
                 addresses: vec!["192.168.1.1:4433".to_string()],
                 relay_url: Some("https://relay.example.com/".to_string()),
             })
@@ -215,15 +236,10 @@ mod tests {
         let response = FindNodeResponse { nodes };
         let bytes = postcard::to_allocvec(&response).unwrap();
 
-        assert!(bytes.len() < MAX_SIZE, "Response {} bytes exceeds limit", bytes.len());
-    }
-
-    #[test]
-    fn test_pool_error_formatting() {
-        use crate::network::pool::PoolError;
-        let err = PoolError::ConnectionFailed("test error".to_string());
-        let msg = format!("{}", err);
-        assert!(msg.contains("test error"));
+        assert!(
+            bytes.len() < MAX_SIZE,
+            "Response {} bytes exceeds limit",
+            bytes.len()
+        );
     }
 }
-

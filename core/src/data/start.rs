@@ -55,9 +55,10 @@ impl From<rusqlite::Error> for StartError {
 /// - `StartError::Database` for SQLite/SQLCipher errors
 ///
 /// # Security
-/// The passphrase is passed to SQLCipher using a parameterized approach
-/// to prevent SQL injection. The passphrase is hex-encoded to safely
-/// handle any characters including quotes and special characters.
+/// SQL PRAGMA values cannot be bound as query parameters, so the passphrase
+/// is first hex-encoded before interpolation into `PRAGMA key`.
+/// This constrains the interpolated content to safe hex characters and
+/// avoids quote/escape injection.
 pub fn start_db(db_path: &str, passphrase: &str) -> Result<Connection, StartError> {
     // Validate passphrase
     if passphrase.is_empty() {
@@ -71,26 +72,19 @@ pub fn start_db(db_path: &str, passphrase: &str) -> Result<Connection, StartErro
     // This safely handles any passphrase characters
     let hex_key = hex::encode(passphrase.as_bytes());
     conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex_key))?;
-    
+
     // Enable WAL mode for better concurrency (multiple readers, non-blocking writes)
     // Note: PRAGMA returns the new mode, so we use query_row instead of execute
     let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-    
+
     // Enable foreign keys
     conn.execute("PRAGMA foreign_keys = ON", [])?;
 
-    // Check if tables need to be created
-    let tables_exist: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='peers'",
-        [],
-        |row| row.get(0),
-    )?;
+    // Schema creation is idempotent (`CREATE TABLE IF NOT EXISTS`), so always
+    // run it to recover cleanly from partially initialized databases.
+    create_all_tables(&conn)?;
 
-    if !tables_exist {
-        create_all_tables(&conn)?;
-    }
-    
-    // Run migrations for existing databases
+    // No migration step yet: pre-testnet schema changes are handled by fresh table creation.
     Ok(conn)
 }
 
@@ -137,7 +131,7 @@ mod tests {
         // This passphrase would break naive string formatting
         let dangerous_passphrase = "test'; DROP TABLE peers; --";
         let result = start_db(&db_path, dangerous_passphrase);
-        
+
         // Should succeed (hex encoding handles special chars)
         assert!(result.is_ok(), "passphrase with special chars should work");
 
@@ -172,11 +166,23 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert!(tables.contains(&"local_node".to_string()), "local_node table missing");
+        assert!(
+            tables.contains(&"local_node".to_string()),
+            "local_node table missing"
+        );
         assert!(tables.contains(&"peers".to_string()), "peers table missing");
-        assert!(tables.contains(&"dht_routing".to_string()), "dht_routing table missing");
-        assert!(tables.contains(&"topics".to_string()), "topics table missing");
-        assert!(tables.contains(&"topic_members".to_string()), "topic_members table missing");
+        assert!(
+            tables.contains(&"dht_routing".to_string()),
+            "dht_routing table missing"
+        );
+        assert!(
+            tables.contains(&"topics".to_string()),
+            "topics table missing"
+        );
+        assert!(
+            tables.contains(&"topic_members".to_string()),
+            "topic_members table missing"
+        );
 
         cleanup(&db_path);
     }
@@ -239,19 +245,96 @@ mod tests {
     }
 
     #[test]
+    fn test_recovers_partial_schema_when_peers_exists() {
+        let db_path = temp_db_path("partial_schema_v1");
+        cleanup(&db_path);
+
+        // Simulate a partially initialized database where only `peers` remains.
+        {
+            let conn = start_db(&db_path, "test-passphrase").unwrap();
+            conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('peers', 'sqlite_sequence')")
+                .unwrap();
+            let tables_to_drop: Vec<String> = stmt
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            drop(stmt);
+
+            for table in tables_to_drop {
+                conn.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table), [])
+                    .unwrap();
+            }
+            conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        }
+
+        let conn = start_db(&db_path, "test-passphrase").unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            tables.contains(&"local_node".to_string()),
+            "local_node table missing"
+        );
+        assert!(
+            tables.contains(&"topics".to_string()),
+            "topics table missing"
+        );
+        assert!(
+            tables.contains(&"outgoing_packets".to_string()),
+            "outgoing_packets table missing"
+        );
+        assert!(
+            tables.contains(&"harbor_cache".to_string()),
+            "harbor_cache table missing"
+        );
+
+        cleanup(&db_path);
+    }
+
+    #[test]
     fn test_memory_db() {
         let conn = start_memory_db().unwrap();
 
-        // Should have all tables
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
-                [],
-                |row| row.get(0),
-            )
+        // Should include the core tables that span all data subdomains.
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        let tables: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert!(count >= 7, "should have at least 7 tables");
+        assert!(
+            tables.contains(&"local_node".to_string()),
+            "local_node table missing"
+        );
+        assert!(tables.contains(&"peers".to_string()), "peers table missing");
+        assert!(
+            tables.contains(&"dht_routing".to_string()),
+            "dht_routing table missing"
+        );
+        assert!(
+            tables.contains(&"outgoing_packets".to_string()),
+            "outgoing_packets table missing"
+        );
+        assert!(
+            tables.contains(&"harbor_cache".to_string()),
+            "harbor_cache table missing"
+        );
+        assert!(tables.contains(&"blobs".to_string()), "blobs table missing");
+        assert!(
+            tables.contains(&"connection_list".to_string()),
+            "connection_list table missing"
+        );
     }
 
     #[test]

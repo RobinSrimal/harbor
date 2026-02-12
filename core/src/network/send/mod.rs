@@ -13,7 +13,7 @@
 //! # Direct vs Harbor Delivery
 //!
 //! - **Direct delivery**: Uses QUIC TLS only (no app-level crypto) - fast path
-//! - **Harbor storage**: Uses seal() to apply full crypto stack (encrypt + MAC + sign)
+//! - **Harbor storage**: Uses seal() crypto (topic: encrypt + MAC + sign, DM: encrypt + sign)
 //!
 //! # Module Structure
 //!
@@ -27,22 +27,32 @@ pub mod protocol;
 pub mod service;
 pub mod topic;
 
-pub use protocol::{SEND_ALPN, Receipt};
+pub use protocol::{Receipt, SEND_ALPN};
 pub use service::{
-    SendConfig, SendService, SendResult, SendError, SendOptions,
-    ProcessResult, ProcessError, PacketSource, ReceiveError,
+    PacketSource, ProcessError, ProcessResult, ReceiveError, SendConfig, SendError, SendOptions,
+    SendResult, SendService,
 };
 
 // Re-export message types from network/packet for backwards compatibility
 pub use crate::network::packet::{
-    // Payload structs
-    FileAnnouncementMessage, CanSeedMessage, SyncUpdateMessage, StreamRequestMessage,
-    DmStreamRequestMessage, StreamAcceptMessage, StreamRejectMessage,
-    StreamQueryMessage, StreamActiveMessage, StreamEndedMessage,
-    // Wrapper enums
-    TopicMessage, DmMessage, StreamSignalingMessage,
+    CanSeedMessage,
     // Decode error
     DecodeError as TopicMessageDecodeError,
+    DmMessage,
+    DmStreamRequestMessage,
+    // Payload structs
+    FileAnnouncementMessage,
+    StreamAcceptMessage,
+    StreamActiveMessage,
+    StreamEndedMessage,
+    StreamQueryMessage,
+    StreamRejectMessage,
+    StreamRequestMessage,
+    StreamSignalingMessage,
+    SyncUpdateMessage,
+    // Wrapper enums
+    TopicMessage,
     // Helper functions
-    is_dm_message_type, is_stream_signaling_type,
+    is_dm_message_type,
+    is_stream_signaling_type,
 };

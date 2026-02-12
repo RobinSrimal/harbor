@@ -6,28 +6,33 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 
-use iroh::endpoint::Connection;
 use iroh::Endpoint;
+use iroh::endpoint::Connection;
 use rusqlite::Connection as DbConnection;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tracing::{debug, info, trace};
 
 use super::internal::api::{
-    ApiProtocol, AddCandidates, ConfirmRelayUrls, FindClosest, GetNodeRelayUrls,
-    GetRoutingTable, HandleFindNodeRequest, Lookup, NodesDead, NodesSeen, RandomLookup,
-    SelfLookup, SetNodeRelayUrls,
+    AddCandidates, ApiProtocol, ConfirmRelayUrls, FindClosest, GetNodeRelayUrls, GetRoutingTable,
+    HandleFindNodeRequest, Lookup, NodesDead, NodesSeen, RandomLookup, SelfLookup,
+    SetNodeRelayUrls,
 };
 use super::internal::bootstrap::{bootstrap_dial_info, bootstrap_node_ids};
-use super::internal::config::{create_dht_actor_with_buckets, DhtConfig};
+use super::internal::config::{DhtConfig, create_dht_actor_with_buckets};
 use super::internal::distance::{Distance, Id};
-use super::internal::pool::{DhtPool, DhtPoolConfig, DhtPoolError as PoolError, DialInfo, DHT_ALPN};
+use super::internal::pool::{
+    DHT_ALPN, DhtPool, DhtPoolConfig, DhtPoolError as PoolError, DialInfo,
+};
 use super::internal::routing::Buckets;
 use super::protocol::{FindNode, FindNodeResponse, NodeInfo, RpcProtocol};
-use crate::data::dht::{clear_all_entries, current_timestamp, insert_dht_entry, store_peer_relay_url_unverified, update_peer_relay_url, upsert_peer, DhtEntry, PeerInfo};
+use crate::data::dht::{
+    DhtEntry, PeerInfo, clear_all_entries, current_timestamp, insert_dht_entry,
+    store_peer_relay_url_unverified, update_peer_relay_url, upsert_peer,
+};
 use crate::network::connect::Connector;
 use crate::network::rpc::ExistingConnection;
-use crate::resilience::{ProofOfWork, PoWConfig, PoWResult, PoWVerifier, build_context};
+use crate::resilience::{PoWConfig, PoWResult, PoWVerifier, ProofOfWork, build_context};
 
 /// DHT Service - the single entry point for all DHT operations
 ///
@@ -52,9 +57,18 @@ pub struct DhtService {
     pow_verifier: StdMutex<PoWVerifier>,
 }
 
+fn find_node_pow_context(sender_id: &[u8; 32], target: &Id) -> Vec<u8> {
+    build_context(&[sender_id, target.as_bytes()])
+}
+
 impl DhtService {
     /// Create a new DHT service
-    pub fn new(pool: DhtPool, client: irpc::Client<ApiProtocol>, db: Arc<Mutex<DbConnection>>, our_id: [u8; 32]) -> Arc<Self> {
+    pub fn new(
+        pool: DhtPool,
+        client: irpc::Client<ApiProtocol>,
+        db: Arc<Mutex<DbConnection>>,
+        our_id: [u8; 32],
+    ) -> Arc<Self> {
         Arc::new(Self {
             pool,
             client,
@@ -145,14 +159,14 @@ impl DhtService {
                 };
                 dht_pool.register_dial_info(dial_info).await;
             }
-            bootstrap_ids = bootstrap_node_ids()
-                .into_iter()
-                .map(Id::new)
-                .collect();
+            bootstrap_ids = bootstrap_node_ids().into_iter().map(Id::new).collect();
         }
 
         // Load persisted routing table and relay URLs from database
-        let (persisted_buckets, persisted_relay_urls): (Option<Buckets>, Vec<([u8; 32], String, Option<i64>)>) = {
+        let (persisted_buckets, persisted_relay_urls): (
+            Option<Buckets>,
+            Vec<([u8; 32], String, Option<i64>)>,
+        ) = {
             let db_lock = db.lock().await;
             match crate::data::dht::load_routing_table(&db_lock) {
                 Ok(bucket_vecs) => {
@@ -161,9 +175,7 @@ impl DhtService {
                     for (idx, entries) in bucket_vecs.into_iter().enumerate() {
                         if idx < super::BUCKET_COUNT {
                             for id_bytes in entries {
-                                buckets
-                                    .get_mut(idx)
-                                    .add_node(Id::new(id_bytes));
+                                buckets.get_mut(idx).add_node(Id::new(id_bytes));
                                 loaded_count += 1;
                             }
                         }
@@ -200,12 +212,7 @@ impl DhtService {
             persisted_buckets,
         );
 
-        let dht_service = Self::new(
-            service_pool,
-            dht_api_client,
-            db,
-            our_id,
-        );
+        let dht_service = Self::new(service_pool, dht_api_client, db, our_id);
         dht_actor.set_service(WeakDhtService::new(&dht_service));
         tokio::spawn(dht_actor.run());
 
@@ -250,19 +257,19 @@ impl DhtService {
     ///
     /// Context for DHT PoW: `sender_id || target_bytes`
     /// Uses RequestBased scaling.
-    pub fn verify_pow(
-        &self,
-        pow: &ProofOfWork,
-        sender_id: &[u8; 32],
-        target: &Id,
-    ) -> bool {
-        let context = build_context(&[sender_id, target.as_bytes()]);
-        let verifier = self.pow_verifier.lock().unwrap();
+    pub fn verify_pow(&self, pow: &ProofOfWork, sender_id: &[u8; 32], target: &Id) -> bool {
+        let context = find_node_pow_context(sender_id, target);
+        let mut verifier = self.pow_verifier.lock().unwrap();
 
-        matches!(
+        if matches!(
             verifier.verify(pow, &context, sender_id, None),
             PoWResult::Allowed
-        )
+        ) {
+            verifier.record_request(sender_id, None);
+            true
+        } else {
+            false
+        }
     }
 
     // ========== Outgoing: Wire Protocol ==========
@@ -271,23 +278,27 @@ impl DhtService {
     ///
     /// Uses irpc for serialization/framing over the connection.
     /// Used by the actor's spawned lookup tasks and candidate verification.
+    /// `sender_id` must be this node's transport identity (`conn.local_id()`).
     pub async fn send_find_node_on_conn(
         conn: &Connection,
         target: Id,
+        sender_id: [u8; 32],
         requester: Option<[u8; 32]>,
         requester_relay_url: Option<String>,
     ) -> Result<FindNodeResponse, PoolError> {
         // Compute PoW (context: sender_id || target_bytes)
-        let sender_id = requester.unwrap_or([0u8; 32]);
-        let pow_context = build_context(&[&sender_id, target.as_bytes()]);
+        let pow_context = find_node_pow_context(&sender_id, &target);
         let pow = ProofOfWork::compute(&pow_context, PoWConfig::dht().base_difficulty)
             .ok_or_else(|| PoolError::ConnectionFailed("failed to compute PoW".to_string()))?;
 
-        let client = irpc::Client::<RpcProtocol>::boxed(
-            ExistingConnection::new(conn)
-        );
+        let client = irpc::Client::<RpcProtocol>::boxed(ExistingConnection::new(conn));
         client
-            .rpc(FindNode { target, requester, requester_relay_url, pow })
+            .rpc(FindNode {
+                target,
+                requester,
+                requester_relay_url,
+                pow,
+            })
             .await
             .map_err(|e| PoolError::ConnectionFailed(e.to_string()))
     }
@@ -301,7 +312,8 @@ impl DhtService {
         requester_relay_url: Option<String>,
     ) -> Result<FindNodeResponse, PoolError> {
         let (conn, _relay_confirmed) = self.pool.get_connection(dial_info).await?;
-        Self::send_find_node_on_conn(&conn, target, requester, requester_relay_url).await
+        Self::send_find_node_on_conn(&conn, target, self.our_id, requester, requester_relay_url)
+            .await
     }
 
     // ========== API: Actor Commands ==========
@@ -318,7 +330,9 @@ impl DhtService {
 
     /// Add nodes to candidates list for verification
     pub async fn add_candidates(&self, ids: &[[u8; 32]]) -> Result<(), irpc::Error> {
-        self.client.notify(AddCandidates { ids: ids.to_vec() }).await
+        self.client
+            .notify(AddCandidates { ids: ids.to_vec() })
+            .await
     }
 
     /// Find the K closest nodes to a target (iterative network lookup)
@@ -336,17 +350,25 @@ impl DhtService {
     }
 
     /// Get relay URLs for all known nodes (for persistence)
-    pub async fn get_node_relay_urls(&self) -> Result<Vec<([u8; 32], String, Option<i64>)>, irpc::Error> {
+    pub async fn get_node_relay_urls(
+        &self,
+    ) -> Result<Vec<([u8; 32], String, Option<i64>)>, irpc::Error> {
         self.client.rpc(GetNodeRelayUrls).await
     }
 
     /// Set relay URLs for nodes (for restoration from database)
-    pub async fn set_node_relay_urls(&self, relay_urls: Vec<([u8; 32], String, Option<i64>)>) -> Result<(), irpc::Error> {
+    pub async fn set_node_relay_urls(
+        &self,
+        relay_urls: Vec<([u8; 32], String, Option<i64>)>,
+    ) -> Result<(), irpc::Error> {
         self.client.notify(SetNodeRelayUrls { relay_urls }).await
     }
 
     /// Confirm relay URLs after outbound connection verification
-    pub async fn confirm_relay_urls(&self, confirmed: Vec<([u8; 32], String, Option<i64>)>) -> Result<(), irpc::Error> {
+    pub async fn confirm_relay_urls(
+        &self,
+        confirmed: Vec<([u8; 32], String, Option<i64>)>,
+    ) -> Result<(), irpc::Error> {
         self.client.notify(ConfirmRelayUrls { confirmed }).await
     }
 
@@ -361,7 +383,11 @@ impl DhtService {
     }
 
     /// Find K closest nodes from the local routing table (no network lookup)
-    pub async fn find_closest(&self, target: Id, k: Option<usize>) -> Result<Vec<[u8; 32]>, irpc::Error> {
+    pub async fn find_closest(
+        &self,
+        target: Id,
+        k: Option<usize>,
+    ) -> Result<Vec<[u8; 32]>, irpc::Error> {
         self.client.rpc(FindClosest { target, k }).await
     }
 
@@ -372,7 +398,13 @@ impl DhtService {
         requester: Option<[u8; 32]>,
         requester_relay_url: Option<String>,
     ) -> Result<Vec<NodeInfo>, irpc::Error> {
-        self.client.rpc(HandleFindNodeRequest { target, requester, requester_relay_url }).await
+        self.client
+            .rpc(HandleFindNodeRequest {
+                target,
+                requester,
+                requester_relay_url,
+            })
+            .await
     }
 
     /// Register dial info for a node (e.g., bootstrap nodes)
@@ -385,11 +417,15 @@ impl DhtService {
     /// Save the current routing table to the database
     pub async fn save_routing_table(&self) -> Result<(), DhtServiceError> {
         // Get current routing table from actor
-        let buckets = self.get_routing_table().await
+        let buckets = self
+            .get_routing_table()
+            .await
             .map_err(|e| DhtServiceError::Actor(e.to_string()))?;
 
         // Get relay URLs for nodes (with verification timestamps)
-        let relay_urls: HashMap<[u8; 32], (String, Option<i64>)> = self.get_node_relay_urls().await
+        let relay_urls: HashMap<[u8; 32], (String, Option<i64>)> = self
+            .get_node_relay_urls()
+            .await
             .map_err(|e| DhtServiceError::Actor(e.to_string()))?
             .into_iter()
             .map(|(id, url, verified_at)| (id, (url, verified_at)))
@@ -400,11 +436,11 @@ impl DhtService {
 
         // Save to database using transaction for atomicity
         let mut db_lock = self.db.lock().await;
-        let tx = db_lock.transaction()
+        let tx = db_lock
+            .transaction()
             .map_err(|e| DhtServiceError::Database(e.to_string()))?;
 
-        clear_all_entries(&tx)
-            .map_err(|e| DhtServiceError::Database(e.to_string()))?;
+        clear_all_entries(&tx).map_err(|e| DhtServiceError::Database(e.to_string()))?;
 
         for (bucket_idx, entries) in buckets.iter().enumerate() {
             for endpoint_id in entries {
@@ -416,8 +452,7 @@ impl DhtService {
                     relay_url: None,
                     relay_url_last_success: None,
                 };
-                upsert_peer(&tx, &peer)
-                    .map_err(|e| DhtServiceError::Database(e.to_string()))?;
+                upsert_peer(&tx, &peer).map_err(|e| DhtServiceError::Database(e.to_string()))?;
 
                 let entry = DhtEntry {
                     endpoint_id: *endpoint_id,
@@ -513,18 +548,27 @@ impl DhtService {
                 } else {
                     Some(*local_id.as_bytes())
                 };
+                let sender_id_for_pow = *local_id.as_bytes();
                 let relay_url_for_rpc = home_relay_url.clone();
 
                 query_tasks.spawn(async move {
                     // Create dial info - pool will merge with known relay URLs
                     let dial_info = DialInfo::from_node_id(
-                        iroh::EndpointId::from_bytes(id.as_bytes()).expect("valid node id")
+                        iroh::EndpointId::from_bytes(id.as_bytes()).expect("valid node id"),
                     );
 
                     match pool.get_connection(&dial_info).await {
                         Ok((conn, _relay_confirmed)) => {
                             // Send actual FindNode RPC over the connection
-                            match DhtService::send_find_node_on_conn(&conn, target_for_rpc, requester_for_rpc, relay_url_for_rpc).await {
+                            match DhtService::send_find_node_on_conn(
+                                &conn,
+                                target_for_rpc,
+                                sender_id_for_pow,
+                                requester_for_rpc,
+                                relay_url_for_rpc,
+                            )
+                            .await
+                            {
                                 Ok(response) => {
                                     // Return full NodeInfo so caller can extract relay URLs
                                     trace!(
@@ -568,7 +612,8 @@ impl DhtService {
                         // Add new candidates for lookup AND notify DHT about discovered nodes
                         // Also register relay URLs for future connectivity AND store for sharing
                         let mut discovered: Vec<[u8; 32]> = Vec::new();
-                        let mut discovered_relay_urls: Vec<([u8; 32], String, Option<i64>)> = Vec::new();
+                        let mut discovered_relay_urls: Vec<([u8; 32], String, Option<i64>)> =
+                            Vec::new();
                         for info in node_infos {
                             let node = Id::new(info.node_id);
                             if node != local_id && !queried.contains(&node) {
@@ -580,7 +625,10 @@ impl DhtService {
                                 if let Some(relay_url) = info.relay_url {
                                     let node_id = iroh::EndpointId::from_bytes(&info.node_id)
                                         .expect("valid node id");
-                                    let dial_info = DialInfo::from_node_id_with_relay(node_id, relay_url.clone());
+                                    let dial_info = DialInfo::from_node_id_with_relay(
+                                        node_id,
+                                        relay_url.clone(),
+                                    );
                                     pool.register_dial_info(dial_info).await;
                                     // Store for sharing with other nodes in FindNode responses (unverified)
                                     discovered_relay_urls.push((info.node_id, relay_url, None));
@@ -684,5 +732,28 @@ impl WeakDhtService {
     /// Try to upgrade to a strong reference
     pub fn upgrade(&self) -> Option<Arc<DhtService>> {
         self.inner.upgrade()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_id(seed: u8) -> Id {
+        Id::new([seed; 32])
+    }
+
+    #[test]
+    fn test_find_node_pow_context_uses_transport_sender_id() {
+        let sender_id = [9u8; 32];
+        let target = make_id(3);
+
+        let actual = find_node_pow_context(&sender_id, &target);
+        let expected = build_context(&[&sender_id, target.as_bytes()]);
+        let zero_sender = [0u8; 32];
+        let legacy = build_context(&[&zero_sender, target.as_bytes()]);
+
+        assert_eq!(actual, expected);
+        assert_ne!(actual, legacy);
     }
 }

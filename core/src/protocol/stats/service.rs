@@ -12,8 +12,7 @@ use crate::data::dht::{count_all_entries as count_dht_entries, get_bucket_entrie
 use crate::data::harbor::{get_active_harbor_ids, get_harbor_cache_stats};
 use crate::data::send::get_packets_needing_replication;
 use crate::data::{
-    current_timestamp, get_all_topics, get_topic_members, get_peer_relay_info,
-    LocalIdentity,
+    LocalIdentity, current_timestamp, get_all_topics, get_peer_relay_info, get_topic_members,
 };
 use crate::network::dht::DhtService;
 use crate::security::harbor_id_from_topic;
@@ -80,20 +79,25 @@ impl StatsService {
 
         // Identity stats
         let endpoint_id = hex::encode(self.identity.public_key);
-        let relay_url = self.endpoint.addr().relay_urls().next().map(|u| u.to_string());
+        let relay_url = self
+            .endpoint
+            .addr()
+            .relay_urls()
+            .next()
+            .map(|u| u.to_string());
 
         // Network stats
         let is_online = relay_url.is_some();
 
         // DHT stats from database (persisted)
-        let total_dht_nodes = count_dht_entries(&db)
-            .map_err(|e| StatsError::Database(e.to_string()))? as u32;
+        let total_dht_nodes =
+            count_dht_entries(&db).map_err(|e| StatsError::Database(e.to_string()))? as u32;
 
         // Count non-empty buckets from database
         let mut active_buckets = 0u32;
         for bucket in 0..=255u8 {
-            let entries = get_bucket_entries(&db, bucket)
-                .map_err(|e| StatsError::Database(e.to_string()))?;
+            let entries =
+                get_bucket_entries(&db, bucket).map_err(|e| StatsError::Database(e.to_string()))?;
             if !entries.is_empty() {
                 active_buckets += 1;
             }
@@ -130,8 +134,8 @@ impl StatsService {
         let pending_count = pending_packets.len() as u32;
 
         // Harbor stats
-        let harbor_ids = get_active_harbor_ids(&db)
-            .map_err(|e| StatsError::Database(e.to_string()))?;
+        let harbor_ids =
+            get_active_harbor_ids(&db).map_err(|e| StatsError::Database(e.to_string()))?;
         let harbor_ids_served = harbor_ids.len() as u32;
 
         // Get storage stats from harbor cache
@@ -202,15 +206,12 @@ impl StatsService {
     }
 
     /// Get detailed information about a specific topic
-    pub async fn get_topic_details(
-        &self,
-        topic_id: &[u8; 32],
-    ) -> Result<TopicDetails, StatsError> {
+    pub async fn get_topic_details(&self, topic_id: &[u8; 32]) -> Result<TopicDetails, StatsError> {
         let db = self.db.lock().await;
         let our_id = self.identity.public_key;
 
-        let member_ids = get_topic_members(&db, topic_id)
-            .map_err(|e| StatsError::Database(e.to_string()))?;
+        let member_ids =
+            get_topic_members(&db, topic_id).map_err(|e| StatsError::Database(e.to_string()))?;
 
         if member_ids.is_empty() {
             return Err(StatsError::TopicNotFound);

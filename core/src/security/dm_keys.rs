@@ -29,7 +29,7 @@ pub fn dm_seal(
 ) -> Result<Vec<u8>, DmCryptoError> {
     let shared = derive_shared_secret(sender_private_key, recipient_public_key)?;
     let mut buffer = plaintext.to_vec();
-    seal_with_shared(&shared, &mut buffer);
+    seal_with_shared(&shared, &mut buffer)?;
     Ok(buffer)
 }
 
@@ -69,27 +69,28 @@ fn derive_shared_secret(
     let x25519_secret = crypto_box::SecretKey::from(signing_key.to_scalar());
 
     // Convert ed25519 public key → x25519 public key
-    let verifying_key = VerifyingKey::from_bytes(public_key)
-        .map_err(|_| DmCryptoError::InvalidPublicKey)?;
+    let verifying_key =
+        VerifyingKey::from_bytes(public_key).map_err(|_| DmCryptoError::InvalidPublicKey)?;
     let x25519_public = crypto_box::PublicKey::from(verifying_key.to_montgomery());
 
-    Ok(crypto_box::ChaChaBox::new(
-        &x25519_public,
-        &x25519_secret,
-    ))
+    Ok(crypto_box::ChaChaBox::new(&x25519_public, &x25519_secret))
 }
 
 /// Encrypt in-place, appending nonce to buffer.
-fn seal_with_shared(shared: &crypto_box::ChaChaBox, buffer: &mut Vec<u8>) {
+fn seal_with_shared(
+    shared: &crypto_box::ChaChaBox,
+    buffer: &mut Vec<u8>,
+) -> Result<(), DmCryptoError> {
     use crypto_box::aead::{AeadCore, AeadInPlace, OsRng};
 
     let nonce = crypto_box::ChaChaBox::generate_nonce(&mut OsRng);
 
     shared
         .encrypt_in_place(&nonce, &[], buffer)
-        .expect("encryption failed");
+        .map_err(|_| DmCryptoError::EncryptionFailed)?;
 
     buffer.extend_from_slice(&nonce);
+    Ok(())
 }
 
 /// Decrypt in-place, reading nonce from end of buffer.
@@ -121,6 +122,8 @@ fn open_with_shared(
 pub enum DmCryptoError {
     /// Invalid ed25519 public key
     InvalidPublicKey,
+    /// Encryption failed
+    EncryptionFailed,
     /// Ciphertext too short or malformed
     InvalidCiphertext,
     /// Decryption failed (wrong key or tampered data)
@@ -131,6 +134,7 @@ impl std::fmt::Display for DmCryptoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DmCryptoError::InvalidPublicKey => write!(f, "invalid ed25519 public key"),
+            DmCryptoError::EncryptionFailed => write!(f, "DM encryption failed"),
             DmCryptoError::InvalidCiphertext => write!(f, "invalid DM ciphertext"),
             DmCryptoError::DecryptionFailed => write!(f, "DM decryption failed"),
         }
@@ -143,6 +147,7 @@ impl std::error::Error for DmCryptoError {}
 mod tests {
     use super::*;
     use crate::security::create_key_pair::generate_key_pair;
+    use ed25519_dalek::VerifyingKey;
 
     #[test]
     fn test_dm_seal_open_roundtrip() {
@@ -212,5 +217,33 @@ mod tests {
         let ciphertext = dm_seal(&alice.private_key, &bob.public_key, b"").unwrap();
         let decrypted = dm_open(&bob.private_key, &alice.public_key, &ciphertext).unwrap();
         assert_eq!(decrypted, b"");
+    }
+
+    #[test]
+    fn test_dm_invalid_public_key_rejected() {
+        let alice = generate_key_pair();
+        let mut invalid_public = None;
+        let mut candidate = [0u8; 32];
+        for byte in 0u8..=u8::MAX {
+            candidate[0] = byte;
+            if VerifyingKey::from_bytes(&candidate).is_err() {
+                invalid_public = Some(candidate);
+                break;
+            }
+        }
+        let invalid_public = invalid_public.expect("failed to find invalid public-key test vector");
+
+        let result = dm_seal(&alice.private_key, &invalid_public, b"secret");
+        assert!(matches!(result, Err(DmCryptoError::InvalidPublicKey)));
+    }
+
+    #[test]
+    fn test_dm_ciphertext_shorter_than_nonce_rejected() {
+        let alice = generate_key_pair();
+        let bob = generate_key_pair();
+        let short_ciphertext = vec![0u8; NONCE_LEN - 1];
+
+        let result = dm_open(&bob.private_key, &alice.public_key, &short_ciphertext);
+        assert!(matches!(result, Err(DmCryptoError::InvalidCiphertext)));
     }
 }

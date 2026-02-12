@@ -51,7 +51,10 @@ impl KBucket {
     /// Returns true if the node was added or already exists.
     /// Returns false if the bucket is full.
     pub fn add_node(&mut self, node: Id) -> bool {
-        matches!(self.try_add_node(node), AddNodeResult::Added | AddNodeResult::AlreadyExists)
+        matches!(
+            self.try_add_node(node),
+            AddNodeResult::Added | AddNodeResult::AlreadyExists
+        )
     }
 
     /// Try to add a node to the bucket with detailed result
@@ -210,7 +213,7 @@ impl fmt::Debug for Buckets {
             .filter(|(_, b)| !b.is_empty())
             .map(|(i, b)| (i, b.len()))
             .collect();
-        
+
         f.debug_struct("Buckets")
             .field("total_buckets", &self.buckets.len())
             .field("non_empty", &non_empty)
@@ -370,7 +373,7 @@ mod tests {
     #[test]
     fn test_kbucket_add_node() {
         let mut bucket = KBucket::new();
-        
+
         // Add a node
         let id = make_id(1);
         assert!(bucket.add_node(id));
@@ -382,7 +385,7 @@ mod tests {
     fn test_kbucket_add_duplicate() {
         let mut bucket = KBucket::new();
         let id = make_id(1);
-        
+
         assert!(bucket.add_node(id));
         assert!(bucket.add_node(id)); // Adding again should return true
         assert_eq!(bucket.len(), 1); // But count stays at 1
@@ -391,14 +394,14 @@ mod tests {
     #[test]
     fn test_kbucket_full() {
         let mut bucket = KBucket::new();
-        
+
         // Fill the bucket
         for i in 0..K {
             assert!(bucket.add_node(make_id(i as u8)));
         }
-        
+
         assert!(bucket.is_full());
-        
+
         // Try to add one more - should fail
         assert!(!bucket.add_node(make_id(100)));
     }
@@ -407,10 +410,10 @@ mod tests {
     fn test_kbucket_remove() {
         let mut bucket = KBucket::new();
         let id = make_id(1);
-        
+
         bucket.add_node(id);
         assert!(bucket.contains(&id));
-        
+
         bucket.remove_node(&id);
         assert!(!bucket.contains(&id));
         assert!(bucket.is_empty());
@@ -420,7 +423,7 @@ mod tests {
     fn test_routing_table_add_node() {
         let local = make_id(0);
         let mut table = RoutingTable::new(local);
-        
+
         let peer = make_id(1);
         assert!(table.add_node(peer));
         assert!(table.contains(&peer));
@@ -431,7 +434,7 @@ mod tests {
     fn test_routing_table_cannot_add_self() {
         let local = make_id(0);
         let mut table = RoutingTable::new(local);
-        
+
         // Cannot add ourselves
         assert!(!table.add_node(local));
         assert!(!table.contains(&local));
@@ -443,12 +446,12 @@ mod tests {
         // Local ID with all zeros
         let local = make_id(0);
         let mut table = RoutingTable::new(local);
-        
+
         // ID that differs in first bit should go to bucket 0
         let peer = make_id_with_prefix(&[0x80]);
         assert!(table.add_node(peer));
         assert_eq!(table.bucket_index(&peer), Some(0));
-        
+
         // ID that differs in second bit should go to bucket 1
         let peer2 = make_id_with_prefix(&[0x40]);
         assert!(table.add_node(peer2));
@@ -459,18 +462,18 @@ mod tests {
     fn test_find_closest_nodes() {
         let local = make_id(0);
         let mut table = RoutingTable::new(local);
-        
+
         // Add some nodes
         for i in 1..=10u8 {
             table.add_node(make_id(i));
         }
-        
+
         // Find 3 closest to target
         let target = make_id(5);
         let closest = table.find_closest_nodes(&target, 3);
-        
+
         assert_eq!(closest.len(), 3);
-        
+
         // First result should be the target itself (if it exists)
         // or the closest node to it
         assert_eq!(closest[0], make_id(5));
@@ -480,17 +483,17 @@ mod tests {
     fn test_find_closest_nodes_sorted_by_distance() {
         let local = make_id(0);
         let mut table = RoutingTable::new(local);
-        
+
         // Add nodes with various IDs
         let ids: Vec<u8> = vec![0xFF, 0x01, 0x80, 0x10, 0x08];
         for &id in &ids {
             table.add_node(make_id(id));
         }
-        
+
         // Find closest to local (0x00)
         let target = make_id(0);
         let closest = table.find_closest_nodes(&target, 5);
-        
+
         // Should be sorted by XOR distance to 0x00
         // 0x01 is closest, then 0x08, 0x10, 0x80, 0xFF
         assert_eq!(closest[0], make_id(0x01));
@@ -504,15 +507,15 @@ mod tests {
     fn test_find_closest_less_than_k() {
         let local = make_id(0);
         let mut table = RoutingTable::new(local);
-        
+
         // Add only 3 nodes
         for i in 1..=3u8 {
             table.add_node(make_id(i));
         }
-        
+
         // Ask for 10 closest
         let closest = table.find_closest_nodes(&local, 10);
-        
+
         // Should return all 3, not fail
         assert_eq!(closest.len(), 3);
     }
@@ -521,11 +524,11 @@ mod tests {
     fn test_remove_node() {
         let local = make_id(0);
         let mut table = RoutingTable::new(local);
-        
+
         let peer = make_id(1);
         table.add_node(peer);
         assert!(table.contains(&peer));
-        
+
         table.remove_node(&peer);
         assert!(!table.contains(&peer));
         assert_eq!(table.len(), 0);
@@ -535,19 +538,19 @@ mod tests {
     fn test_with_buckets_removes_self() {
         let local = make_id(0);
         let peer = make_id(1);
-        
+
         // Create buckets with local ID in them (simulating bad DB data)
         let mut buckets = Buckets::new();
         let bucket_idx = local.distance(&peer).bucket_index().unwrap();
         buckets.get_mut(bucket_idx).add_node(peer);
-        
+
         // Also add local to wrong bucket (shouldn't be there)
         let wrong_bucket_idx = local.distance(&make_id(2)).bucket_index().unwrap();
         buckets.get_mut(wrong_bucket_idx).add_node(local);
-        
+
         // Create table with these buckets
         let table = RoutingTable::with_buckets(local, buckets);
-        
+
         // Local should not be in the table
         assert!(!table.contains(&local));
         // Peer should still be there
@@ -560,7 +563,7 @@ mod tests {
         buckets.get_mut(0).add_node(make_id(1));
         buckets.get_mut(5).add_node(make_id(2));
         buckets.get_mut(5).add_node(make_id(3));
-        
+
         let debug = format!("{:?}", buckets);
         assert!(debug.contains("Buckets"));
         assert!(debug.contains("non_empty"));
@@ -570,7 +573,7 @@ mod tests {
     fn test_many_nodes_in_different_buckets() {
         let local = make_id(0);
         let mut table = RoutingTable::new(local);
-        
+
         // Add nodes that will land in different buckets
         // Using carefully chosen IDs to spread across buckets
         let mut added = 0;
@@ -579,10 +582,10 @@ mod tests {
                 added += 1;
             }
         }
-        
+
         assert!(added > 0);
         assert_eq!(table.len(), added);
-        
+
         // Find closest should work
         let closest = table.find_closest_nodes(&make_id(50), K);
         assert!(closest.len() <= K);
@@ -592,12 +595,12 @@ mod tests {
     fn test_find_closest_nodes_k_zero() {
         let local = make_id(0);
         let mut table = RoutingTable::new(local);
-        
+
         // Add some nodes
         for i in 1..=10u8 {
             table.add_node(make_id(i));
         }
-        
+
         // k=0 should return empty vec
         let closest = table.find_closest_nodes(&make_id(5), 0);
         assert!(closest.is_empty());
@@ -606,19 +609,19 @@ mod tests {
     #[test]
     fn test_kbucket_try_add_node() {
         let mut bucket = KBucket::new();
-        
+
         // Add a node
         let id1 = make_id(1);
         assert_eq!(bucket.try_add_node(id1), AddNodeResult::Added);
-        
+
         // Add same node again
         assert_eq!(bucket.try_add_node(id1), AddNodeResult::AlreadyExists);
-        
+
         // Fill the bucket
         for i in 2..=K as u8 {
             assert_eq!(bucket.try_add_node(make_id(i)), AddNodeResult::Added);
         }
-        
+
         // Try to add one more - should return BucketFull with oldest
         let new_node = make_id(100);
         let result = bucket.try_add_node(new_node);
@@ -628,21 +631,21 @@ mod tests {
     #[test]
     fn test_kbucket_refresh_node() {
         let mut bucket = KBucket::new();
-        
+
         // Add nodes in order: 1, 2, 3
         bucket.add_node(make_id(1));
         bucket.add_node(make_id(2));
         bucket.add_node(make_id(3));
-        
+
         // Oldest is 1
         assert_eq!(bucket.oldest(), Some(&make_id(1)));
-        
+
         // Refresh node 1 - should move to back
         assert!(bucket.refresh_node(&make_id(1)));
-        
+
         // Now oldest is 2
         assert_eq!(bucket.oldest(), Some(&make_id(2)));
-        
+
         // Node 1 should be at the back (most recent)
         assert_eq!(bucket.nodes().last(), Some(&make_id(1)));
     }
@@ -650,16 +653,16 @@ mod tests {
     #[test]
     fn test_kbucket_replace_oldest() {
         let mut bucket = KBucket::new();
-        
+
         // Add nodes: 1, 2, 3
         bucket.add_node(make_id(1));
         bucket.add_node(make_id(2));
         bucket.add_node(make_id(3));
-        
+
         // Replace oldest (1) with new node (100)
         let evicted = bucket.replace_oldest(make_id(100));
         assert_eq!(evicted, Some(make_id(1)));
-        
+
         // Node 1 should be gone, node 100 should be at back
         assert!(!bucket.contains(&make_id(1)));
         assert!(bucket.contains(&make_id(100)));
@@ -671,29 +674,29 @@ mod tests {
         // Simulate the full Kademlia eviction workflow
         let local = make_id(0);
         let mut table = RoutingTable::new(local);
-        
+
         // All these nodes go to the same bucket (differ only in lower bits)
         // Create nodes that will all land in the same bucket
         let mut nodes_in_bucket = Vec::new();
         for i in 1..=(K + 1) as u8 {
             nodes_in_bucket.push(make_id(i));
         }
-        
+
         // Add K nodes - should all succeed
         for i in 0..K {
             let result = table.try_add_node(nodes_in_bucket[i]);
             assert!(matches!(result, Some(AddNodeResult::Added)));
         }
-        
+
         // Try to add K+1th node - should get BucketFull
         let new_node = nodes_in_bucket[K];
         let result = table.try_add_node(new_node);
-        
+
         if let Some(AddNodeResult::BucketFull { oldest }) = result {
             // Simulate: oldest node failed ping, so we evict it
             let evicted = table.replace_oldest(new_node);
             assert_eq!(evicted, Some(oldest));
-            
+
             // New node should now be in the table
             assert!(table.contains(&new_node));
             // Oldest should be gone
@@ -709,18 +712,17 @@ mod tests {
     fn test_routing_table_refresh_node() {
         let local = make_id(0);
         let mut table = RoutingTable::new(local);
-        
+
         let peer = make_id(1);
         table.add_node(peer);
-        
+
         // Refresh should succeed for existing node
         assert!(table.refresh_node(&peer));
-        
+
         // Refresh should fail for non-existent node
         assert!(!table.refresh_node(&make_id(99)));
-        
+
         // Refresh should fail for local ID
         assert!(!table.refresh_node(&local));
     }
 }
-

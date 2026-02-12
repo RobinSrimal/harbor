@@ -156,7 +156,7 @@ mod tests {
     fn test_id_from_hash() {
         let data = b"test topic id";
         let id = Id::from_hash(data);
-        
+
         // Should match direct BLAKE3 hash
         let expected = blake3::hash(data);
         assert_eq!(id.as_bytes(), expected.as_bytes());
@@ -166,7 +166,7 @@ mod tests {
     fn test_distance_symmetric() {
         let a = Id::new([1u8; 32]);
         let b = Id::new([2u8; 32]);
-        
+
         assert_eq!(a.distance(&b), b.distance(&a));
     }
 
@@ -174,7 +174,7 @@ mod tests {
     fn test_distance_zero_to_self() {
         let a = Id::new([42u8; 32]);
         let dist = a.distance(&a);
-        
+
         assert_eq!(dist, Distance::ZERO);
         assert_eq!(dist.bucket_index(), None);
     }
@@ -183,7 +183,7 @@ mod tests {
     fn test_distance_xor() {
         let a = Id::new([0xFF; 32]);
         let b = Id::new([0x00; 32]);
-        
+
         let dist = a.distance(&b);
         assert_eq!(dist, Distance::MAX);
     }
@@ -211,15 +211,15 @@ mod tests {
     #[test]
     fn test_distance_ordering() {
         let target = Id::new([0u8; 32]);
-        
+
         // Closer to target (smaller XOR distance)
         let close = Id::new([0x01; 32]);
         // Further from target (larger XOR distance)
         let far = Id::new([0xFF; 32]);
-        
+
         let dist_close = target.distance(&close);
         let dist_far = target.distance(&far);
-        
+
         assert!(dist_close < dist_far);
     }
 
@@ -227,9 +227,9 @@ mod tests {
     fn test_distance_inverse() {
         let a = [0x42u8; 32];
         let b = [0x24u8; 32];
-        
+
         let dist = Distance::between(&a, &b);
-        
+
         // inverse(b) should give us back a
         assert_eq!(dist.inverse(&b), a);
         // inverse(a) should give us back b
@@ -239,11 +239,11 @@ mod tests {
     #[test]
     fn test_id_debug_display() {
         let id = Id::new([0xAB; 32]);
-        
+
         // Debug shows shortened hex
         let debug = format!("{:?}", id);
         assert!(debug.contains("abababab"));
-        
+
         // Display shows full hex
         let display = format!("{}", id);
         assert_eq!(display.len(), 64); // 32 bytes * 2 hex chars
@@ -254,17 +254,17 @@ mod tests {
         // All zeros - maximum leading zeros
         let zero = Distance([0u8; 32]);
         assert_eq!(zero.leading_zeros(), 256);
-        
+
         // First byte is 0x80 (10000000) - 0 leading zeros
         let mut bytes = [0u8; 32];
         bytes[0] = 0x80;
         assert_eq!(Distance(bytes).leading_zeros(), 0);
-        
+
         // First byte is 0x01 (00000001) - 7 leading zeros
         let mut bytes = [0u8; 32];
         bytes[0] = 0x01;
         assert_eq!(Distance(bytes).leading_zeros(), 7);
-        
+
         // First byte 0, second byte 0x80 - 8 leading zeros
         let mut bytes = [0u8; 32];
         bytes[1] = 0x80;
@@ -291,4 +291,3 @@ mod tests {
         assert_eq!(bytes_ref, &[0x42u8; 32]);
     }
 }
-

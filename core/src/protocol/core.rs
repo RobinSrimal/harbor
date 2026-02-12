@@ -13,24 +13,24 @@ use std::time::Duration;
 use iroh::Endpoint;
 use iroh::protocol::Router;
 use rusqlite::Connection;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::info;
 
-use crate::data::{
-    add_topic_member, ensure_self_in_peers, get_or_create_identity, start_db,
-    subscribe_dm_topic, LocalIdentity,
-};
-use crate::network::control::{ControlService, CONTROL_ALPN};
-use crate::network::connect::Connector;
-use crate::network::dht::DhtService;
 use crate::data::BlobStore;
+use crate::data::{
+    LocalIdentity, add_topic_member, ensure_self_in_peers, get_or_create_identity, start_db,
+    subscribe_dm_topic,
+};
+use crate::network::connect::Connector;
+use crate::network::control::{CONTROL_ALPN, ControlService};
+use crate::network::dht::DhtService;
 use crate::network::gate::ConnectionGate;
-use crate::network::harbor::{HarborService, HARBOR_ALPN};
-use crate::network::stream::{StreamService, STREAM_ALPN};
-use crate::network::send::{SendService, SEND_ALPN};
-use crate::network::share::{ShareConfig, ShareService, SHARE_ALPN};
-use crate::network::sync::{SyncService, SYNC_ALPN};
+use crate::network::harbor::{HARBOR_ALPN, HarborService};
 use crate::network::pool::PoolConfig;
+use crate::network::send::{SEND_ALPN, SendService};
+use crate::network::share::{SHARE_ALPN, ShareConfig, ShareService};
+use crate::network::stream::{STREAM_ALPN, StreamService};
+use crate::network::sync::{SYNC_ALPN, SyncService};
 
 use super::config::ProtocolConfig;
 use super::error::ProtocolError;
@@ -98,16 +98,19 @@ impl Protocol {
         // Require a database encryption key — the caller must always provide one
         use zeroize::Zeroize;
         let mut db_key = config.db_key.ok_or_else(|| {
-            ProtocolError::Database("db_key is required — set it via ProtocolConfig::with_db_key()".to_string())
+            ProtocolError::Database(
+                "db_key is required — set it via ProtocolConfig::with_db_key()".to_string(),
+            )
         })?;
         let passphrase = hex::encode(db_key);
         db_key.zeroize();
 
-        let db = start_db(&db_path, &passphrase).map_err(|e| ProtocolError::Database(e.to_string()))?;
+        let db =
+            start_db(&db_path, &passphrase).map_err(|e| ProtocolError::Database(e.to_string()))?;
 
         // Get or create identity (wrapped in Arc for sharing with services)
         let identity = Arc::new(
-            get_or_create_identity(&db).map_err(|e| ProtocolError::Database(e.to_string()))?
+            get_or_create_identity(&db).map_err(|e| ProtocolError::Database(e.to_string()))?,
         );
 
         info!(
@@ -148,7 +151,8 @@ impl Protocol {
             &config.bootstrap_nodes,
             db.clone(),
             identity.public_key,
-        ).await;
+        )
+        .await;
 
         // Create event channel
         let (event_tx, event_rx) = mpsc::channel(1000);
@@ -231,14 +235,16 @@ impl Protocol {
         let blob_path = if let Some(ref path) = config.blob_path {
             path.clone()
         } else if let Some(ref db_path) = config.db_path {
-            db_path.parent()
+            db_path
+                .parent()
                 .map(|p| p.join(".harbor_blobs"))
                 .unwrap_or_else(|| PathBuf::from(".harbor_blobs"))
         } else {
             crate::data::default_blob_path().unwrap_or_else(|_| PathBuf::from(".harbor_blobs"))
         };
-        let blob_store = Arc::new(BlobStore::new(&blob_path)
-            .map_err(|e| ProtocolError::StartFailed(format!("failed to create blob store: {}", e)))?);
+        let blob_store = Arc::new(BlobStore::new(&blob_path).map_err(|e| {
+            ProtocolError::StartFailed(format!("failed to create blob store: {}", e))
+        })?);
 
         let share_service = Arc::new(ShareService::new(
             share_connector.clone(),
@@ -271,7 +277,9 @@ impl Protocol {
         );
 
         // Give SendService access to StreamService (for routing stream signaling)
-        send_service.set_stream_service(stream_service.clone()).await;
+        send_service
+            .set_stream_service(stream_service.clone())
+            .await;
 
         // Initialize Stats service
         let stats_service = Arc::new(StatsService::new(
@@ -367,7 +375,7 @@ impl Protocol {
     /// Get the event receiver
     ///
     /// Get the protocol event receiver
-    /// 
+    ///
     /// This returns a receiver for all protocol events (messages, file events, etc.)
     /// Can only be called once - subsequent calls return None.
     pub async fn events(&self) -> Option<mpsc::Receiver<ProtocolEvent>> {
@@ -387,7 +395,7 @@ impl Protocol {
     }
 
     /// Get the blob storage path
-    /// 
+    ///
     /// Returns the configured blob path, or derives one from the db path,
     /// or falls back to the system default.
     pub fn blob_path(&self) -> PathBuf {
@@ -395,7 +403,8 @@ impl Protocol {
             path.clone()
         } else if let Some(ref db_path) = self.config.db_path {
             // Derive from db_path: .harbor_blobs/ next to database
-            db_path.parent()
+            db_path
+                .parent()
                 .map(|p| p.join(".harbor_blobs"))
                 .unwrap_or_else(|| PathBuf::from(".harbor_blobs"))
         } else {
@@ -419,8 +428,8 @@ mod tests {
     use super::*;
     use crate::data::schema::create_all_tables;
     use crate::data::{
-        add_topic_member, ensure_peer_exists, get_all_topics, get_topic_members, remove_topic_member,
-        subscribe_topic, subscribe_topic_with_admin, unsubscribe_topic,
+        add_topic_member, ensure_peer_exists, get_all_topics, get_topic_members,
+        remove_topic_member, subscribe_topic, subscribe_topic_with_admin, unsubscribe_topic,
     };
     use crate::protocol::TopicInvite;
 

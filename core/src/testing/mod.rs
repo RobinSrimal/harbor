@@ -22,9 +22,8 @@
 //! let packet = network.receive_packet(bob).await;
 //! ```
 
-pub mod node;
 pub mod network;
+pub mod node;
 
-pub use node::TestNode;
 pub use network::TestNetwork;
-
+pub use node::TestNode;

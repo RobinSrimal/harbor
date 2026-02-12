@@ -48,7 +48,7 @@ pub fn upsert_peer(conn: &Connection, peer: &PeerInfo) -> rusqlite::Result<()> {
          ON CONFLICT(endpoint_id) DO UPDATE SET
              last_latency_ms = COALESCE(?2, last_latency_ms),
              latency_timestamp = COALESCE(?3, latency_timestamp),
-             last_seen = ?4",
+             last_seen = MAX(last_seen, excluded.last_seen)",
         params![
             peer.endpoint_id.as_slice(),
             peer.last_latency_ms,
@@ -185,7 +185,6 @@ pub fn ensure_peer_exists(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite
     Ok(())
 }
 
-
 /// Update peer's latency measurement
 pub fn update_peer_latency(
     conn: &Connection,
@@ -217,7 +216,21 @@ pub fn delete_peer(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite::Resul
 pub fn cleanup_stale_peers(conn: &Connection) -> rusqlite::Result<usize> {
     let cutoff = current_timestamp() - PEER_RETENTION_SECS;
     let rows = conn.execute(
-        "DELETE FROM peers WHERE last_seen < ?1",
+        "DELETE FROM peers
+         WHERE last_seen < ?1
+           AND id NOT IN (SELECT admin_peer_id FROM topics)
+           AND id NOT IN (SELECT peer_id FROM topic_members)
+           AND id NOT IN (SELECT peer_id FROM outgoing_recipients)
+           AND id NOT IN (SELECT sender_peer_id FROM harbor_cache)
+           AND id NOT IN (SELECT peer_id FROM harbor_recipients)
+           AND id NOT IN (SELECT sender_peer_id FROM pending_decryption)
+           AND id NOT IN (SELECT source_peer_id FROM blobs)
+           AND id NOT IN (SELECT peer_id FROM blob_recipients)
+           AND id NOT IN (SELECT received_from_peer_id FROM blob_sections WHERE received_from_peer_id IS NOT NULL)
+           AND id NOT IN (SELECT peer_id FROM connection_list)
+           AND id NOT IN (SELECT sender_peer_id FROM pending_topic_invites)
+           AND id NOT IN (SELECT admin_peer_id FROM pending_topic_invites)
+           AND id NOT IN (SELECT peer_id FROM harbor_nodes_cache)",
         [cutoff],
     )?;
     Ok(rows)
@@ -225,10 +238,8 @@ pub fn cleanup_stale_peers(conn: &Connection) -> rusqlite::Result<usize> {
 
 /// Get all peers not seen since the given timestamp
 pub fn get_stale_peers(conn: &Connection, threshold: i64) -> rusqlite::Result<Vec<[u8; 32]>> {
-    let mut stmt = conn.prepare(
-        "SELECT endpoint_id FROM peers WHERE last_seen < ?1",
-    )?;
-    
+    let mut stmt = conn.prepare("SELECT endpoint_id FROM peers WHERE last_seen < ?1")?;
+
     let peers = stmt
         .query_map([threshold], |row| {
             let id_vec: Vec<u8> = row.get(0)?;
@@ -244,19 +255,19 @@ pub fn get_stale_peers(conn: &Connection, threshold: i64) -> rusqlite::Result<Ve
             Ok(endpoint_id)
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    
+
     Ok(peers)
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::schema::create_peer_table;
+    use crate::data::schema::create_all_tables;
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        create_peer_table(&conn).unwrap();
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        create_all_tables(&conn).unwrap();
         conn
     }
 
@@ -268,7 +279,7 @@ mod tests {
     fn test_insert_and_get_peer() {
         let conn = setup_db();
         let endpoint_id = test_endpoint_id(1);
-        
+
         let peer = PeerInfo {
             endpoint_id,
             last_latency_ms: Some(50),
@@ -311,7 +322,7 @@ mod tests {
             relay_url_last_success: None,
         };
         upsert_peer(&conn, &peer2).unwrap();
-        
+
         let retrieved = get_peer(&conn, &endpoint_id).unwrap().unwrap();
         // Original latency should be preserved
         assert_eq!(retrieved.last_latency_ms, peer1.last_latency_ms);
@@ -321,7 +332,7 @@ mod tests {
     fn test_touch_peer() {
         let conn = setup_db();
         let endpoint_id = test_endpoint_id(6);
-        
+
         let old_time = current_timestamp() - 1000;
         let peer = PeerInfo {
             endpoint_id,
@@ -332,10 +343,10 @@ mod tests {
             relay_url_last_success: None,
         };
         upsert_peer(&conn, &peer).unwrap();
-        
+
         // Touch the peer
         touch_peer(&conn, &endpoint_id).unwrap();
-        
+
         let retrieved = get_peer(&conn, &endpoint_id).unwrap().unwrap();
         assert!(retrieved.last_seen > old_time);
     }
@@ -344,7 +355,7 @@ mod tests {
     fn test_delete_peer() {
         let conn = setup_db();
         let endpoint_id = test_endpoint_id(8);
-        
+
         let peer = PeerInfo {
             endpoint_id,
             last_latency_ms: None,
@@ -358,7 +369,7 @@ mod tests {
         assert!(get_peer(&conn, &endpoint_id).unwrap().is_some());
 
         delete_peer(&conn, &endpoint_id).unwrap();
-        
+
         assert!(get_peer(&conn, &endpoint_id).unwrap().is_none());
     }
 
@@ -366,7 +377,7 @@ mod tests {
     fn test_get_stale_peers() {
         let conn = setup_db();
         let now = current_timestamp();
-        
+
         // Fresh peer
         let fresh = PeerInfo {
             endpoint_id: test_endpoint_id(9),
@@ -432,5 +443,107 @@ mod tests {
         // Recent should remain, stale should be gone
         assert!(get_peer(&conn, &test_endpoint_id(1)).unwrap().is_some());
         assert!(get_peer(&conn, &test_endpoint_id(2)).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_upsert_peer_does_not_regress_last_seen() {
+        let conn = setup_db();
+        let endpoint_id = test_endpoint_id(11);
+
+        let newer = PeerInfo {
+            endpoint_id,
+            last_latency_ms: None,
+            latency_timestamp: None,
+            last_seen: 2_000,
+            relay_url: None,
+            relay_url_last_success: None,
+        };
+        upsert_peer(&conn, &newer).unwrap();
+
+        let older = PeerInfo {
+            endpoint_id,
+            last_latency_ms: None,
+            latency_timestamp: None,
+            last_seen: 1_000,
+            relay_url: None,
+            relay_url_last_success: None,
+        };
+        upsert_peer(&conn, &older).unwrap();
+
+        let stored = get_peer(&conn, &endpoint_id).unwrap().unwrap();
+        assert_eq!(stored.last_seen, 2_000);
+    }
+
+    #[test]
+    fn test_update_peer_relay_url_uses_newer_timestamp_only() {
+        let conn = setup_db();
+        let endpoint_id = test_endpoint_id(12);
+        ensure_peer_exists(&conn, &endpoint_id).unwrap();
+
+        update_peer_relay_url(&conn, &endpoint_id, "https://relay.new/", 2_000).unwrap();
+        let relay = get_peer_relay_info(&conn, &endpoint_id).unwrap().unwrap();
+        assert_eq!(relay.0, "https://relay.new/");
+        assert_eq!(relay.1, Some(2_000));
+
+        // Older timestamp should not replace relay metadata.
+        update_peer_relay_url(&conn, &endpoint_id, "https://relay.old/", 1_500).unwrap();
+        let relay = get_peer_relay_info(&conn, &endpoint_id).unwrap().unwrap();
+        assert_eq!(relay.0, "https://relay.new/");
+        assert_eq!(relay.1, Some(2_000));
+    }
+
+    #[test]
+    fn test_cleanup_stale_peers_skips_referenced_rows() {
+        let conn = setup_db();
+        crate::data::schema::create_topic_table(&conn).unwrap();
+
+        let now = current_timestamp();
+        let stale_seen = now - PEER_RETENTION_SECS - 1_000;
+
+        let referenced_id = test_endpoint_id(13);
+        let unreferenced_id = test_endpoint_id(14);
+
+        upsert_peer(
+            &conn,
+            &PeerInfo {
+                endpoint_id: referenced_id,
+                last_latency_ms: None,
+                latency_timestamp: None,
+                last_seen: stale_seen,
+                relay_url: None,
+                relay_url_last_success: None,
+            },
+        )
+        .unwrap();
+        upsert_peer(
+            &conn,
+            &PeerInfo {
+                endpoint_id: unreferenced_id,
+                last_latency_ms: None,
+                latency_timestamp: None,
+                last_seen: stale_seen,
+                relay_url: None,
+                relay_url_last_success: None,
+            },
+        )
+        .unwrap();
+
+        // Keep referenced_id alive via topics.admin_peer_id FK.
+        conn.execute(
+            "INSERT INTO topics (topic_id, harbor_id, admin_peer_id)
+             VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
+            params![
+                [21u8; 32].as_slice(),
+                [22u8; 32].as_slice(),
+                referenced_id.as_slice(),
+            ],
+        )
+        .unwrap();
+
+        let deleted = cleanup_stale_peers(&conn).unwrap();
+        assert_eq!(deleted, 1);
+
+        assert!(get_peer(&conn, &referenced_id).unwrap().is_some());
+        assert!(get_peer(&conn, &unreferenced_id).unwrap().is_none());
     }
 }

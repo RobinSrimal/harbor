@@ -8,10 +8,10 @@
 //! The private key is automatically zeroed from memory when `LocalIdentity`
 //! is dropped, preventing key material from lingering in RAM.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::security::create_key_pair::{generate_key_pair, key_pair_from_bytes, KeyPair};
+use crate::security::create_key_pair::{KeyPair, generate_key_pair, key_pair_from_bytes};
 
 /// Local node identity stored in the database
 ///
@@ -64,12 +64,16 @@ pub fn get_or_create_identity(conn: &Connection) -> rusqlite::Result<LocalIdenti
 
     // No identity exists, create one
     let key_pair = generate_key_pair();
-    store_identity(conn, &key_pair)?;
+    match store_identity(conn, &key_pair) {
+        Ok(()) => {}
+        // If another process created identity first, recover by loading it.
+        Err(rusqlite::Error::SqliteFailure(ref sqlite_err, _))
+            if sqlite_err.code == ErrorCode::ConstraintViolation => {}
+        Err(e) => return Err(e),
+    }
 
     // Load and return the newly created identity
-    get_identity(conn)?.ok_or_else(|| {
-        rusqlite::Error::QueryReturnedNoRows
-    })
+    get_identity(conn)?.ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)
 }
 
 /// Get the existing local node identity, if any
@@ -80,21 +84,28 @@ pub fn get_identity(conn: &Connection) -> rusqlite::Result<Option<LocalIdentity>
         |row| {
             let private_key_vec: Vec<u8> = row.get(0)?;
             let public_key_vec: Vec<u8> = row.get(1)?;
-            
+
             let mut private_key = [0u8; 32];
             let mut public_key = [0u8; 32];
-            
-            if private_key_vec.len() != 32 || public_key_vec.len() != 32 {
+
+            if private_key_vec.len() != 32 {
                 return Err(rusqlite::Error::InvalidColumnType(
                     0,
                     "private_key".to_string(),
                     rusqlite::types::Type::Blob,
                 ));
             }
-            
+            if public_key_vec.len() != 32 {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    1,
+                    "public_key".to_string(),
+                    rusqlite::types::Type::Blob,
+                ));
+            }
+
             private_key.copy_from_slice(&private_key_vec);
             public_key.copy_from_slice(&public_key_vec);
-            
+
             Ok(LocalIdentity {
                 private_key,
                 public_key,
@@ -119,11 +130,9 @@ fn store_identity(conn: &Connection, key_pair: &KeyPair) -> rusqlite::Result<()>
 
 /// Check if a local identity exists
 pub fn has_identity(conn: &Connection) -> rusqlite::Result<bool> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM local_node WHERE id = 1",
-        [],
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM local_node WHERE id = 1", [], |row| {
+        row.get(0)
+    })?;
     Ok(count > 0)
 }
 
@@ -142,7 +151,7 @@ pub fn ensure_self_in_peers(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqli
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::schema::create_local_node_table;
+    use crate::data::schema::{create_local_node_table, create_peer_table};
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -158,20 +167,20 @@ mod tests {
     #[test]
     fn test_get_or_create_identity_creates_new() {
         let conn = setup_db();
-        
+
         // Should not have identity initially
         assert!(!has_identity(&conn).unwrap());
-        
+
         // Get or create should create one
         let identity = get_or_create_identity(&conn).unwrap();
-        
+
         // Should now have identity
         assert!(has_identity(&conn).unwrap());
-        
+
         // Keys should be 32 bytes
         assert_eq!(identity.private_key.len(), 32);
         assert_eq!(identity.public_key.len(), 32);
-        
+
         // Private and public should be different
         assert_ne!(identity.private_key, identity.public_key);
     }
@@ -179,13 +188,13 @@ mod tests {
     #[test]
     fn test_get_or_create_identity_reuses_existing() {
         let conn = setup_db();
-        
+
         // Create initial identity
         let identity1 = get_or_create_identity(&conn).unwrap();
-        
+
         // Get again - should return the same identity
         let identity2 = get_or_create_identity(&conn).unwrap();
-        
+
         assert_eq!(identity1.private_key, identity2.private_key);
         assert_eq!(identity1.public_key, identity2.public_key);
     }
@@ -194,9 +203,9 @@ mod tests {
     fn test_identity_persists_across_connections() {
         let db_path = temp_db_path("identity_persist");
         let _ = std::fs::remove_file(&db_path);
-        
+
         let original_public_key: [u8; 32];
-        
+
         // First connection - create identity
         {
             let conn = Connection::open(&db_path).unwrap();
@@ -204,14 +213,14 @@ mod tests {
             let identity = get_or_create_identity(&conn).unwrap();
             original_public_key = identity.public_key;
         }
-        
+
         // Second connection - should load same identity
         {
             let conn = Connection::open(&db_path).unwrap();
             let identity = get_or_create_identity(&conn).unwrap();
             assert_eq!(identity.public_key, original_public_key);
         }
-        
+
         // Cleanup
         let _ = std::fs::remove_file(&db_path);
     }
@@ -220,9 +229,9 @@ mod tests {
     fn test_identity_to_key_pair() {
         let conn = setup_db();
         let identity = get_or_create_identity(&conn).unwrap();
-        
+
         let key_pair = identity.to_key_pair();
-        
+
         assert_eq!(key_pair.private_key, identity.private_key);
         assert_eq!(key_pair.public_key, identity.public_key);
     }
@@ -231,7 +240,7 @@ mod tests {
     fn test_node_id() {
         let conn = setup_db();
         let identity = get_or_create_identity(&conn).unwrap();
-        
+
         // node_id should return the public key
         assert_eq!(identity.node_id(), identity.public_key);
     }
@@ -239,23 +248,23 @@ mod tests {
     #[test]
     fn test_only_one_identity_allowed() {
         let conn = setup_db();
-        
+
         // Create first identity
         get_or_create_identity(&conn).unwrap();
-        
+
         // Try to insert another directly - should fail due to CHECK constraint
         let result = conn.execute(
             "INSERT INTO local_node (id, private_key, public_key) VALUES (2, ?1, ?2)",
             params![[0u8; 32].as_slice(), [1u8; 32].as_slice()],
         );
-        
+
         assert!(result.is_err());
     }
 
     #[test]
     fn test_get_identity_returns_none_when_empty() {
         let conn = setup_db();
-        
+
         let identity = get_identity(&conn).unwrap();
         assert!(identity.is_none());
     }
@@ -264,15 +273,98 @@ mod tests {
     fn test_debug_does_not_expose_private_key() {
         let conn = setup_db();
         let identity = get_or_create_identity(&conn).unwrap();
-        
+
         let debug_output = format!("{:?}", identity);
-        
+
         // Should contain REDACTED, not actual key bytes
-        assert!(debug_output.contains("[REDACTED]"), "Debug should redact private key");
-        
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug should redact private key"
+        );
+
         // Should show public key in hex
         let public_hex = hex::encode(identity.public_key);
-        assert!(debug_output.contains(&public_hex), "Debug should show public key");
+        assert!(
+            debug_output.contains(&public_hex),
+            "Debug should show public key"
+        );
+    }
+
+    #[test]
+    fn test_ensure_self_in_peers_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_peer_table(&conn).unwrap();
+
+        let endpoint = [7u8; 32];
+        ensure_self_in_peers(&conn, &endpoint).unwrap();
+        ensure_self_in_peers(&conn, &endpoint).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM peers WHERE endpoint_id = ?1",
+                [endpoint.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(count, 1, "ensure_self_in_peers should not duplicate rows");
+    }
+
+    #[test]
+    fn test_get_identity_rejects_invalid_private_key_size() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE local_node (
+                id INTEGER PRIMARY KEY,
+                private_key BLOB NOT NULL,
+                public_key BLOB NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO local_node (id, private_key, public_key) VALUES (1, ?1, ?2)",
+            params![[1u8; 16].as_slice(), [2u8; 32].as_slice()],
+        )
+        .unwrap();
+
+        let err = get_identity(&conn).unwrap_err();
+        match err {
+            rusqlite::Error::InvalidColumnType(index, name, rusqlite::types::Type::Blob) => {
+                assert_eq!(index, 0);
+                assert_eq!(name, "private_key");
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_get_identity_rejects_invalid_public_key_size() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE local_node (
+                id INTEGER PRIMARY KEY,
+                private_key BLOB NOT NULL,
+                public_key BLOB NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO local_node (id, private_key, public_key) VALUES (1, ?1, ?2)",
+            params![[1u8; 32].as_slice(), [2u8; 16].as_slice()],
+        )
+        .unwrap();
+
+        let err = get_identity(&conn).unwrap_err();
+        match err {
+            rusqlite::Error::InvalidColumnType(index, name, rusqlite::types::Type::Blob) => {
+                assert_eq!(index, 1);
+                assert_eq!(name, "public_key");
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
     }
 }
-

@@ -7,8 +7,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::data::dht::{current_timestamp, ensure_peer_exists};
 use crate::data::membership::epoch::store_epoch_key;
-use crate::security::topic_keys::{TopicKeys, harbor_id_from_topic};
 use crate::security::derive_epoch_secret_from_topic;
+use crate::security::topic_keys::{TopicKeys, harbor_id_from_topic};
+
+const PLACEHOLDER_ADMIN_ID: [u8; 32] = [0u8; 32];
 
 /// A topic subscription stored in the database
 #[derive(Clone)]
@@ -43,7 +45,7 @@ impl TopicSubscription {
     pub fn new(topic_id: [u8; 32]) -> Self {
         let harbor_id = harbor_id_from_topic(&topic_id);
         let keys = TopicKeys::derive(&topic_id);
-        
+
         Self {
             topic_id,
             harbor_id,
@@ -75,16 +77,16 @@ pub struct TopicMember {
 
 /// Subscribe to a topic (for joining an existing topic via invite)
 ///
-/// Creates the topic subscription with the sender as admin.
+/// Creates the topic subscription with a placeholder admin for compatibility.
 /// Uses INSERT OR IGNORE to preserve the original `created_at` timestamp
 /// if the topic already exists.
 ///
 /// For creating new topics where you are the admin, use `subscribe_topic_with_admin`.
-pub fn subscribe_topic(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<TopicSubscription> {
-    // For backwards compatibility, use a placeholder admin
-    // This will be overwritten when proper invite flow sets the real admin
-    let placeholder_admin = [0u8; 32];
-    subscribe_topic_with_admin(conn, topic_id, &placeholder_admin)
+pub fn subscribe_topic(
+    conn: &Connection,
+    topic_id: &[u8; 32],
+) -> rusqlite::Result<TopicSubscription> {
+    subscribe_topic_with_admin(conn, topic_id, &PLACEHOLDER_ADMIN_ID)
 }
 
 /// Subscribe to a topic with explicit admin
@@ -106,21 +108,42 @@ pub fn subscribe_topic_with_admin(
     admin_id: &[u8; 32],
 ) -> rusqlite::Result<TopicSubscription> {
     let subscription = TopicSubscription::new(*topic_id);
+    let tx = conn.unchecked_transaction()?;
 
     // Ensure admin exists in peers table (for FK constraint)
-    ensure_peer_exists(conn, admin_id)?;
+    ensure_peer_exists(&tx, admin_id)?;
 
     // Use INSERT OR IGNORE to preserve original created_at on rejoin
-    conn.execute(
+    tx.execute(
         "INSERT OR IGNORE INTO topics (topic_id, harbor_id, admin_peer_id)
          VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
-        params![topic_id.as_slice(), subscription.harbor_id.as_slice(), admin_id.as_slice()],
+        params![
+            topic_id.as_slice(),
+            subscription.harbor_id.as_slice(),
+            admin_id.as_slice()
+        ],
+    )?;
+
+    // Upgrade legacy placeholder admin rows to the real admin once known.
+    // This is intentionally one-way: if a real admin is already present, keep it.
+    tx.execute(
+        "UPDATE topics
+         SET admin_peer_id = (SELECT id FROM peers WHERE endpoint_id = ?2)
+         WHERE topic_id = ?1
+           AND admin_peer_id = (SELECT id FROM peers WHERE endpoint_id = ?3)",
+        params![
+            topic_id.as_slice(),
+            admin_id.as_slice(),
+            PLACEHOLDER_ADMIN_ID.as_slice(),
+        ],
     )?;
 
     // Store epoch 0 key derived from topic_id
     // This ensures all topics have at least one epoch key from the start
     let epoch_0_secret = derive_epoch_secret_from_topic(topic_id, 0);
-    store_epoch_key(conn, topic_id, 0, &epoch_0_secret)?;
+    store_epoch_key(&tx, topic_id, 0, &epoch_0_secret)?;
+
+    tx.commit()?;
 
     // Return the actual subscription from DB (may have older created_at)
     get_topic(conn, topic_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
@@ -138,10 +161,7 @@ pub fn subscribe_topic_with_admin(
 ///
 /// Note: DMs don't use epoch keys (they use DM shared keys), so we don't store
 /// an epoch key here.
-pub fn subscribe_dm_topic(
-    conn: &Connection,
-    endpoint_id: &[u8; 32],
-) -> rusqlite::Result<()> {
+pub fn subscribe_dm_topic(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite::Result<()> {
     // Ensure endpoint exists in peers table (for FK constraint)
     ensure_peer_exists(conn, endpoint_id)?;
 
@@ -150,7 +170,11 @@ pub fn subscribe_dm_topic(
     conn.execute(
         "INSERT OR IGNORE INTO topics (topic_id, harbor_id, admin_peer_id)
          VALUES (?1, ?2, (SELECT id FROM peers WHERE endpoint_id = ?3))",
-        params![endpoint_id.as_slice(), endpoint_id.as_slice(), endpoint_id.as_slice()],
+        params![
+            endpoint_id.as_slice(),
+            endpoint_id.as_slice(),
+            endpoint_id.as_slice()
+        ],
     )?;
 
     Ok(())
@@ -178,7 +202,10 @@ pub fn is_subscribed(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result
 }
 
 /// Get the admin ID for a topic
-pub fn get_topic_admin(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<Option<[u8; 32]>> {
+pub fn get_topic_admin(
+    conn: &Connection,
+    topic_id: &[u8; 32],
+) -> rusqlite::Result<Option<[u8; 32]>> {
     conn.query_row(
         "SELECT p.endpoint_id
          FROM topics t
@@ -236,13 +263,13 @@ fn parse_id(vec: &[u8], column_name: &str) -> rusqlite::Result<[u8; 32]> {
 fn parse_topic_row(row: &rusqlite::Row) -> rusqlite::Result<TopicSubscription> {
     let topic_id_vec: Vec<u8> = row.get(0)?;
     let harbor_id_vec: Vec<u8> = row.get(1)?;
-    
+
     let topic_id = parse_id(&topic_id_vec, "topic_id")?;
     let harbor_id = parse_id(&harbor_id_vec, "harbor_id")?;
-    
+
     // Derive keys from topic_id
     let keys = TopicKeys::derive(&topic_id);
-    
+
     Ok(TopicSubscription {
         topic_id,
         harbor_id,
@@ -253,7 +280,10 @@ fn parse_topic_row(row: &rusqlite::Row) -> rusqlite::Result<TopicSubscription> {
 }
 
 /// Get a topic subscription
-pub fn get_topic(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<Option<TopicSubscription>> {
+pub fn get_topic(
+    conn: &Connection,
+    topic_id: &[u8; 32],
+) -> rusqlite::Result<Option<TopicSubscription>> {
     conn.query_row(
         "SELECT topic_id, harbor_id, created_at FROM topics WHERE topic_id = ?1",
         [topic_id.as_slice()],
@@ -263,7 +293,10 @@ pub fn get_topic(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<Opt
 }
 
 /// Get topic by HarborID
-pub fn get_topic_by_harbor_id(conn: &Connection, harbor_id: &[u8; 32]) -> rusqlite::Result<Option<TopicSubscription>> {
+pub fn get_topic_by_harbor_id(
+    conn: &Connection,
+    harbor_id: &[u8; 32],
+) -> rusqlite::Result<Option<TopicSubscription>> {
     conn.query_row(
         "SELECT topic_id, harbor_id, created_at FROM topics WHERE harbor_id = ?1",
         [harbor_id.as_slice()],
@@ -274,14 +307,13 @@ pub fn get_topic_by_harbor_id(conn: &Connection, harbor_id: &[u8; 32]) -> rusqli
 
 /// Get all subscribed topics
 pub fn get_all_topics(conn: &Connection) -> rusqlite::Result<Vec<TopicSubscription>> {
-    let mut stmt = conn.prepare(
-        "SELECT topic_id, harbor_id, created_at FROM topics ORDER BY created_at DESC",
-    )?;
-    
+    let mut stmt = conn
+        .prepare("SELECT topic_id, harbor_id, created_at FROM topics ORDER BY created_at DESC")?;
+
     let topics = stmt
         .query_map([], parse_topic_row)?
         .collect::<Result<Vec<_>, _>>()?;
-    
+
     Ok(topics)
 }
 
@@ -296,8 +328,9 @@ pub fn add_topic_member(
     // Ensure member exists in peers table (for FK constraint)
     ensure_peer_exists(conn, endpoint_id)?;
 
+    // Keep the original joined_at for existing rows.
     conn.execute(
-        "INSERT OR REPLACE INTO topic_members (topic_id, peer_id)
+        "INSERT OR IGNORE INTO topic_members (topic_id, peer_id)
          VALUES (?1, (SELECT id FROM peers WHERE endpoint_id = ?2))",
         params![topic_id.as_slice(), endpoint_id.as_slice()],
     )?;
@@ -336,7 +369,10 @@ pub fn is_topic_member(
 }
 
 /// Get all members of a topic (endpoint IDs only)
-pub fn get_topic_members(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result<Vec<[u8; 32]>> {
+pub fn get_topic_members(
+    conn: &Connection,
+    topic_id: &[u8; 32],
+) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut stmt = conn.prepare(
         "SELECT p.endpoint_id
          FROM topic_members tm
@@ -344,14 +380,14 @@ pub fn get_topic_members(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Re
          WHERE tm.topic_id = ?1
          ORDER BY tm.joined_at",
     )?;
-    
+
     let members = stmt
         .query_map([topic_id.as_slice()], |row| {
             let id_vec: Vec<u8> = row.get(0)?;
             parse_id(&id_vec, "endpoint_id")
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    
+
     Ok(members)
 }
 
@@ -386,7 +422,7 @@ pub fn set_topic_members(
         // Ensure member exists in peers table (for FK constraint)
         ensure_peer_exists(&tx, member)?;
         tx.execute(
-            "INSERT OR REPLACE INTO topic_members (topic_id, peer_id)
+            "INSERT OR IGNORE INTO topic_members (topic_id, peer_id)
              VALUES (?1, (SELECT id FROM peers WHERE endpoint_id = ?2))",
             params![topic_id.as_slice(), member.as_slice()],
         )?;
@@ -396,21 +432,24 @@ pub fn set_topic_members(
 }
 
 /// Get topics that a specific endpoint is a member of
-pub fn get_topics_for_member(conn: &Connection, endpoint_id: &[u8; 32]) -> rusqlite::Result<Vec<[u8; 32]>> {
+pub fn get_topics_for_member(
+    conn: &Connection,
+    endpoint_id: &[u8; 32],
+) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut stmt = conn.prepare(
         "SELECT tm.topic_id
          FROM topic_members tm
          JOIN peers p ON tm.peer_id = p.id
          WHERE p.endpoint_id = ?1",
     )?;
-    
+
     let topics = stmt
         .query_map([endpoint_id.as_slice()], |row| {
             let id_vec: Vec<u8> = row.get(0)?;
             parse_id(&id_vec, "topic_id")
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    
+
     Ok(topics)
 }
 
@@ -433,7 +472,7 @@ pub fn get_joined_at(conn: &Connection, topic_id: &[u8; 32]) -> rusqlite::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::schema::{create_topic_table, create_peer_table, create_membership_tables};
+    use crate::data::schema::{create_membership_tables, create_peer_table, create_topic_table};
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -456,9 +495,9 @@ mod tests {
     fn test_subscribe_topic() {
         let conn = setup_db();
         let topic_id = test_topic_id(1);
-        
+
         let subscription = subscribe_topic(&conn, &topic_id).unwrap();
-        
+
         assert_eq!(subscription.topic_id, topic_id);
         assert_eq!(subscription.harbor_id, harbor_id_from_topic(&topic_id));
         assert!(is_subscribed(&conn, &topic_id).unwrap());
@@ -468,10 +507,10 @@ mod tests {
     fn test_unsubscribe_topic() {
         let conn = setup_db();
         let topic_id = test_topic_id(2);
-        
+
         subscribe_topic(&conn, &topic_id).unwrap();
         assert!(is_subscribed(&conn, &topic_id).unwrap());
-        
+
         unsubscribe_topic(&conn, &topic_id).unwrap();
         assert!(!is_subscribed(&conn, &topic_id).unwrap());
     }
@@ -480,12 +519,12 @@ mod tests {
     fn test_get_topic() {
         let conn = setup_db();
         let topic_id = test_topic_id(3);
-        
+
         subscribe_topic(&conn, &topic_id).unwrap();
-        
+
         let topic = get_topic(&conn, &topic_id).unwrap().unwrap();
         assert_eq!(topic.topic_id, topic_id);
-        
+
         // Keys should be derivable
         let keys = topic.keys();
         let expected = TopicKeys::derive(&topic_id);
@@ -498,9 +537,9 @@ mod tests {
         let conn = setup_db();
         let topic_id = test_topic_id(4);
         let harbor_id = harbor_id_from_topic(&topic_id);
-        
+
         subscribe_topic(&conn, &topic_id).unwrap();
-        
+
         let topic = get_topic_by_harbor_id(&conn, &harbor_id).unwrap().unwrap();
         assert_eq!(topic.topic_id, topic_id);
     }
@@ -510,10 +549,10 @@ mod tests {
         let conn = setup_db();
         let topic_id = test_topic_id(5);
         let member = test_endpoint_id(10);
-        
+
         subscribe_topic(&conn, &topic_id).unwrap();
         add_topic_member(&conn, &topic_id, &member).unwrap();
-        
+
         assert!(is_topic_member(&conn, &topic_id, &member).unwrap());
     }
 
@@ -522,11 +561,11 @@ mod tests {
         let conn = setup_db();
         let topic_id = test_topic_id(6);
         let member = test_endpoint_id(20);
-        
+
         subscribe_topic(&conn, &topic_id).unwrap();
         add_topic_member(&conn, &topic_id, &member).unwrap();
         assert!(is_topic_member(&conn, &topic_id, &member).unwrap());
-        
+
         remove_topic_member(&conn, &topic_id, &member).unwrap();
         assert!(!is_topic_member(&conn, &topic_id, &member).unwrap());
     }
@@ -535,13 +574,17 @@ mod tests {
     fn test_get_topic_members() {
         let conn = setup_db();
         let topic_id = test_topic_id(7);
-        let members = [test_endpoint_id(30), test_endpoint_id(31), test_endpoint_id(32)];
-        
+        let members = [
+            test_endpoint_id(30),
+            test_endpoint_id(31),
+            test_endpoint_id(32),
+        ];
+
         subscribe_topic(&conn, &topic_id).unwrap();
         for member in &members {
             add_topic_member(&conn, &topic_id, member).unwrap();
         }
-        
+
         let retrieved = get_topic_members(&conn, &topic_id).unwrap();
         assert_eq!(retrieved.len(), 3);
         for member in &members {
@@ -553,19 +596,23 @@ mod tests {
     fn test_set_topic_members() {
         let mut conn = setup_db();
         let topic_id = test_topic_id(8);
-        
+
         subscribe_topic(&conn, &topic_id).unwrap();
-        
+
         // Set initial members
         let members1 = [test_endpoint_id(40), test_endpoint_id(41)];
         set_topic_members(&mut conn, &topic_id, &members1).unwrap();
         assert_eq!(get_topic_member_count(&conn, &topic_id).unwrap(), 2);
-        
+
         // Replace with new members
-        let members2 = [test_endpoint_id(50), test_endpoint_id(51), test_endpoint_id(52)];
+        let members2 = [
+            test_endpoint_id(50),
+            test_endpoint_id(51),
+            test_endpoint_id(52),
+        ];
         set_topic_members(&mut conn, &topic_id, &members2).unwrap();
         assert_eq!(get_topic_member_count(&conn, &topic_id).unwrap(), 3);
-        
+
         // Old members should be gone
         assert!(!is_topic_member(&conn, &topic_id, &members1[0]).unwrap());
     }
@@ -574,15 +621,15 @@ mod tests {
     fn test_unsubscribe_removes_members() {
         let conn = setup_db();
         let topic_id = test_topic_id(9);
-        
+
         subscribe_topic(&conn, &topic_id).unwrap();
         add_topic_member(&conn, &topic_id, &test_endpoint_id(60)).unwrap();
         add_topic_member(&conn, &topic_id, &test_endpoint_id(61)).unwrap();
-        
+
         assert_eq!(get_topic_member_count(&conn, &topic_id).unwrap(), 2);
-        
+
         unsubscribe_topic(&conn, &topic_id).unwrap();
-        
+
         // Members should be cascade deleted
         assert_eq!(get_topic_member_count(&conn, &topic_id).unwrap(), 0);
     }
@@ -590,11 +637,11 @@ mod tests {
     #[test]
     fn test_get_all_topics() {
         let conn = setup_db();
-        
+
         subscribe_topic(&conn, &test_topic_id(10)).unwrap();
         subscribe_topic(&conn, &test_topic_id(11)).unwrap();
         subscribe_topic(&conn, &test_topic_id(12)).unwrap();
-        
+
         let topics = get_all_topics(&conn).unwrap();
         assert_eq!(topics.len(), 3);
     }
@@ -603,15 +650,15 @@ mod tests {
     fn test_get_topics_for_member() {
         let conn = setup_db();
         let member = test_endpoint_id(70);
-        
+
         // Member in topics 20 and 21, not in 22
         subscribe_topic(&conn, &test_topic_id(20)).unwrap();
         subscribe_topic(&conn, &test_topic_id(21)).unwrap();
         subscribe_topic(&conn, &test_topic_id(22)).unwrap();
-        
+
         add_topic_member(&conn, &test_topic_id(20), &member).unwrap();
         add_topic_member(&conn, &test_topic_id(21), &member).unwrap();
-        
+
         let topics = get_topics_for_member(&conn, &member).unwrap();
         assert_eq!(topics.len(), 2);
         assert!(topics.contains(&test_topic_id(20)));
@@ -623,10 +670,10 @@ mod tests {
     fn test_topic_subscription_new() {
         let topic_id = test_topic_id(100);
         let sub = TopicSubscription::new(topic_id);
-        
+
         assert_eq!(sub.topic_id, topic_id);
         assert_eq!(sub.harbor_id, harbor_id_from_topic(&topic_id));
-        
+
         let keys = sub.keys();
         let expected = TopicKeys::derive(&topic_id);
         assert_eq!(keys.k_enc, expected.k_enc);
@@ -637,18 +684,134 @@ mod tests {
     fn test_debug_does_not_expose_keys() {
         let topic_id = test_topic_id(101);
         let sub = TopicSubscription::new(topic_id);
-        
+
         let debug_output = format!("{:?}", sub);
-        
+
         // Should contain REDACTED for keys
-        assert!(debug_output.contains("[REDACTED]"), "Debug should redact keys");
-        
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug should redact keys"
+        );
+
         // Should show topic_id in hex
         let topic_hex = hex::encode(topic_id);
-        assert!(debug_output.contains(&topic_hex), "Debug should show topic_id");
-        
+        assert!(
+            debug_output.contains(&topic_hex),
+            "Debug should show topic_id"
+        );
+
         // Should NOT contain actual key bytes
         let k_enc_hex = hex::encode(sub.k_enc);
-        assert!(!debug_output.contains(&k_enc_hex), "Debug should NOT contain k_enc");
+        assert!(
+            !debug_output.contains(&k_enc_hex),
+            "Debug should NOT contain k_enc"
+        );
+    }
+
+    #[test]
+    fn test_subscribe_topic_upgrades_placeholder_admin() {
+        let conn = setup_db();
+        let topic_id = test_topic_id(102);
+        let admin_id = test_endpoint_id(103);
+
+        let initial = subscribe_topic(&conn, &topic_id).unwrap();
+        assert_eq!(
+            get_topic_admin(&conn, &topic_id).unwrap(),
+            Some(PLACEHOLDER_ADMIN_ID)
+        );
+
+        subscribe_topic_with_admin(&conn, &topic_id, &admin_id).unwrap();
+        let upgraded = get_topic(&conn, &topic_id).unwrap().unwrap();
+
+        assert_eq!(get_topic_admin(&conn, &topic_id).unwrap(), Some(admin_id));
+        assert_eq!(upgraded.created_at, initial.created_at);
+    }
+
+    #[test]
+    fn test_subscribe_topic_with_admin_does_not_override_existing_admin() {
+        let conn = setup_db();
+        let topic_id = test_topic_id(104);
+        let admin_1 = test_endpoint_id(105);
+        let admin_2 = test_endpoint_id(106);
+
+        subscribe_topic_with_admin(&conn, &topic_id, &admin_1).unwrap();
+        subscribe_topic_with_admin(&conn, &topic_id, &admin_2).unwrap();
+
+        assert_eq!(get_topic_admin(&conn, &topic_id).unwrap(), Some(admin_1));
+    }
+
+    #[test]
+    fn test_subscribe_topic_with_admin_is_atomic() {
+        let conn = setup_db();
+        let topic_id = test_topic_id(107);
+        let admin_id = test_endpoint_id(108);
+        let topic_hex = hex::encode(topic_id);
+        let trigger_sql = format!(
+            "CREATE TRIGGER abort_epoch_insert_for_topic
+             BEFORE INSERT ON epoch_keys
+             WHEN NEW.topic_id = x'{topic_hex}'
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced epoch key failure');
+             END;"
+        );
+        conn.execute(&trigger_sql, []).unwrap();
+
+        let err = subscribe_topic_with_admin(&conn, &topic_id, &admin_id).unwrap_err();
+        assert!(err.to_string().contains("forced epoch key failure"));
+        assert!(!is_subscribed(&conn, &topic_id).unwrap());
+        assert!(
+            crate::data::membership::epoch::get_epoch_key(&conn, &topic_id, 0)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_subscribe_dm_topic_raw_ids_and_no_epoch_key() {
+        let conn = setup_db();
+        let endpoint_id = test_endpoint_id(109);
+
+        subscribe_dm_topic(&conn, &endpoint_id).unwrap();
+        let topic = get_topic(&conn, &endpoint_id).unwrap().unwrap();
+
+        assert_eq!(topic.topic_id, endpoint_id);
+        assert_eq!(topic.harbor_id, endpoint_id);
+        assert!(
+            crate::data::membership::epoch::get_epoch_key(&conn, &endpoint_id, 0)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_add_topic_member_is_idempotent_and_preserves_joined_at() {
+        let conn = setup_db();
+        let topic_id = test_topic_id(110);
+        let member_id = test_endpoint_id(111);
+
+        subscribe_topic(&conn, &topic_id).unwrap();
+        add_topic_member(&conn, &topic_id, &member_id).unwrap();
+        conn.execute(
+            "UPDATE topic_members
+             SET joined_at = 12345
+             WHERE topic_id = ?1
+               AND peer_id = (SELECT id FROM peers WHERE endpoint_id = ?2)",
+            params![topic_id.as_slice(), member_id.as_slice()],
+        )
+        .unwrap();
+
+        add_topic_member(&conn, &topic_id, &member_id).unwrap();
+        let joined_at: i64 = conn
+            .query_row(
+                "SELECT tm.joined_at
+                 FROM topic_members tm
+                 JOIN peers p ON tm.peer_id = p.id
+                 WHERE tm.topic_id = ?1 AND p.endpoint_id = ?2",
+                params![topic_id.as_slice(), member_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(joined_at, 12345);
+        assert_eq!(get_topic_member_count(&conn, &topic_id).unwrap(), 1);
     }
 }

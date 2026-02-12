@@ -1,12 +1,12 @@
 //! HTTP API endpoint handlers
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use std::collections::HashMap;
 use tracing::info;
 
+use super::parse::{extract_json_string, http_json_response, http_response};
 use harbor_core::{Protocol, TopicInvite};
-use super::parse::{extract_json_string, http_response, http_json_response};
 
 /// Shared state for active stream tracks (source side)
 /// Maps request_id → TrackProducer for reuse across publish calls
@@ -20,12 +20,10 @@ pub struct BootstrapInfo {
 
 pub async fn handle_create_topic(protocol: &Protocol) -> String {
     match protocol.create_topic().await {
-        Ok(invite) => {
-            match invite.to_hex() {
-                Ok(hex) => http_response(200, &hex),
-                Err(e) => http_response(500, &format!("Failed to encode invite: {}", e)),
-            }
-        }
+        Ok(invite) => match invite.to_hex() {
+            Ok(hex) => http_response(200, &hex),
+            Err(e) => http_response(500, &format!("Failed to encode invite: {}", e)),
+        },
         Err(e) => http_response(500, &format!("Failed to create topic: {}", e)),
     }
 }
@@ -41,12 +39,10 @@ pub async fn handle_get_invite(protocol: &Protocol, topic_hex: &str) -> String {
     };
 
     match protocol.get_invite(&topic_bytes).await {
-        Ok(invite) => {
-            match invite.to_hex() {
-                Ok(hex) => http_response(200, &hex),
-                Err(e) => http_response(500, &format!("Failed to encode invite: {}", e)),
-            }
-        }
+        Ok(invite) => match invite.to_hex() {
+            Ok(hex) => http_response(200, &hex),
+            Err(e) => http_response(500, &format!("Failed to encode invite: {}", e)),
+        },
         Err(e) => http_response(404, &format!("Topic not found: {}", e)),
     }
 }
@@ -77,7 +73,10 @@ pub async fn handle_send(protocol: &Protocol, body: &str) -> String {
     let msg_start = body.find("\"message\"");
 
     if topic_start.is_none() || msg_start.is_none() {
-        tracing::warn!("API: JSON parse failed - missing 'topic' or 'message' field, body_len={}", body.len());
+        tracing::warn!(
+            "API: JSON parse failed - missing 'topic' or 'message' field, body_len={}",
+            body.len()
+        );
         return http_response(400, "Expected JSON with 'topic' and 'message' fields");
     }
 
@@ -85,7 +84,10 @@ pub async fn handle_send(protocol: &Protocol, body: &str) -> String {
     let message = extract_json_string(body, "message");
 
     if topic_hex.is_none() || message.is_none() {
-        tracing::warn!("API: JSON parse failed - couldn't extract values, body_len={}", body.len());
+        tracing::warn!(
+            "API: JSON parse failed - couldn't extract values, body_len={}",
+            body.len()
+        );
         return http_response(400, "Failed to parse topic or message");
     }
 
@@ -102,7 +104,10 @@ pub async fn handle_send(protocol: &Protocol, body: &str) -> String {
     };
 
     info!("API: calling protocol.send()");
-    let result = match protocol.send(harbor_core::Target::Topic(topic_bytes), message.as_bytes()).await {
+    let result = match protocol
+        .send(harbor_core::Target::Topic(topic_bytes), message.as_bytes())
+        .await
+    {
         Ok(()) => {
             info!("API: protocol.send() completed successfully");
             http_response(200, "Message sent")
@@ -138,7 +143,10 @@ pub async fn handle_send_dm(protocol: &Protocol, body: &str) -> String {
         _ => return http_response(400, "Invalid recipient ID (must be 64 hex chars)"),
     };
 
-    match protocol.send(harbor_core::Target::Dm(recipient_bytes), message.as_bytes()).await {
+    match protocol
+        .send(harbor_core::Target::Dm(recipient_bytes), message.as_bytes())
+        .await
+    {
         Ok(()) => {
             info!("API: DM sent to {}", &recipient_hex[..16]);
             http_response(200, "DM sent")
@@ -173,8 +181,13 @@ pub async fn handle_list_topics(protocol: &Protocol) -> String {
     match protocol.list_topics().await {
         Ok(topics) => {
             let hex_topics: Vec<String> = topics.iter().map(|t| hex::encode(t)).collect();
-            let json = format!(r#"{{"topics":[{}]}}"#,
-                hex_topics.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(",")
+            let json = format!(
+                r#"{{"topics":[{}]}}"#,
+                hex_topics
+                    .iter()
+                    .map(|t| format!("\"{}\"", t))
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
             http_json_response(200, &json)
         }
@@ -186,10 +199,7 @@ pub fn handle_bootstrap(bootstrap: &BootstrapInfo) -> String {
     let relay = bootstrap.relay_url.as_deref().unwrap_or("");
     let json = format!(
         r#"{{"endpoint_id":"{}","relay_url":"{}","bootstrap_arg":"{}:{}"}}"#,
-        bootstrap.endpoint_id,
-        relay,
-        bootstrap.endpoint_id,
-        relay
+        bootstrap.endpoint_id, relay, bootstrap.endpoint_id, relay
     );
     http_json_response(200, &json)
 }
@@ -221,7 +231,10 @@ pub async fn handle_share_file(protocol: &Protocol, body: &str) -> String {
         _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
     };
 
-    match protocol.share_file(harbor_core::Target::Topic(topic_bytes), &file_path).await {
+    match protocol
+        .share_file(harbor_core::Target::Topic(topic_bytes), &file_path)
+        .await
+    {
         Ok(hash) => {
             let json = format!(r#"{{"hash":"{}","status":"announced"}}"#, hex::encode(hash));
             http_json_response(200, &json)
@@ -384,7 +397,10 @@ pub async fn handle_sync_update(protocol: &Protocol, body: &str) -> String {
         Err(_) => return http_response(400, "Invalid hex data"),
     };
 
-    match protocol.send_sync_update(harbor_core::Target::Topic(topic_bytes), data).await {
+    match protocol
+        .send_sync_update(harbor_core::Target::Topic(topic_bytes), data)
+        .await
+    {
         Ok(()) => http_response(200, "Sync update sent"),
         Err(e) => http_response(500, &format!("Failed to send sync update: {}", e)),
     }
@@ -408,7 +424,10 @@ pub async fn handle_sync_request(protocol: &Protocol, body: &str) -> String {
         _ => return http_response(400, "Invalid topic ID (must be 64 hex chars)"),
     };
 
-    match protocol.request_sync(harbor_core::Target::Topic(topic_bytes)).await {
+    match protocol
+        .request_sync(harbor_core::Target::Topic(topic_bytes))
+        .await
+    {
         Ok(()) => http_response(200, "Sync request sent"),
         Err(e) => http_response(500, &format!("Failed to request sync: {}", e)),
     }
@@ -456,7 +475,14 @@ pub async fn handle_sync_respond(protocol: &Protocol, body: &str) -> String {
         Err(_) => return http_response(400, "Invalid hex data"),
     };
 
-    match protocol.respond_sync(harbor_core::Target::Topic(topic_bytes), &requester_bytes, data).await {
+    match protocol
+        .respond_sync(
+            harbor_core::Target::Topic(topic_bytes),
+            &requester_bytes,
+            data,
+        )
+        .await
+    {
         Ok(()) => http_response(200, "Sync response sent"),
         Err(e) => http_response(500, &format!("Failed to respond to sync: {}", e)),
     }
@@ -493,7 +519,10 @@ pub async fn handle_dm_sync_update(protocol: &Protocol, body: &str) -> String {
         Err(_) => return http_response(400, "Invalid hex data"),
     };
 
-    match protocol.send_sync_update(harbor_core::Target::Dm(recipient_bytes), data).await {
+    match protocol
+        .send_sync_update(harbor_core::Target::Dm(recipient_bytes), data)
+        .await
+    {
         Ok(()) => http_response(200, "DM sync update sent"),
         Err(e) => http_response(500, &format!("Failed to send DM sync update: {}", e)),
     }
@@ -516,7 +545,10 @@ pub async fn handle_dm_sync_request(protocol: &Protocol, body: &str) -> String {
         _ => return http_response(400, "Invalid recipient ID (must be 64 hex chars)"),
     };
 
-    match protocol.request_sync(harbor_core::Target::Dm(recipient_bytes)).await {
+    match protocol
+        .request_sync(harbor_core::Target::Dm(recipient_bytes))
+        .await
+    {
         Ok(()) => http_response(200, "DM sync request sent"),
         Err(e) => http_response(500, &format!("Failed to send DM sync request: {}", e)),
     }
@@ -550,7 +582,14 @@ pub async fn handle_dm_sync_respond(protocol: &Protocol, body: &str) -> String {
     };
 
     // requester_id is unused for DM target, pass recipient as placeholder
-    match protocol.respond_sync(harbor_core::Target::Dm(recipient_bytes), &recipient_bytes, data).await {
+    match protocol
+        .respond_sync(
+            harbor_core::Target::Dm(recipient_bytes),
+            &recipient_bytes,
+            data,
+        )
+        .await
+    {
         Ok(()) => http_response(200, "DM sync response sent"),
         Err(e) => http_response(500, &format!("Failed to send DM sync response: {}", e)),
     }
@@ -582,7 +621,10 @@ pub async fn handle_dm_share(protocol: &Protocol, body: &str) -> String {
         _ => return http_response(400, "Invalid recipient ID (must be 64 hex chars)"),
     };
 
-    match protocol.share_file(harbor_core::Target::Dm(recipient_bytes), &file_path).await {
+    match protocol
+        .share_file(harbor_core::Target::Dm(recipient_bytes), &file_path)
+        .await
+    {
         Ok(hash) => {
             let json = format!(r#"{{"hash":"{}","status":"announced"}}"#, hex::encode(hash));
             http_json_response(200, &json)
@@ -615,8 +657,12 @@ pub async fn handle_dm_stream_request(protocol: &Protocol, body: &str) -> String
     };
 
     match protocol.dm_stream_request(&peer_bytes, &name).await {
-        Ok(request_id) => {
-            let json = format!(r#"{{"request_id":"{}"}}"#, hex::encode(request_id));
+        Ok(broadcast_id) => {
+            let encoded = hex::encode(broadcast_id);
+            let json = format!(
+                r#"{{"broadcast_id":"{}","request_id":"{}"}}"#,
+                encoded, encoded
+            );
             http_json_response(200, &json)
         }
         Err(e) => http_response(500, &format!("Failed to request DM stream: {}", e)),
@@ -654,9 +700,16 @@ pub async fn handle_stream_request(protocol: &Protocol, body: &str) -> String {
         _ => return http_response(400, "Invalid peer ID"),
     };
 
-    match protocol.request_stream(&topic_bytes, &peer_bytes, &name, vec![]).await {
-        Ok(request_id) => {
-            let json = format!(r#"{{"request_id":"{}"}}"#, hex::encode(request_id));
+    match protocol
+        .request_stream(&topic_bytes, &peer_bytes, &name, vec![])
+        .await
+    {
+        Ok(broadcast_id) => {
+            let encoded = hex::encode(broadcast_id);
+            let json = format!(
+                r#"{{"broadcast_id":"{}","request_id":"{}"}}"#,
+                encoded, encoded
+            );
             http_json_response(200, &json)
         }
         Err(e) => http_response(500, &format!("Failed to request stream: {}", e)),
@@ -813,7 +866,15 @@ pub async fn handle_control_connect(protocol: &Protocol, body: &str) -> String {
         None
     };
 
-    match protocol.request_connection(&peer_bytes, relay_url.as_deref(), display_name.as_deref(), token).await {
+    match protocol
+        .request_connection(
+            &peer_bytes,
+            relay_url.as_deref(),
+            display_name.as_deref(),
+            token,
+        )
+        .await
+    {
         Ok(request_id) => {
             let json = format!(r#"{{"request_id":"{}"}}"#, hex::encode(request_id));
             http_json_response(200, &json)
@@ -864,7 +925,10 @@ pub async fn handle_control_decline(protocol: &Protocol, body: &str) -> String {
         _ => return http_response(400, "Invalid request_id"),
     };
 
-    match protocol.decline_connection(&id_bytes, reason.as_deref()).await {
+    match protocol
+        .decline_connection(&id_bytes, reason.as_deref())
+        .await
+    {
         Ok(()) => http_response(200, "Connection declined"),
         Err(e) => http_response(500, &format!("Failed to decline connection: {}", e)),
     }
@@ -957,22 +1021,25 @@ pub async fn handle_control_unblock(protocol: &Protocol, body: &str) -> String {
 pub async fn handle_control_list_connections(protocol: &Protocol) -> String {
     match protocol.list_connections().await {
         Ok(connections) => {
-            let conn_jsons: Vec<String> = connections.iter().map(|c| {
-                let state_str = match c.state {
-                    harbor_core::ConnectionState::PendingOutgoing => "pending_outgoing",
-                    harbor_core::ConnectionState::PendingIncoming => "pending_incoming",
-                    harbor_core::ConnectionState::Connected => "connected",
-                    harbor_core::ConnectionState::Declined => "declined",
-                    harbor_core::ConnectionState::Blocked => "blocked",
-                };
-                format!(
-                    r#"{{"peer_id":"{}","state":"{}","display_name":"{}","relay_url":"{}"}}"#,
-                    hex::encode(c.peer_id),
-                    state_str,
-                    c.display_name.as_deref().unwrap_or(""),
-                    c.relay_url.as_deref().unwrap_or("")
-                )
-            }).collect();
+            let conn_jsons: Vec<String> = connections
+                .iter()
+                .map(|c| {
+                    let state_str = match c.state {
+                        harbor_core::ConnectionState::PendingOutgoing => "pending_outgoing",
+                        harbor_core::ConnectionState::PendingIncoming => "pending_incoming",
+                        harbor_core::ConnectionState::Connected => "connected",
+                        harbor_core::ConnectionState::Declined => "declined",
+                        harbor_core::ConnectionState::Blocked => "blocked",
+                    };
+                    format!(
+                        r#"{{"peer_id":"{}","state":"{}","display_name":"{}","relay_url":"{}"}}"#,
+                        hex::encode(c.peer_id),
+                        state_str,
+                        c.display_name.as_deref().unwrap_or(""),
+                        c.relay_url.as_deref().unwrap_or("")
+                    )
+                })
+                .collect();
             let json = format!(r#"{{"connections":[{}]}}"#, conn_jsons.join(","));
             http_json_response(200, &json)
         }
@@ -1118,7 +1185,10 @@ pub async fn handle_control_remove_member(protocol: &Protocol, body: &str) -> St
         _ => return http_response(400, "Invalid member ID"),
     };
 
-    match protocol.remove_topic_member(&topic_bytes, &member_bytes).await {
+    match protocol
+        .remove_topic_member(&topic_bytes, &member_bytes)
+        .await
+    {
         Ok(()) => http_response(200, "Member removed"),
         Err(e) => http_response(500, &format!("Failed to remove member: {}", e)),
     }
@@ -1155,7 +1225,10 @@ pub async fn handle_control_suggest(protocol: &Protocol, body: &str) -> String {
         _ => return http_response(400, "Invalid suggested_peer ID"),
     };
 
-    match protocol.suggest_peer(&to_bytes, &suggested_bytes, note.as_deref()).await {
+    match protocol
+        .suggest_peer(&to_bytes, &suggested_bytes, note.as_deref())
+        .await
+    {
         Ok(message_id) => {
             let json = format!(r#"{{"message_id":"{}"}}"#, hex::encode(message_id));
             http_json_response(200, &json)

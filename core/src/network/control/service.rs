@@ -1,7 +1,8 @@
 //! Control Service - Lifecycle and relationship management
 //!
 //! Handles peer connections, topic invitations, and membership management.
-//! One-off exchanges: open connection, send message, get response, close.
+//! Typical flow is request/response per message over CONTROL_ALPN.
+//! Connections are not pooled and may be opened and closed per exchange.
 //! Does not maintain a connection pool.
 //!
 //! Business logic is split by domain:
@@ -10,9 +11,9 @@
 //! - `lifecycle.rs` — topic create/join/list/get_invite
 //! - `introductions.rs` — suggest peer
 
-use std::sync::{Arc, Mutex as StdMutex};
 use rusqlite::Connection as DbConnection;
-use tokio::sync::{mpsc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::debug;
 
 use crate::data::LocalIdentity;
@@ -21,6 +22,7 @@ use crate::network::connect::Connector;
 use crate::network::gate::ConnectionGate;
 use crate::protocol::ProtocolEvent;
 use crate::resilience::{PoWConfig, PoWResult, PoWVerifier, ProofOfWork, build_context};
+use crate::security::PacketId;
 
 use super::protocol::{ControlPacketType, ControlRpcProtocol};
 
@@ -157,18 +159,17 @@ impl ControlService {
         message_type: ControlPacketType,
     ) -> Result<(), ControlError> {
         let context = build_context(&[sender_id, &[message_type as u8]]);
-        let verifier = self.pow_verifier.lock().unwrap();
+        let mut verifier = lock_pow_verifier(&self.pow_verifier);
 
         match verifier.verify(pow, &context, sender_id, None) {
-            PoWResult::Allowed => Ok(()),
+            PoWResult::Allowed => {
+                verifier.record_request(sender_id, None);
+                Ok(())
+            }
             PoWResult::InsufficientDifficulty { required, .. } => {
                 Err(ControlError::InsufficientPoW { required })
             }
             PoWResult::Expired { .. } => {
-                let required = verifier.effective_difficulty(sender_id, None);
-                Err(ControlError::InsufficientPoW { required })
-            }
-            PoWResult::InvalidContext => {
                 let required = verifier.effective_difficulty(sender_id, None);
                 Err(ControlError::InsufficientPoW { required })
             }
@@ -182,7 +183,8 @@ impl ControlService {
         &self,
         peer_id: &[u8; 32],
     ) -> ControlResult<irpc::Client<ControlRpcProtocol>> {
-        let conn = self.connector
+        let conn = self
+            .connector
             .connect(peer_id)
             .await
             .map_err(|e| ControlError::Connection(e.to_string()))?;
@@ -216,9 +218,12 @@ impl ControlService {
         prefixed_data.push(packet_type as u8);
         prefixed_data.extend_from_slice(packet_data);
 
+        let mut outgoing_packet_id: PacketId = [0u8; 16];
+        outgoing_packet_id.copy_from_slice(&packet_id[..16]);
+
         store_outgoing_packet(
             &mut db,
-            packet_id,
+            &outgoing_packet_id,
             &topic_id,
             harbor_id,
             &prefixed_data,
@@ -239,9 +244,21 @@ impl ControlService {
     }
 }
 
+fn lock_pow_verifier(
+    pow_verifier: &StdMutex<PoWVerifier>,
+) -> std::sync::MutexGuard<'_, PoWVerifier> {
+    match pow_verifier.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// Compute PoW for a control message
 /// Context: sender_id || message_type_byte
-pub(super) fn compute_control_pow(sender_id: &[u8; 32], message_type: ControlPacketType) -> ControlResult<ProofOfWork> {
+pub(super) fn compute_control_pow(
+    sender_id: &[u8; 32],
+    message_type: ControlPacketType,
+) -> ControlResult<ProofOfWork> {
     let context = build_context(&[sender_id, &[message_type as u8]]);
     let difficulty = PoWConfig::control().base_difficulty;
     ProofOfWork::compute(&context, difficulty)
@@ -355,7 +372,23 @@ mod tests {
     fn test_connect_invite_invalid() {
         // Too short
         assert!(ConnectInvite::decode("AAAA").is_none());
-        // Invalid base64
+        // Invalid hex
         assert!(ConnectInvite::decode("!!!invalid!!!").is_none());
+    }
+
+    #[test]
+    fn test_lock_pow_verifier_recovers_from_poison() {
+        let pow_verifier = Arc::new(StdMutex::new(PoWVerifier::new(PoWConfig::control())));
+        let poisoned_ref = pow_verifier.clone();
+
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned_ref.lock().unwrap();
+            panic!("poison test mutex");
+        })
+        .join();
+
+        let sender_id = [7u8; 32];
+        let mut guard = lock_pow_verifier(pow_verifier.as_ref());
+        guard.record_request(&sender_id, None);
     }
 }

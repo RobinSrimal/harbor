@@ -2,10 +2,10 @@
 
 use std::time::Duration;
 
-use super::routing::{K, ALPHA, Buckets};
+use super::api::ApiProtocol;
 use super::distance::Id;
 use super::pool::DhtPool;
-use super::api::ApiProtocol;
+use super::routing::{ALPHA, Buckets, K};
 use crate::network::dht::actor::DhtActor;
 
 /// Default interval for verifying candidate nodes (30 seconds)

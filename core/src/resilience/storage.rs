@@ -1,7 +1,7 @@
 //! Storage management for Harbor protocol
 //!
 //! Manages:
-//! - Total storage quotas (default 10GB)
+//! - Total storage quotas (platform default: 10GB mobile, 50GB desktop)
 //! - Per-HarborID quotas
 //! - Eviction policy for when quotas are exceeded
 //!
@@ -14,16 +14,60 @@
 //! This prioritizes keeping undelivered messages in cache.
 
 use rusqlite::Connection;
+use rusqlite::types::Type;
+use std::collections::HashSet;
 use std::fmt;
 
-/// Parse a 32-byte ID from a database row, returning None if invalid length
-fn parse_id(id_vec: &[u8]) -> Option<[u8; 32]> {
-    if id_vec.len() != 32 {
-        return None;
+use crate::security::PacketId;
+
+fn conversion_error(
+    column_idx: usize,
+    column_name: &str,
+    column_type: Type,
+    message: impl Into<String>,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column_idx,
+        column_type,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: {}", column_name, message.into()),
+        )),
+    )
+}
+
+fn parse_fixed_id<const N: usize>(
+    id_vec: &[u8],
+    column_idx: usize,
+    column_name: &str,
+) -> Result<[u8; N], rusqlite::Error> {
+    if id_vec.len() != N {
+        return Err(conversion_error(
+            column_idx,
+            column_name,
+            Type::Blob,
+            format!("expected {} bytes, got {}", N, id_vec.len()),
+        ));
     }
-    let mut id = [0u8; 32];
+    let mut id = [0u8; N];
     id.copy_from_slice(id_vec);
-    Some(id)
+    Ok(id)
+}
+
+fn parse_non_negative_u64(
+    value: i64,
+    column_idx: usize,
+    column_name: &str,
+) -> Result<u64, rusqlite::Error> {
+    if value < 0 {
+        return Err(conversion_error(
+            column_idx,
+            column_name,
+            Type::Integer,
+            format!("expected non-negative integer, got {}", value),
+        ));
+    }
+    Ok(value as u64)
 }
 
 /// Storage configuration
@@ -50,8 +94,8 @@ impl StorageConfig {
     /// intentionally not configurable by the user.
     pub fn mobile() -> Self {
         Self {
-            max_total_bytes: Self::MIN_STORAGE_BYTES,     // 10 GB
-            max_per_harbor_bytes: 100 * 1024 * 1024,      // 100 MB per topic
+            max_total_bytes: Self::MIN_STORAGE_BYTES, // 10 GB
+            max_per_harbor_bytes: 100 * 1024 * 1024,  // 100 MB per topic
             enabled: true,
         }
     }
@@ -59,8 +103,8 @@ impl StorageConfig {
     /// Desktop configuration (50GB default, user configurable)
     pub fn desktop() -> Self {
         Self {
-            max_total_bytes: 50 * 1024 * 1024 * 1024,     // 50 GB
-            max_per_harbor_bytes: 500 * 1024 * 1024,      // 500 MB per topic
+            max_total_bytes: 50 * 1024 * 1024 * 1024, // 50 GB
+            max_per_harbor_bytes: 500 * 1024 * 1024,  // 500 MB per topic
             enabled: true,
         }
     }
@@ -96,8 +140,8 @@ impl StorageConfig {
     /// Testing configuration (small limits)
     pub fn for_testing() -> Self {
         Self {
-            max_total_bytes: 10 * 1024 * 1024,            // 10 MB
-            max_per_harbor_bytes: 1024 * 1024,             // 1 MB per topic
+            max_total_bytes: 10 * 1024 * 1024, // 10 MB
+            max_per_harbor_bytes: 1024 * 1024, // 1 MB per topic
             enabled: true,
         }
     }
@@ -156,6 +200,8 @@ impl StorageManager {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        let total_bytes = parse_non_negative_u64(total_bytes, 0, "total_bytes")?;
+        let packet_count = parse_non_negative_u64(packet_count, 1, "packet_count")?;
 
         // Harbor count
         let harbor_count: i64 = conn.query_row(
@@ -163,6 +209,7 @@ impl StorageManager {
             [],
             |row| row.get(0),
         )?;
+        let harbor_count = parse_non_negative_u64(harbor_count, 0, "harbor_count")?;
 
         // Per-harbor breakdown (top 10)
         let mut stmt = conn.prepare(
@@ -170,25 +217,24 @@ impl StorageManager {
              FROM harbor_cache
              GROUP BY harbor_id
              ORDER BY bytes DESC
-             LIMIT 10"
+             LIMIT 10",
         )?;
 
-        let per_harbor: Vec<([u8; 32], u64)> = stmt
-            .query_map([], |row| {
-                let harbor_id: Vec<u8> = row.get(0)?;
-                let bytes: i64 = row.get(1)?;
-                Ok((harbor_id, bytes as u64))
-            })?
-            .filter_map(|r| r.ok())
-            .filter_map(|(id_vec, bytes)| {
-                parse_id(&id_vec).map(|id| (id, bytes))
-            })
-            .collect();
+        let mut per_harbor = Vec::new();
+        for row_result in stmt.query_map([], |row| {
+            let harbor_id: Vec<u8> = row.get(0)?;
+            let bytes: i64 = row.get(1)?;
+            let harbor_id = parse_fixed_id::<32>(&harbor_id, 0, "harbor_id")?;
+            let bytes = parse_non_negative_u64(bytes, 1, "bytes")?;
+            Ok((harbor_id, bytes))
+        })? {
+            per_harbor.push(row_result?);
+        }
 
         Ok(StorageStats {
-            total_bytes: total_bytes as u64,
-            packet_count: packet_count as u64,
-            harbor_count: harbor_count as u64,
+            total_bytes,
+            packet_count,
+            harbor_count,
             per_harbor,
         })
     }
@@ -207,7 +253,16 @@ impl StorageManager {
         let stats = self.get_stats(conn)?;
 
         // Check total limit
-        if stats.total_bytes + packet_size > self.config.max_total_bytes {
+        let projected_total = match stats.total_bytes.checked_add(packet_size) {
+            Some(v) => v,
+            None => {
+                return Ok(StorageCheckResult::TotalLimitExceeded {
+                    current: stats.total_bytes,
+                    limit: self.config.max_total_bytes,
+                });
+            }
+        };
+        if projected_total > self.config.max_total_bytes {
             return Ok(StorageCheckResult::TotalLimitExceeded {
                 current: stats.total_bytes,
                 limit: self.config.max_total_bytes,
@@ -216,7 +271,17 @@ impl StorageManager {
 
         // Check per-harbor limit
         let harbor_bytes = self.get_harbor_bytes(conn, harbor_id)?;
-        if harbor_bytes + packet_size > self.config.max_per_harbor_bytes {
+        let projected_harbor = match harbor_bytes.checked_add(packet_size) {
+            Some(v) => v,
+            None => {
+                return Ok(StorageCheckResult::HarborLimitExceeded {
+                    harbor_id: *harbor_id,
+                    current: harbor_bytes,
+                    limit: self.config.max_per_harbor_bytes,
+                });
+            }
+        };
+        if projected_harbor > self.config.max_per_harbor_bytes {
             return Ok(StorageCheckResult::HarborLimitExceeded {
                 harbor_id: *harbor_id,
                 current: harbor_bytes,
@@ -240,7 +305,7 @@ impl StorageManager {
             [harbor_id.as_slice()],
             |row| row.get(0),
         )?;
-        Ok(bytes as u64)
+        parse_non_negative_u64(bytes, 0, "harbor_bytes")
     }
 
     /// Evict packets to make room for new data
@@ -255,7 +320,7 @@ impl StorageManager {
         }
 
         let stats = self.get_stats(conn)?;
-        
+
         // Calculate how much we need to free
         let target = self.config.max_total_bytes.saturating_sub(needed_bytes);
         if stats.total_bytes <= target {
@@ -274,7 +339,8 @@ impl StorageManager {
         bytes_to_free: u64,
     ) -> Result<usize, rusqlite::Error> {
         // Collect packets to evict before starting transaction
-        let mut to_evict: Vec<([u8; 32], u64)> = Vec::new();
+        let mut to_evict: Vec<(PacketId, u64)> = Vec::new();
+        let mut seen_packet_ids: HashSet<PacketId> = HashSet::new();
         let mut freed = 0u64;
 
         // First, try fully-delivered packets (oldest first)
@@ -286,27 +352,27 @@ impl StorageManager {
                      SELECT 1 FROM harbor_recipients r 
                      WHERE r.packet_id = c.packet_id AND r.delivered = 0
                  )
-                 ORDER BY c.created_at ASC"
+                 ORDER BY c.created_at ASC",
             )?;
 
-            let packets: Vec<([u8; 32], u64)> = stmt
-                .query_map([], |row| {
-                    let id: Vec<u8> = row.get(0)?;
-                    let size: i64 = row.get(1)?;
-                    Ok((id, size as u64))
-                })?
-                .filter_map(|r| r.ok())
-                .filter_map(|(id_vec, size)| {
-                    parse_id(&id_vec).map(|id| (id, size))
-                })
-                .collect();
+            let mut packets: Vec<(PacketId, u64)> = Vec::new();
+            for row_result in stmt.query_map([], |row| {
+                let id: Vec<u8> = row.get(0)?;
+                let size: i64 = row.get(1)?;
+                let packet_id = parse_fixed_id::<16>(&id, 0, "packet_id")?;
+                let size = parse_non_negative_u64(size, 1, "packet_size")?;
+                Ok((packet_id, size))
+            })? {
+                packets.push(row_result?);
+            }
 
             for (packet_id, size) in packets {
                 if freed >= bytes_to_free {
                     break;
                 }
+                seen_packet_ids.insert(packet_id);
                 to_evict.push((packet_id, size));
-                freed += size;
+                freed = freed.saturating_add(size);
             }
         }
 
@@ -315,29 +381,28 @@ impl StorageManager {
             let mut stmt = conn.prepare(
                 "SELECT packet_id, LENGTH(packet_data) as size
                  FROM harbor_cache
-                 ORDER BY created_at ASC"
+                 ORDER BY created_at ASC",
             )?;
 
-            let packets: Vec<([u8; 32], u64)> = stmt
-                .query_map([], |row| {
-                    let id: Vec<u8> = row.get(0)?;
-                    let size: i64 = row.get(1)?;
-                    Ok((id, size as u64))
-                })?
-                .filter_map(|r| r.ok())
-                .filter_map(|(id_vec, size)| {
-                    parse_id(&id_vec).map(|id| (id, size))
-                })
-                .collect();
+            let mut packets: Vec<(PacketId, u64)> = Vec::new();
+            for row_result in stmt.query_map([], |row| {
+                let id: Vec<u8> = row.get(0)?;
+                let size: i64 = row.get(1)?;
+                let packet_id = parse_fixed_id::<16>(&id, 0, "packet_id")?;
+                let size = parse_non_negative_u64(size, 1, "packet_size")?;
+                Ok((packet_id, size))
+            })? {
+                packets.push(row_result?);
+            }
 
             for (packet_id, size) in packets {
                 if freed >= bytes_to_free {
                     break;
                 }
                 // Skip if already marked for eviction
-                if !to_evict.iter().any(|(id, _)| id == &packet_id) {
+                if seen_packet_ids.insert(packet_id) {
                     to_evict.push((packet_id, size));
-                    freed += size;
+                    freed = freed.saturating_add(size);
                 }
             }
         }
@@ -368,8 +433,11 @@ impl StorageManager {
         }
 
         let current = self.get_harbor_bytes(conn, harbor_id)?;
-        let target = self.config.max_per_harbor_bytes.saturating_sub(needed_bytes);
-        
+        let target = self
+            .config
+            .max_per_harbor_bytes
+            .saturating_sub(needed_bytes);
+
         if current <= target {
             return Ok(0);
         }
@@ -377,26 +445,25 @@ impl StorageManager {
         let to_free = current - target;
 
         // Collect packets to evict
-        let to_evict: Vec<[u8; 32]>;
+        let to_evict: Vec<PacketId>;
         {
             let mut stmt = conn.prepare(
                 "SELECT packet_id, LENGTH(packet_data) as size
                  FROM harbor_cache
                  WHERE harbor_id = ?1
-                 ORDER BY created_at ASC"
+                 ORDER BY created_at ASC",
             )?;
 
-            let packets: Vec<([u8; 32], u64)> = stmt
-                .query_map([harbor_id.as_slice()], |row| {
-                    let id: Vec<u8> = row.get(0)?;
-                    let size: i64 = row.get(1)?;
-                    Ok((id, size as u64))
-                })?
-                .filter_map(|r| r.ok())
-                .filter_map(|(id_vec, size)| {
-                    parse_id(&id_vec).map(|id| (id, size))
-                })
-                .collect();
+            let mut packets: Vec<(PacketId, u64)> = Vec::new();
+            for row_result in stmt.query_map([harbor_id.as_slice()], |row| {
+                let id: Vec<u8> = row.get(0)?;
+                let size: i64 = row.get(1)?;
+                let packet_id = parse_fixed_id::<16>(&id, 0, "packet_id")?;
+                let size = parse_non_negative_u64(size, 1, "packet_size")?;
+                Ok((packet_id, size))
+            })? {
+                packets.push(row_result?);
+            }
 
             let mut freed = 0u64;
             to_evict = packets
@@ -405,7 +472,7 @@ impl StorageManager {
                     if freed >= to_free {
                         return false;
                     }
-                    freed += size;
+                    freed = freed.saturating_add(*size);
                     true
                 })
                 .map(|(id, _)| id)
@@ -438,10 +505,7 @@ pub enum StorageCheckResult {
     /// Storage is allowed
     Allowed,
     /// Total storage limit exceeded
-    TotalLimitExceeded {
-        current: u64,
-        limit: u64,
-    },
+    TotalLimitExceeded { current: u64, limit: u64 },
     /// Per-HarborID limit exceeded
     HarborLimitExceeded {
         harbor_id: [u8; 32],
@@ -487,8 +551,9 @@ impl fmt::Display for StorageCheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::schema::{create_harbor_table, create_peer_table};
     use crate::data::harbor::cache_packet;
+    use crate::data::schema::{create_harbor_table, create_peer_table};
+    use crate::security::PacketId;
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -500,6 +565,10 @@ mod tests {
 
     fn test_id(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    fn test_packet_id(seed: u8) -> PacketId {
+        [seed; 16]
     }
 
     #[test]
@@ -522,23 +591,25 @@ mod tests {
         let data = vec![0u8; 1000];
         cache_packet(
             &mut conn,
-            &test_id(1),
+            &test_packet_id(1),
             &test_id(10),
             &test_id(20),
             &data,
             &[test_id(30)],
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         cache_packet(
             &mut conn,
-            &test_id(2),
+            &test_packet_id(2),
             &test_id(10),
             &test_id(21),
             &data,
             &[test_id(30)],
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         let stats = manager.get_stats(&conn).unwrap();
         assert_eq!(stats.total_bytes, 2000);
@@ -574,17 +645,21 @@ mod tests {
         let data = vec![0u8; 1000];
         cache_packet(
             &mut conn,
-            &test_id(1),
+            &test_packet_id(1),
             &test_id(10),
             &test_id(20),
             &data,
             &[test_id(30)],
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should fail - would exceed total
         let result = manager.can_store(&conn, &test_id(10), 600).unwrap();
-        assert!(matches!(result, StorageCheckResult::TotalLimitExceeded { .. }));
+        assert!(matches!(
+            result,
+            StorageCheckResult::TotalLimitExceeded { .. }
+        ));
 
         // Smaller should pass
         let result = manager.can_store(&conn, &test_id(10), 400).unwrap();
@@ -605,17 +680,21 @@ mod tests {
         let data = vec![0u8; 1000];
         cache_packet(
             &mut conn,
-            &test_id(1),
+            &test_packet_id(1),
             &test_id(10),
             &test_id(20),
             &data,
             &[test_id(30)],
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Same harbor should fail
         let result = manager.can_store(&conn, &test_id(10), 600).unwrap();
-        assert!(matches!(result, StorageCheckResult::HarborLimitExceeded { .. }));
+        assert!(matches!(
+            result,
+            StorageCheckResult::HarborLimitExceeded { .. }
+        ));
 
         // Different harbor should pass
         let result = manager.can_store(&conn, &test_id(11), 600).unwrap();
@@ -637,13 +716,14 @@ mod tests {
         for i in 0..3 {
             cache_packet(
                 &mut conn,
-                &test_id(i),
+                &test_packet_id(i),
                 &test_id(10),
                 &test_id(20),
                 &data,
                 &[test_id(30)],
                 false,
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Need 1000 more bytes, so need to free ~1500 to get under 2500-1000=1500
@@ -668,27 +748,31 @@ mod tests {
         let data = vec![0u8; 1000];
         cache_packet(
             &mut conn,
-            &test_id(1),
+            &test_packet_id(1),
             &test_id(10),
             &test_id(20),
             &data,
             &[test_id(30)],
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         cache_packet(
             &mut conn,
-            &test_id(2),
+            &test_packet_id(2),
             &test_id(10),
             &test_id(21),
             &data,
             &[test_id(30)],
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Harbor 10 has 2000 bytes, limit is 1500
         // Need room for 500 more
-        let evicted = manager.evict_for_harbor(&mut conn, &test_id(10), 500).unwrap();
+        let evicted = manager
+            .evict_for_harbor(&mut conn, &test_id(10), 500)
+            .unwrap();
         assert!(evicted > 0);
     }
 
@@ -730,17 +814,21 @@ mod tests {
     #[test]
     fn test_storage_check_result_is_allowed() {
         assert!(StorageCheckResult::Allowed.is_allowed());
-        assert!(!StorageCheckResult::TotalLimitExceeded {
-            current: 100,
-            limit: 50,
-        }
-        .is_allowed());
-        assert!(!StorageCheckResult::HarborLimitExceeded {
-            harbor_id: test_id(1),
-            current: 100,
-            limit: 50,
-        }
-        .is_allowed());
+        assert!(
+            !StorageCheckResult::TotalLimitExceeded {
+                current: 100,
+                limit: 50,
+            }
+            .is_allowed()
+        );
+        assert!(
+            !StorageCheckResult::HarborLimitExceeded {
+                harbor_id: test_id(1),
+                current: 100,
+                limit: 50,
+            }
+            .is_allowed()
+        );
     }
 
     #[test]
@@ -757,7 +845,7 @@ mod tests {
         let data = vec![0u8; 100];
         cache_packet(
             &mut conn,
-            &test_id(1),
+            &test_packet_id(1),
             &test_id(10),
             &test_id(20),
             &data,
@@ -849,7 +937,7 @@ mod tests {
         for harbor_seed in 10..15 {
             cache_packet(
                 &mut conn,
-                &test_id(harbor_seed),
+                &test_packet_id(harbor_seed),
                 &test_id(harbor_seed),
                 &test_id(20),
                 &data,
@@ -875,5 +963,89 @@ mod tests {
         // Even with data, eviction should do nothing when disabled
         let evicted = manager.evict_if_needed(&mut conn, u64::MAX).unwrap();
         assert_eq!(evicted, 0);
+    }
+
+    #[test]
+    fn test_get_stats_rejects_malformed_harbor_id() {
+        let conn = setup_db();
+        let manager = StorageManager::new(StorageConfig::for_testing());
+
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute("PRAGMA ignore_check_constraints = ON", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO harbor_cache
+             (packet_id, harbor_id, sender_peer_id, packet_data, synced, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, 0, 1, 0)",
+            rusqlite::params![
+                vec![1u8; 16],
+                vec![2u8; 31], // invalid harbor_id length
+                1_i64,
+                vec![9u8; 16],
+            ],
+        )
+        .unwrap();
+
+        let result = manager.get_stats(&conn);
+        assert!(result.is_err(), "malformed harbor_id should fail-closed");
+    }
+
+    #[test]
+    fn test_can_store_detects_addition_overflow() {
+        let mut conn = setup_db();
+        let config = StorageConfig {
+            max_total_bytes: u64::MAX,
+            max_per_harbor_bytes: u64::MAX,
+            enabled: true,
+        };
+        let manager = StorageManager::new(config);
+
+        cache_packet(
+            &mut conn,
+            &test_packet_id(1),
+            &test_id(10),
+            &test_id(20),
+            &[1u8],
+            &[test_id(30)],
+            false,
+        )
+        .unwrap();
+
+        // Existing bytes + packet_size would overflow u64; treat as exceeded.
+        let result = manager.can_store(&conn, &test_id(10), u64::MAX).unwrap();
+        assert!(matches!(
+            result,
+            StorageCheckResult::TotalLimitExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn test_evict_if_needed_rejects_malformed_packet_id() {
+        let mut conn = setup_db();
+        let config = StorageConfig {
+            max_total_bytes: 10,
+            max_per_harbor_bytes: 10,
+            enabled: true,
+        };
+        let manager = StorageManager::new(config);
+
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute("PRAGMA ignore_check_constraints = ON", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO harbor_cache
+             (packet_id, harbor_id, sender_peer_id, packet_data, synced, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, 0, 1, 0)",
+            rusqlite::params![
+                vec![1u8; 15], // invalid packet_id length
+                vec![2u8; 32],
+                1_i64,
+                vec![9u8; 64],
+            ],
+        )
+        .unwrap();
+
+        let result = manager.evict_if_needed(&mut conn, 1);
+        assert!(result.is_err(), "malformed packet_id should fail-closed");
     }
 }

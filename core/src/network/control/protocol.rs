@@ -1,7 +1,8 @@
 //! Control protocol wire format
 //!
 //! Uses irpc for typed RPC over QUIC bi-streams.
-//! One-off exchanges: open connection, send message, get ack, close.
+//! Typical flow is request/ack per message; a connection may carry
+//! one or multiple sequential control requests.
 //!
 //! Message types:
 //! - Connect Request/Accept/Decline: Peer-level connection handshake
@@ -327,6 +328,7 @@ pub enum ControlRpcProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::packet::{PacketType, VerificationMode};
 
     /// Create a dummy PoW for tests (difficulty 0 = always passes)
     fn test_pow() -> ProofOfWork {
@@ -405,6 +407,38 @@ mod tests {
     }
 
     #[test]
+    fn test_connect_accept_serialization() {
+        let accept = ConnectAccept {
+            request_id: [3u8; 32],
+            sender_id: [4u8; 32],
+            display_name: Some("Bob".to_string()),
+            relay_url: Some("https://relay.accept".to_string()),
+            pow: test_pow(),
+        };
+        let bytes = postcard::to_allocvec(&accept).unwrap();
+        let decoded: ConnectAccept = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.request_id, accept.request_id);
+        assert_eq!(decoded.sender_id, accept.sender_id);
+        assert_eq!(decoded.display_name, accept.display_name);
+        assert_eq!(decoded.relay_url, accept.relay_url);
+    }
+
+    #[test]
+    fn test_connect_decline_serialization() {
+        let decline = ConnectDecline {
+            request_id: [5u8; 32],
+            sender_id: [6u8; 32],
+            reason: Some("busy".to_string()),
+            pow: test_pow(),
+        };
+        let bytes = postcard::to_allocvec(&decline).unwrap();
+        let decoded: ConnectDecline = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.request_id, decline.request_id);
+        assert_eq!(decoded.sender_id, decline.sender_id);
+        assert_eq!(decoded.reason, decline.reason);
+    }
+
+    #[test]
     fn test_topic_invite_serialization() {
         let invite = TopicInvite {
             message_id: [1u8; 32],
@@ -450,6 +484,30 @@ mod tests {
     }
 
     #[test]
+    fn test_topic_leave_serialization() {
+        use crate::network::membership::create_membership_proof;
+        use crate::security::harbor_id_from_topic;
+
+        let topic_id = [7u8; 32];
+        let harbor_id = harbor_id_from_topic(&topic_id);
+        let sender_id = [8u8; 32];
+        let leave = TopicLeave {
+            message_id: [9u8; 32],
+            harbor_id,
+            sender_id,
+            epoch: 3,
+            membership_proof: create_membership_proof(&topic_id, &harbor_id, &sender_id),
+            pow: test_pow(),
+        };
+        let bytes = postcard::to_allocvec(&leave).unwrap();
+        let decoded: TopicLeave = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.message_id, leave.message_id);
+        assert_eq!(decoded.harbor_id, leave.harbor_id);
+        assert_eq!(decoded.sender_id, leave.sender_id);
+        assert_eq!(decoded.epoch, leave.epoch);
+    }
+
+    #[test]
     fn test_remove_member_serialization() {
         use crate::network::membership::create_membership_proof;
         use crate::security::harbor_id_from_topic;
@@ -489,5 +547,41 @@ mod tests {
         let decoded: Suggest = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.suggested_peer, suggest.suggested_peer);
         assert_eq!(decoded.note, suggest.note);
+    }
+
+    #[test]
+    fn test_control_packet_type_matches_packet_type_mapping() {
+        let cases = [
+            (
+                ControlPacketType::ConnectRequest,
+                PacketType::ConnectRequest,
+            ),
+            (ControlPacketType::ConnectAccept, PacketType::ConnectAccept),
+            (
+                ControlPacketType::ConnectDecline,
+                PacketType::ConnectDecline,
+            ),
+            (ControlPacketType::TopicInvite, PacketType::TopicInvite),
+            (ControlPacketType::TopicJoin, PacketType::TopicJoin),
+            (ControlPacketType::TopicLeave, PacketType::TopicLeave),
+            (ControlPacketType::RemoveMember, PacketType::RemoveMember),
+            (ControlPacketType::Suggest, PacketType::Suggest),
+        ];
+
+        for (control_type, packet_type) in cases {
+            assert_eq!(
+                ControlPacketType::from_byte(control_type as u8),
+                Some(control_type)
+            );
+            assert_eq!(PacketType::from_byte(control_type as u8), Some(packet_type));
+            assert_eq!(packet_type.as_byte(), control_type as u8);
+
+            let expected = if control_type.is_mac_only() {
+                VerificationMode::MacOnly
+            } else {
+                VerificationMode::Full
+            };
+            assert_eq!(packet_type.verification_mode(), expected);
+        }
     }
 }

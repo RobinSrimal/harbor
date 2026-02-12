@@ -12,7 +12,9 @@ use tracing::{debug, trace};
 
 use crate::data::current_timestamp;
 use crate::network::dht::Id;
-use crate::network::dht::protocol::{FindNodeResponse, NodeInfo, RpcMessage, RpcProtocol};
+use crate::network::dht::protocol::{
+    FindNodeResponse, MAX_FIND_NODE_RESULTS, NodeInfo, RpcMessage, RpcProtocol,
+};
 use crate::network::dht::service::DhtService;
 
 use crate::protocol::ProtocolError;
@@ -69,7 +71,11 @@ impl DhtService {
                             "DHT FindNode rejected: insufficient PoW"
                         );
                         // Return empty response on PoW failure
-                        find_node_msg.tx.send(FindNodeResponse { nodes: vec![] }).await.ok();
+                        find_node_msg
+                            .tx
+                            .send(FindNodeResponse { nodes: vec![] })
+                            .await
+                            .ok();
                         continue;
                     }
 
@@ -84,11 +90,10 @@ impl DhtService {
                     // handle_find_node_request:
                     // 1. Adds the requester to our routing table (if provided)
                     // 2. Returns NodeInfo WITH relay URLs (critical for peer discovery)
-                    let response = match self.handle_find_node_request(
-                        target,
-                        requester,
-                        requester_relay_url.clone(),
-                    ).await {
+                    let response = match self
+                        .handle_find_node_request(target, requester, requester_relay_url.clone())
+                        .await
+                    {
                         Ok(nodes) => {
                             let with_relay = nodes.iter().filter(|n| n.relay_url.is_some()).count();
                             trace!(
@@ -130,15 +135,11 @@ impl DhtService {
     }
 
     /// Helper: find closest nodes from database (fallback when DHT actor unavailable)
-    async fn find_closest_from_db(
-        db: &Arc<Mutex<DbConnection>>,
-        target: &Id,
-    ) -> FindNodeResponse {
+    async fn find_closest_from_db(db: &Arc<Mutex<DbConnection>>, target: &Id) -> FindNodeResponse {
         let db_lock = db.lock().await;
 
         // Load DHT entries from database
-        let entries = crate::data::dht::get_all_entries(&db_lock)
-            .unwrap_or_default();
+        let entries = crate::data::dht::get_all_entries(&db_lock).unwrap_or_default();
 
         // Convert to IDs and find closest to target
         let mut nodes_with_distance: Vec<_> = entries
@@ -154,7 +155,7 @@ impl DhtService {
         nodes_with_distance.sort_by(|a, b| a.0.cmp(&b.0));
         let closest: Vec<NodeInfo> = nodes_with_distance
             .into_iter()
-            .take(20) // K = 20
+            .take(MAX_FIND_NODE_RESULTS)
             .map(|(_, id)| NodeInfo {
                 node_id: id,
                 addresses: Vec::new(),
@@ -174,7 +175,9 @@ impl DhtService {
 #[cfg(test)]
 mod tests {
     use crate::network::dht::Id;
-    use crate::network::dht::protocol::{FindNode, FindNodeResponse, NodeInfo};
+    use crate::network::dht::protocol::{
+        FindNode, FindNodeResponse, MAX_FIND_NODE_RESULTS, NodeInfo,
+    };
     use crate::resilience::ProofOfWork;
 
     fn make_id(seed: u8) -> [u8; 32] {
@@ -286,9 +289,9 @@ mod tests {
     fn test_max_response_size_check() {
         const MAX_SIZE: usize = 65536;
 
-        let nodes: Vec<NodeInfo> = (0..20u8)
+        let nodes: Vec<NodeInfo> = (0..MAX_FIND_NODE_RESULTS)
             .map(|i| NodeInfo {
-                node_id: make_id(i),
+                node_id: make_id(u8::try_from(i).expect("MAX_FIND_NODE_RESULTS must fit in u8")),
                 addresses: vec!["192.168.1.1:4433".to_string()],
                 relay_url: Some("https://relay.example.com/".to_string()),
             })
@@ -297,7 +300,11 @@ mod tests {
         let response = FindNodeResponse { nodes };
         let bytes = postcard::to_allocvec(&response).unwrap();
 
-        assert!(bytes.len() < MAX_SIZE, "Response {} bytes exceeds limit", bytes.len());
+        assert!(
+            bytes.len() < MAX_SIZE,
+            "Response {} bytes exceeds limit",
+            bytes.len()
+        );
     }
 
     #[test]
@@ -320,11 +327,7 @@ mod tests {
 
     #[test]
     fn test_node_info_from_closest() {
-        let entries = vec![
-            make_id(1),
-            make_id(2),
-            make_id(3),
-        ];
+        let entries = vec![make_id(1), make_id(2), make_id(3)];
 
         let nodes: Vec<NodeInfo> = entries
             .iter()

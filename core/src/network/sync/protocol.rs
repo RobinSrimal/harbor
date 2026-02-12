@@ -187,27 +187,27 @@ mod tests {
         let update = SyncMessage::Update(SyncUpdate {
             data: vec![1, 2, 3, 4, 5],
         });
-        
+
         let encoded = update.encode();
         assert_eq!(encoded[0], SYNC_MESSAGE_PREFIX);
-        
+
         let decoded = SyncMessage::decode(&encoded).unwrap();
         match decoded {
             SyncMessage::Update(u) => assert_eq!(u.data, vec![1, 2, 3, 4, 5]),
             _ => panic!("wrong type"),
         }
     }
-    
+
     #[test]
     fn test_initial_sync_request_roundtrip() {
         let request = SyncMessage::InitialSyncRequest(InitialSyncRequest {
             request_id: [42u8; 32],
             version: vec![10, 20, 30],
         });
-        
+
         let encoded = request.encode();
         let decoded = SyncMessage::decode(&encoded).unwrap();
-        
+
         match decoded {
             SyncMessage::InitialSyncRequest(r) => {
                 assert_eq!(r.request_id, [42u8; 32]);
@@ -216,28 +216,35 @@ mod tests {
             _ => panic!("wrong type"),
         }
     }
-    
+
     #[test]
     fn test_initial_sync_response_roundtrip() {
         let response = InitialSyncResponse {
             request_id: [99u8; 32],
             snapshot: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         };
-        
+
         let encoded = response.encode();
         let decoded = InitialSyncResponse::decode(&encoded).unwrap();
-        
+
         assert_eq!(decoded.request_id, [99u8; 32]);
         assert_eq!(decoded.snapshot, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
-    
+
     #[test]
     fn test_is_sync_message() {
-        assert!(SyncMessage::is_sync_message(&[SYNC_MESSAGE_PREFIX, 0, 0, 0, 0, 0]));
+        assert!(SyncMessage::is_sync_message(&[
+            SYNC_MESSAGE_PREFIX,
+            0,
+            0,
+            0,
+            0,
+            0
+        ]));
         assert!(!SyncMessage::is_sync_message(&[0x00, 1, 2, 3]));
         assert!(!SyncMessage::is_sync_message(&[]));
     }
-    
+
     #[test]
     fn test_decode_too_short() {
         // Less than 6 bytes should fail
@@ -250,7 +257,7 @@ mod tests {
             Err(DecodeError::TooShort)
         ));
     }
-    
+
     #[test]
     fn test_decode_invalid_prefix() {
         let bytes = vec![0x00, 0x01, 0, 0, 0, 5, 1, 2, 3, 4, 5];
@@ -259,7 +266,7 @@ mod tests {
             Err(DecodeError::InvalidPrefix)
         ));
     }
-    
+
     #[test]
     fn test_decode_invalid_type() {
         // Type byte 0xFF is invalid
@@ -269,7 +276,7 @@ mod tests {
             Err(DecodeError::InvalidType)
         ));
     }
-    
+
     #[test]
     fn test_decode_truncated_payload() {
         // Header says 100 bytes but only 5 provided
@@ -279,35 +286,41 @@ mod tests {
             Err(DecodeError::TooShort)
         ));
     }
-    
+
     #[test]
     fn test_sync_message_type_conversion() {
         assert_eq!(SyncMessageType::try_from(0x01), Ok(SyncMessageType::Update));
-        assert_eq!(SyncMessageType::try_from(0x02), Ok(SyncMessageType::InitialSyncRequest));
-        assert_eq!(SyncMessageType::try_from(0x03), Ok(SyncMessageType::InitialSyncResponse));
+        assert_eq!(
+            SyncMessageType::try_from(0x02),
+            Ok(SyncMessageType::InitialSyncRequest)
+        );
+        assert_eq!(
+            SyncMessageType::try_from(0x03),
+            Ok(SyncMessageType::InitialSyncResponse)
+        );
         assert!(SyncMessageType::try_from(0x00).is_err());
         assert!(SyncMessageType::try_from(0x04).is_err());
         assert!(SyncMessageType::try_from(0xFF).is_err());
     }
-    
+
     #[test]
     fn test_large_update_roundtrip() {
         // Test with larger payload (simulating real Loro data)
         let large_data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
-        
+
         let update = SyncMessage::Update(SyncUpdate {
             data: large_data.clone(),
         });
-        
+
         let encoded = update.encode();
         let decoded = SyncMessage::decode(&encoded).unwrap();
-        
+
         match decoded {
             SyncMessage::Update(u) => assert_eq!(u.data, large_data),
             _ => panic!("wrong type"),
         }
     }
-    
+
     #[test]
     fn test_initial_sync_response_decode_invalid_type() {
         // First byte should be InitialSyncResponse type
@@ -317,7 +330,7 @@ mod tests {
             Err(DecodeError::InvalidType)
         ));
     }
-    
+
     #[test]
     fn test_initial_sync_response_decode_too_short() {
         assert!(matches!(
@@ -325,20 +338,17 @@ mod tests {
             Err(DecodeError::TooShort)
         ));
     }
-    
+
     #[test]
     fn test_empty_update() {
-        let update = SyncMessage::Update(SyncUpdate {
-            data: vec![],
-        });
-        
+        let update = SyncMessage::Update(SyncUpdate { data: vec![] });
+
         let encoded = update.encode();
         let decoded = SyncMessage::decode(&encoded).unwrap();
-        
+
         match decoded {
             SyncMessage::Update(u) => assert!(u.data.is_empty()),
             _ => panic!("wrong type"),
         }
     }
 }
-

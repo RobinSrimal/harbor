@@ -1,8 +1,8 @@
 //! Protocol event handling for CLI
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
 use harbor_core::{Protocol, ProtocolEvent};
@@ -93,7 +93,9 @@ async fn handle_event(protocol: Arc<Protocol>, active_tracks: ActiveTracks, even
             tokio::spawn(async move {
                 match p.accept_stream(&rid).await {
                     Ok(()) => info!(request_id = %hex::encode(&rid[..8]), "Stream auto-accepted"),
-                    Err(e) => warn!(request_id = %hex::encode(&rid[..8]), error = %e, "Stream auto-accept failed"),
+                    Err(e) => {
+                        warn!(request_id = %hex::encode(&rid[..8]), error = %e, "Stream auto-accept failed")
+                    }
                 }
             });
         }
@@ -165,7 +167,10 @@ async fn handle_event(protocol: Arc<Protocol>, active_tracks: ActiveTracks, even
                         let mut result = None;
                         for attempt in 0..10 {
                             match p.consume_stream(&rid, "test").await {
-                                Ok(b) => { result = Some(b); break; }
+                                Ok(b) => {
+                                    result = Some(b);
+                                    break;
+                                }
                                 Err(_) if attempt < 9 => {
                                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 }
@@ -178,7 +183,10 @@ async fn handle_event(protocol: Arc<Protocol>, active_tracks: ActiveTracks, even
                         result.unwrap()
                     };
                     info!(request_id = %hex::encode(&rid[..8]), "Stream consumer started");
-                    let mut track = broadcast.subscribe_track(&moq_lite::Track { name: "data".to_string(), priority: 0 });
+                    let mut track = broadcast.subscribe_track(&moq_lite::Track {
+                        name: "data".to_string(),
+                        priority: 0,
+                    });
                     while let Ok(Some(mut group)) = track.next_group().await {
                         while let Ok(Some(frame)) = group.read_frame().await {
                             info!(

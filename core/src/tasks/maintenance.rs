@@ -12,8 +12,8 @@ use crate::data::cleanup_stale_peers;
 use crate::data::harbor::{cleanup_expired, cleanup_old_pulled_packets};
 use crate::network::dht::DhtService;
 
-use std::time::Duration;
 use crate::protocol::Protocol;
+use std::time::Duration;
 
 impl Protocol {
     /// Run the DHT routing table save loop (periodic persistence)
@@ -92,7 +92,10 @@ impl Protocol {
             // 1. Clean expired harbor cache packets
             match cleanup_expired(&db_lock) {
                 Ok(deleted) if deleted > 0 => {
-                    info!(deleted = deleted, "Cleanup: removed {} expired harbor packets", deleted);
+                    info!(
+                        deleted = deleted,
+                        "Cleanup: removed {} expired harbor packets", deleted
+                    );
                 }
                 Ok(_) => {
                     trace!("Cleanup: no expired harbor packets");
@@ -105,7 +108,10 @@ impl Protocol {
             // 2. Clean old pulled packet tracking (same lifetime as harbor packets)
             match cleanup_old_pulled_packets(&db_lock) {
                 Ok(deleted) if deleted > 0 => {
-                    info!(deleted = deleted, "Cleanup: removed {} old pulled packet records", deleted);
+                    info!(
+                        deleted = deleted,
+                        "Cleanup: removed {} old pulled packet records", deleted
+                    );
                 }
                 Ok(_) => {
                     trace!("Cleanup: no old pulled packet records");
@@ -118,7 +124,10 @@ impl Protocol {
             // 4. Clean stale peers (not seen for PEER_RETENTION_SECS)
             match cleanup_stale_peers(&db_lock) {
                 Ok(deleted) if deleted > 0 => {
-                    info!(deleted = deleted, "Cleanup: removed {} stale peers", deleted);
+                    info!(
+                        deleted = deleted,
+                        "Cleanup: removed {} stale peers", deleted
+                    );
                 }
                 Ok(_) => {
                     trace!("Cleanup: no stale peers");
@@ -162,4 +171,3 @@ mod tests {
         assert!(config.dht_save_interval_secs < config.cleanup_interval_secs);
     }
 }
-

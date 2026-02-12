@@ -13,8 +13,8 @@
 //! nonce scheme that guarantees uniqueness.
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Nonce,
+    aead::{Aead, KeyInit, Payload},
 };
 use rand::RngCore;
 
@@ -39,8 +39,12 @@ impl std::fmt::Display for AeadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AeadError::EncryptionFailed => write!(f, "AEAD encryption failed"),
-            AeadError::DecryptionFailed => write!(f, "AEAD decryption failed (authentication error)"),
-            AeadError::CiphertextTooShort => write!(f, "Ciphertext too short (minimum {} bytes)", TAG_SIZE),
+            AeadError::DecryptionFailed => {
+                write!(f, "AEAD decryption failed (authentication error)")
+            }
+            AeadError::CiphertextTooShort => {
+                write!(f, "Ciphertext too short (minimum {} bytes)", TAG_SIZE)
+            }
         }
     }
 }
@@ -88,7 +92,13 @@ pub fn encrypt(
     let nonce = Nonce::from_slice(nonce);
 
     cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| AeadError::EncryptionFailed)
 }
 
@@ -119,7 +129,13 @@ pub fn decrypt(
     let nonce = Nonce::from_slice(nonce);
 
     cipher
-        .decrypt(nonce, Payload { msg: ciphertext, aad })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| AeadError::DecryptionFailed)
 }
 
@@ -358,5 +374,21 @@ mod tests {
 
         // Different nonces should produce different ciphertext
         assert_ne!(ciphertext1, ciphertext2);
+    }
+
+    #[test]
+    fn test_encrypt_known_vector() {
+        let key: [u8; 32] = [0x42; 32];
+        let nonce: [u8; 12] = [0x24; 12];
+        let plaintext = b"Hello, Harbor!";
+        let aad = b"metadata";
+
+        let ciphertext = encrypt(&key, &nonce, plaintext, aad).unwrap();
+        let expected: [u8; 30] = [
+            172, 98, 233, 98, 132, 242, 120, 224, 228, 25, 234, 228, 150, 54, 59, 194, 182, 71,
+            133, 55, 165, 76, 44, 165, 109, 208, 155, 160, 137, 74,
+        ];
+
+        assert_eq!(ciphertext.as_slice(), &expected);
     }
 }

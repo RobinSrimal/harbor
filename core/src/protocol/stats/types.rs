@@ -139,4 +139,3 @@ pub struct TopicSummary {
     /// Number of members
     pub member_count: u32,
 }
-

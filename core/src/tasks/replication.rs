@@ -15,12 +15,10 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::data::send::{
-    get_packets_needing_replication, delete_outgoing_packet,
-};
+use crate::data::send::{delete_outgoing_packet, get_packets_needing_replication};
 use crate::network::harbor::HarborService;
-use crate::resilience::{ProofOfWork, PoWConfig, build_context};
-use crate::security::send::{seal_topic_packet_with_epoch, seal_dm_packet, EpochKeys};
+use crate::resilience::{PoWConfig, ProofOfWork, build_context};
+use crate::security::send::{EpochKeys, seal_dm_packet, seal_topic_packet_with_epoch};
 
 use crate::protocol::Protocol;
 
@@ -72,11 +70,16 @@ impl Protocol {
 
                 // Fallback to DHT lookup if cache is empty (newly subscribed topic)
                 if harbor_nodes.is_empty() {
-                    harbor_nodes = HarborService::find_harbor_nodes_dht(&dht_service, &packet.harbor_id).await;
+                    harbor_nodes =
+                        HarborService::find_harbor_nodes_dht(&dht_service, &packet.harbor_id).await;
                     // Cache the result for next time
                     if !harbor_nodes.is_empty() {
                         let db_lock = db.lock().await;
-                        let _ = crate::data::harbor::replace_harbor_nodes(&db_lock, &packet.harbor_id, &harbor_nodes);
+                        let _ = crate::data::harbor::replace_harbor_nodes(
+                            &db_lock,
+                            &packet.harbor_id,
+                            &harbor_nodes,
+                        );
                     }
                 }
 
@@ -238,8 +241,8 @@ impl Protocol {
 
                 // Create StoreRequest with SEALED packet data and its packet_id
                 let store_req = crate::network::harbor::protocol::StoreRequest {
-                    packet_data: sealed_bytes,  // Sealed, not raw
-                    packet_id: sealed_packet_id,  // Use the packet_id from the sealed packet
+                    packet_data: sealed_bytes,   // Sealed, not raw
+                    packet_id: sealed_packet_id, // Use the packet_id from the sealed packet
                     harbor_id: packet.harbor_id,
                     sender_id: our_id,
                     recipients: unacked_recipients,
@@ -253,7 +256,10 @@ impl Protocol {
                         break;
                     }
 
-                    match harbor_service.send_harbor_store(harbor_node, &store_req).await {
+                    match harbor_service
+                        .send_harbor_store(harbor_node, &store_req)
+                        .await
+                    {
                         Ok(true) => {
                             success_count += 1;
                             trace!(
@@ -330,7 +336,7 @@ mod tests {
         // Testing should have higher replication for reliability
         assert!(config.replication_factor >= 3);
     }
-    
+
     #[test]
     fn test_max_replication_attempts_is_reasonable() {
         let config = ProtocolConfig::default();
@@ -340,4 +346,3 @@ mod tests {
         assert!(config.max_replication_attempts <= 20);
     }
 }
-

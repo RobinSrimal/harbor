@@ -7,12 +7,13 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::data::dht::{current_timestamp, ensure_peer_exists};
+use crate::security::PacketId;
 
 /// Outgoing packet record
 #[derive(Debug, Clone)]
 pub struct OutgoingPacket {
-    /// Unique packet identifier (32 bytes)
-    pub packet_id: [u8; 32],
+    /// Unique packet identifier (16 bytes)
+    pub packet_id: PacketId,
     /// Topic this packet belongs to
     pub topic_id: [u8; 32],
     /// Harbor ID (hash of topic)
@@ -23,7 +24,9 @@ pub struct OutgoingPacket {
     pub created_at: i64,
     /// Whether replicated to Harbor Nodes
     pub replicated_to_harbor: bool,
-    /// Packet type: 0=Content, 1=Join, 2=Leave
+    /// Packet type metadata stored with the packet.
+    ///
+    /// Most current send paths encode message type in `packet_data` and store `0` here.
     pub packet_type: u8,
 }
 
@@ -31,13 +34,27 @@ pub struct OutgoingPacket {
 #[derive(Debug, Clone)]
 pub struct RecipientStatus {
     /// Packet ID
-    pub packet_id: [u8; 32],
+    pub packet_id: PacketId,
     /// Recipient's EndpointID
     pub endpoint_id: [u8; 32],
     /// Whether recipient has acknowledged
     pub acknowledged: bool,
     /// When acknowledged (if applicable)
     pub acknowledged_at: Option<i64>,
+}
+
+/// Parse a 16-byte packet ID from a database blob
+fn parse_packet_id(vec: &[u8], column_name: &str) -> rusqlite::Result<PacketId> {
+    if vec.len() != 16 {
+        return Err(rusqlite::Error::InvalidColumnType(
+            0,
+            column_name.to_string(),
+            rusqlite::types::Type::Blob,
+        ));
+    }
+    let mut id: PacketId = [0u8; 16];
+    id.copy_from_slice(vec);
+    Ok(id)
 }
 
 /// Parse a 32-byte ID from a database blob
@@ -60,9 +77,20 @@ fn parse_outgoing_packet_row(row: &rusqlite::Row) -> rusqlite::Result<OutgoingPa
     let topic_id_vec: Vec<u8> = row.get(1)?;
     let harbor_id_vec: Vec<u8> = row.get(2)?;
 
-    let packet_id = parse_id(&packet_id_vec, "packet_id")?;
+    let packet_id = parse_packet_id(&packet_id_vec, "packet_id")?;
     let topic_id = parse_id(&topic_id_vec, "topic_id")?;
     let harbor_id = parse_id(&harbor_id_vec, "harbor_id")?;
+
+    let replicated_raw: i64 = row.get(5)?;
+    let replicated_to_harbor = match replicated_raw {
+        0 => false,
+        1 => true,
+        _ => return Err(rusqlite::Error::IntegralValueOutOfRange(5, replicated_raw)),
+    };
+
+    let packet_type_raw: i64 = row.get(6)?;
+    let packet_type = u8::try_from(packet_type_raw)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, packet_type_raw))?;
 
     Ok(OutgoingPacket {
         packet_id,
@@ -70,18 +98,18 @@ fn parse_outgoing_packet_row(row: &rusqlite::Row) -> rusqlite::Result<OutgoingPa
         harbor_id,
         packet_data: row.get(3)?,
         created_at: row.get(4)?,
-        replicated_to_harbor: row.get::<_, i32>(5)? != 0,
-        packet_type: row.get::<_, i32>(6)? as u8,
+        replicated_to_harbor,
+        packet_type,
     })
 }
 
 /// Store a new outgoing packet with its recipients
 ///
 /// This operation is atomic - either the packet and all recipients are stored, or none are.
-/// packet_type: 0=Content, 1=Join, 2=Leave (matches HarborPacketType)
+/// `packet_type` is auxiliary metadata for legacy/compatibility tracking.
 pub fn store_outgoing_packet(
     conn: &mut Connection,
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
     topic_id: &[u8; 32],
     harbor_id: &[u8; 32],
     packet_data: &[u8],
@@ -119,7 +147,7 @@ pub fn store_outgoing_packet(
 /// Get an outgoing packet by ID
 pub fn get_outgoing_packet(
     conn: &Connection,
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
 ) -> rusqlite::Result<Option<OutgoingPacket>> {
     conn.query_row(
         "SELECT packet_id, topic_id, harbor_id, packet_data, created_at, replicated_to_harbor, packet_type
@@ -133,7 +161,7 @@ pub fn get_outgoing_packet(
 /// Record a read receipt from a recipient
 pub fn acknowledge_receipt(
     conn: &Connection,
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
     endpoint_id: &[u8; 32],
 ) -> rusqlite::Result<bool> {
     let now = current_timestamp();
@@ -151,41 +179,43 @@ pub fn acknowledge_receipt(
 /// Check if all recipients have acknowledged a packet
 pub fn all_recipients_acknowledged(
     conn: &Connection,
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
 ) -> rusqlite::Result<bool> {
-    let unacked_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM outgoing_recipients 
-         WHERE packet_id = ?1 AND acknowledged = 0",
+    let (packet_exists, has_unacked): (i64, i64) = conn.query_row(
+        "SELECT
+             EXISTS(SELECT 1 FROM outgoing_packets WHERE packet_id = ?1),
+             EXISTS(
+                 SELECT 1 FROM outgoing_recipients
+                 WHERE packet_id = ?1 AND acknowledged = 0
+             )",
         [packet_id.as_slice()],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    Ok(unacked_count == 0)
+    Ok(packet_exists != 0 && has_unacked == 0)
 }
 
 /// Record a read receipt and delete packet if all recipients have acknowledged
 /// Returns: (was_new_ack, was_deleted)
 pub fn acknowledge_and_cleanup_if_complete(
     conn: &Connection,
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
     endpoint_id: &[u8; 32],
 ) -> rusqlite::Result<(bool, bool)> {
     // Record the ack
     let was_new_ack = acknowledge_receipt(conn, packet_id, endpoint_id)?;
-    
+
     // Check if all recipients have now acked
     if all_recipients_acknowledged(conn, packet_id)? {
         // All done - delete the packet
-        delete_outgoing_packet(conn, packet_id)?;
-        Ok((was_new_ack, true))
+        let was_deleted = delete_outgoing_packet(conn, packet_id)?;
+        Ok((was_new_ack, was_deleted))
     } else {
         Ok((was_new_ack, false))
     }
 }
 
 /// Get packets that need harbor replication (not all recipients acknowledged)
-pub fn get_packets_needing_replication(
-    conn: &Connection,
-) -> rusqlite::Result<Vec<OutgoingPacket>> {
+pub fn get_packets_needing_replication(conn: &Connection) -> rusqlite::Result<Vec<OutgoingPacket>> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT p.packet_id, p.topic_id, p.harbor_id, p.packet_data, p.created_at, p.replicated_to_harbor, p.packet_type
          FROM outgoing_packets p
@@ -203,7 +233,7 @@ pub fn get_packets_needing_replication(
 /// Mark a packet as replicated to Harbor Nodes
 pub fn mark_replicated_to_harbor(
     conn: &Connection,
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
 ) -> rusqlite::Result<bool> {
     let rows = conn.execute(
         "UPDATE outgoing_packets SET replicated_to_harbor = 1 WHERE packet_id = ?1",
@@ -215,7 +245,7 @@ pub fn mark_replicated_to_harbor(
 /// Get unacknowledged recipients for a packet
 pub fn get_unacknowledged_recipients(
     conn: &Connection,
-    packet_id: &[u8; 32],
+    packet_id: &PacketId,
 ) -> rusqlite::Result<Vec<[u8; 32]>> {
     let mut stmt = conn.prepare(
         "SELECT p.endpoint_id
@@ -235,10 +265,7 @@ pub fn get_unacknowledged_recipients(
 }
 
 /// Delete a packet and its recipients (cascade)
-pub fn delete_outgoing_packet(
-    conn: &Connection,
-    packet_id: &[u8; 32],
-) -> rusqlite::Result<bool> {
+pub fn delete_outgoing_packet(conn: &Connection, packet_id: &PacketId) -> rusqlite::Result<bool> {
     let rows = conn.execute(
         "DELETE FROM outgoing_packets WHERE packet_id = ?1",
         [packet_id.as_slice()],
@@ -247,10 +274,7 @@ pub fn delete_outgoing_packet(
 }
 
 /// Clean up old packets that are fully acknowledged
-pub fn cleanup_acknowledged_packets(
-    conn: &Connection,
-    older_than: i64,
-) -> rusqlite::Result<usize> {
+pub fn cleanup_acknowledged_packets(conn: &Connection, older_than: i64) -> rusqlite::Result<usize> {
     // Find packets where all recipients have acknowledged and are old enough
     let deleted = conn.execute(
         "DELETE FROM outgoing_packets 
@@ -284,8 +308,8 @@ mod tests {
         .unwrap();
     }
 
-    fn test_packet_id() -> [u8; 32] {
-        [1u8; 32]
+    fn test_packet_id() -> PacketId {
+        [1u8; 16]
     }
 
     fn test_topic_id() -> [u8; 32] {
@@ -325,7 +349,7 @@ mod tests {
         .unwrap();
 
         let packet = get_outgoing_packet(&conn, &packet_id).unwrap().unwrap();
-        
+
         assert_eq!(packet.packet_id, packet_id);
         assert_eq!(packet.topic_id, topic_id);
         assert_eq!(packet.harbor_id, harbor_id);
@@ -402,9 +426,9 @@ mod tests {
     #[test]
     fn test_packets_needing_replication() {
         let mut conn = setup_db();
-        
+
         // Packet with unacked recipients
-        let packet1 = [1u8; 32];
+        let packet1: PacketId = [1u8; 16];
         ensure_test_peer(&conn, &[10u8; 32]);
         store_outgoing_packet(
             &mut conn,
@@ -418,7 +442,7 @@ mod tests {
         .unwrap();
 
         // Packet with all acked
-        let packet2 = [2u8; 32];
+        let packet2: PacketId = [2u8; 16];
         ensure_test_peer(&conn, &[20u8; 32]);
         store_outgoing_packet(
             &mut conn,
@@ -510,7 +534,7 @@ mod tests {
         let old_time = now - 1000;
 
         // Old packet, all acknowledged
-        let old_acked = [1u8; 32];
+        let old_acked: PacketId = [1u8; 16];
         ensure_test_peer(&conn, &[10u8; 32]);
         conn.execute(
             "INSERT INTO outgoing_packets (packet_id, topic_id, harbor_id, packet_data, created_at)
@@ -532,7 +556,7 @@ mod tests {
         .unwrap();
 
         // Old packet, not acknowledged - should NOT be cleaned
-        let old_unacked = [2u8; 32];
+        let old_unacked: PacketId = [2u8; 16];
         ensure_test_peer(&conn, &[20u8; 32]);
         conn.execute(
             "INSERT INTO outgoing_packets (packet_id, topic_id, harbor_id, packet_data, created_at)
@@ -562,5 +586,77 @@ mod tests {
 
         // Old unacked should remain
         assert!(get_outgoing_packet(&conn, &old_unacked).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_all_recipients_acknowledged_missing_packet_is_false() {
+        let conn = setup_db();
+        let missing_packet: PacketId = [250u8; 16];
+        assert!(!all_recipients_acknowledged(&conn, &missing_packet).unwrap());
+    }
+
+    #[test]
+    fn test_acknowledge_and_cleanup_missing_packet_reports_not_deleted() {
+        let conn = setup_db();
+        let missing_packet: PacketId = [251u8; 16];
+        let endpoint: [u8; 32] = [7u8; 32];
+
+        let (was_new_ack, was_deleted) =
+            acknowledge_and_cleanup_if_complete(&conn, &missing_packet, &endpoint).unwrap();
+
+        assert!(!was_new_ack);
+        assert!(!was_deleted);
+    }
+
+    #[test]
+    fn test_get_outgoing_packet_rejects_out_of_range_packet_type() {
+        let conn = setup_db();
+        let packet_id: PacketId = [252u8; 16];
+        conn.execute(
+            "INSERT INTO outgoing_packets
+             (packet_id, topic_id, harbor_id, packet_data, replicated_to_harbor, packet_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                packet_id.as_slice(),
+                test_topic_id().as_slice(),
+                test_harbor_id().as_slice(),
+                b"data".as_slice(),
+                0i64,
+                300i64,
+            ],
+        )
+        .unwrap();
+
+        let err = get_outgoing_packet(&conn, &packet_id).unwrap_err();
+        assert!(matches!(
+            err,
+            rusqlite::Error::IntegralValueOutOfRange(6, 300)
+        ));
+    }
+
+    #[test]
+    fn test_get_outgoing_packet_rejects_invalid_replicated_flag() {
+        let conn = setup_db();
+        let packet_id: PacketId = [253u8; 16];
+        conn.execute(
+            "INSERT INTO outgoing_packets
+             (packet_id, topic_id, harbor_id, packet_data, replicated_to_harbor, packet_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                packet_id.as_slice(),
+                test_topic_id().as_slice(),
+                test_harbor_id().as_slice(),
+                b"data".as_slice(),
+                2i64,
+                0i64,
+            ],
+        )
+        .unwrap();
+
+        let err = get_outgoing_packet(&conn, &packet_id).unwrap_err();
+        assert!(matches!(
+            err,
+            rusqlite::Error::IntegralValueOutOfRange(5, 2)
+        ));
     }
 }

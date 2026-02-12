@@ -19,7 +19,7 @@ mod share_pull;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::network::dht::DhtService;
@@ -44,9 +44,14 @@ impl Protocol {
 
         let replication_task = tokio::spawn(async move {
             Self::run_replication_checker(
-                harbor_service, our_id, running, replication_interval,
-                replication_factor, max_replication_attempts,
-            ).await;
+                harbor_service,
+                our_id,
+                running,
+                replication_interval,
+                replication_factor,
+                max_replication_attempts,
+            )
+            .await;
         });
         tasks.push(replication_task);
 
@@ -106,14 +111,19 @@ impl Protocol {
         let running = self.running.clone();
         let dht_service = self.dht_service.clone();
         let dht_bootstrap_delay = Duration::from_secs(self.config.dht_bootstrap_delay_secs);
-        let dht_initial_refresh = Duration::from_secs(self.config.dht_initial_refresh_interval_secs);
+        let dht_initial_refresh =
+            Duration::from_secs(self.config.dht_initial_refresh_interval_secs);
         let dht_stable_refresh = Duration::from_secs(self.config.dht_stable_refresh_interval_secs);
 
         let dht_refresh_task = tokio::spawn(async move {
             Self::run_dht_refresh_loop(
-                dht_service, running,
-                dht_bootstrap_delay, dht_initial_refresh, dht_stable_refresh,
-            ).await;
+                dht_service,
+                running,
+                dht_bootstrap_delay,
+                dht_initial_refresh,
+                dht_stable_refresh,
+            )
+            .await;
         });
         tasks.push(dht_refresh_task);
 
@@ -145,7 +155,8 @@ impl Protocol {
                 share_pull_interval,
                 share_blob_path,
                 share_event_tx,
-            ).await;
+            )
+            .await;
         });
         tasks.push(share_pull_task);
 
@@ -153,15 +164,12 @@ impl Protocol {
         let db = self.db.clone();
         let dht_service = self.dht_service.clone();
         let running = self.running.clone();
-        let harbor_node_refresh_interval = Duration::from_secs(self.config.harbor_node_refresh_interval_secs);
+        let harbor_node_refresh_interval =
+            Duration::from_secs(self.config.harbor_node_refresh_interval_secs);
 
         let harbor_node_discovery_task = tokio::spawn(async move {
-            Self::run_harbor_node_discovery(
-                db,
-                dht_service,
-                running,
-                harbor_node_refresh_interval,
-            ).await;
+            Self::run_harbor_node_discovery(db, dht_service, running, harbor_node_refresh_interval)
+                .await;
         });
         tasks.push(harbor_node_discovery_task);
 
@@ -193,8 +201,11 @@ impl Protocol {
 
         // Phase 1: Initial rapid lookups to bootstrap the DHT
         // This ensures we quickly discover peers even when nodes join in batches
-        info!("DHT: starting initial bootstrap phase ({} lookups at {}s intervals)...",
-            DHT_INITIAL_LOOKUP_COUNT, initial_refresh_interval.as_secs());
+        info!(
+            "DHT: starting initial bootstrap phase ({} lookups at {}s intervals)...",
+            DHT_INITIAL_LOOKUP_COUNT,
+            initial_refresh_interval.as_secs()
+        );
 
         let mut initial_interval = tokio::time::interval(initial_refresh_interval);
         initial_interval.tick().await; // Skip immediate tick
@@ -210,13 +221,21 @@ impl Protocol {
 
             // Alternate between self-lookup and random lookup for better coverage
             if i % 2 == 0 {
-                debug!("DHT: bootstrap phase - self-lookup ({}/{})", i + 1, DHT_INITIAL_LOOKUP_COUNT);
+                debug!(
+                    "DHT: bootstrap phase - self-lookup ({}/{})",
+                    i + 1,
+                    DHT_INITIAL_LOOKUP_COUNT
+                );
                 match dht.self_lookup().await {
                     Ok(()) => debug!("DHT: self-lookup completed"),
                     Err(e) => warn!("DHT: self-lookup failed: {}", e),
                 }
             } else {
-                debug!("DHT: bootstrap phase - random lookup ({}/{})", i + 1, DHT_INITIAL_LOOKUP_COUNT);
+                debug!(
+                    "DHT: bootstrap phase - random lookup ({}/{})",
+                    i + 1,
+                    DHT_INITIAL_LOOKUP_COUNT
+                );
                 match dht.random_lookup().await {
                     Ok(()) => debug!("DHT: random lookup completed"),
                     Err(e) => warn!("DHT: random lookup failed: {}", e),
@@ -226,8 +245,10 @@ impl Protocol {
             initial_interval.tick().await;
         }
 
-        info!("DHT: bootstrap phase complete, switching to stable refresh interval ({}s)",
-            stable_refresh_interval.as_secs());
+        info!(
+            "DHT: bootstrap phase complete, switching to stable refresh interval ({}s)",
+            stable_refresh_interval.as_secs()
+        );
 
         // Phase 2: Stable periodic refresh
         let mut stable_interval = tokio::time::interval(stable_refresh_interval);
@@ -307,7 +328,7 @@ mod tests {
     fn test_bootstrap_phase_duration() {
         let config = ProtocolConfig::default();
         // Total bootstrap phase duration (in seconds)
-        let bootstrap_duration = config.dht_bootstrap_delay_secs 
+        let bootstrap_duration = config.dht_bootstrap_delay_secs
             + config.dht_initial_refresh_interval_secs * DHT_INITIAL_LOOKUP_COUNT as u64;
         // Should complete within about 1-2 minutes
         assert!(bootstrap_duration >= 30);

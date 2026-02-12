@@ -7,28 +7,135 @@
 //! - Sync requests (Harbor-to-Harbor synchronization)
 
 use rusqlite::Connection;
+use std::sync::{Mutex, MutexGuard};
 use tracing::{debug, info, warn};
 
 use crate::data::harbor::{
     all_recipients_delivered, cache_packet, delete_packet, get_packets_for_recipient,
     get_packets_for_sync, mark_delivered,
 };
-use crate::resilience::{RateLimitResult, StorageCheckResult};
-use crate::security::send::packet::{verify_for_storage, PacketError};
+use crate::resilience::{RateLimitResult, RateLimiter, StorageCheckResult};
+use crate::security::PacketId;
+use crate::security::send::packet::{PacketError, verify_for_storage};
 
 use super::protocol::{
-    DeliveryAck, DeliveryUpdate, PacketInfo, PullRequest,
-    PullResponse, StoreRequest, StoreResponse, SyncRequest, SyncResponse,
+    DeliveryAck, DeliveryUpdate, PacketInfo, PullRequest, PullResponse, StoreRequest,
+    StoreResponse, SyncRequest, SyncResponse,
 };
 use super::service::{HarborError, HarborService};
 
+fn lock_rate_limiter(rate_limiter: &Mutex<RateLimiter>) -> MutexGuard<'_, RateLimiter> {
+    match rate_limiter.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 impl HarborService {
+    fn storage_check_to_error(packet_id_hex: &str, check: StorageCheckResult) -> HarborError {
+        match check {
+            StorageCheckResult::Allowed => {
+                unreachable!("storage_check_to_error called with Allowed")
+            }
+            StorageCheckResult::TotalLimitExceeded { current, limit } => {
+                warn!(
+                    packet_id = %packet_id_hex,
+                    current_bytes = current,
+                    limit_bytes = limit,
+                    "Harbor STORE: rejected - storage full"
+                );
+                HarborError::StorageFull { current, limit }
+            }
+            StorageCheckResult::HarborLimitExceeded {
+                harbor_id,
+                current,
+                limit,
+            } => {
+                warn!(
+                    packet_id = %packet_id_hex,
+                    harbor_id = %hex::encode(harbor_id),
+                    current_bytes = current,
+                    limit_bytes = limit,
+                    "Harbor STORE: rejected - harbor quota exceeded"
+                );
+                HarborError::HarborQuotaExceeded {
+                    harbor_id,
+                    current,
+                    limit,
+                }
+            }
+        }
+    }
+
+    fn ensure_storage_capacity_for_store(
+        &self,
+        conn: &mut Connection,
+        harbor_id: &[u8; 32],
+        packet_size: u64,
+        packet_id_hex: &str,
+    ) -> Result<(), HarborError> {
+        let initial = self
+            .storage_manager
+            .can_store(conn, harbor_id, packet_size)
+            .map_err(HarborError::Database)?;
+
+        match initial {
+            StorageCheckResult::Allowed => Ok(()),
+            StorageCheckResult::TotalLimitExceeded { .. } => {
+                let evicted = self
+                    .storage_manager
+                    .evict_if_needed(conn, packet_size)
+                    .map_err(HarborError::Database)?;
+                if evicted > 0 {
+                    info!(
+                        packet_id = %packet_id_hex,
+                        evicted_packets = evicted,
+                        "Harbor STORE: evicted packets for total quota"
+                    );
+                }
+                let after = self
+                    .storage_manager
+                    .can_store(conn, harbor_id, packet_size)
+                    .map_err(HarborError::Database)?;
+                match after {
+                    StorageCheckResult::Allowed => Ok(()),
+                    other => Err(Self::storage_check_to_error(packet_id_hex, other)),
+                }
+            }
+            StorageCheckResult::HarborLimitExceeded {
+                harbor_id: exceeded_harbor_id,
+                ..
+            } => {
+                let evicted = self
+                    .storage_manager
+                    .evict_for_harbor(conn, &exceeded_harbor_id, packet_size)
+                    .map_err(HarborError::Database)?;
+                if evicted > 0 {
+                    info!(
+                        packet_id = %packet_id_hex,
+                        harbor_id = %hex::encode(exceeded_harbor_id),
+                        evicted_packets = evicted,
+                        "Harbor STORE: evicted packets for harbor quota"
+                    );
+                }
+                let after = self
+                    .storage_manager
+                    .can_store(conn, harbor_id, packet_size)
+                    .map_err(HarborError::Database)?;
+                match after {
+                    StorageCheckResult::Allowed => Ok(()),
+                    other => Err(Self::storage_check_to_error(packet_id_hex, other)),
+                }
+            }
+        }
+    }
+
     /// Check rate limit for a connection
     pub(super) fn check_connection_rate_limit(
         &self,
         endpoint_id: &[u8; 32],
     ) -> Result<(), HarborError> {
-        let mut limiter = self.rate_limiter.lock().unwrap();
+        let mut limiter = lock_rate_limiter(&self.rate_limiter);
         match limiter.check_connection(endpoint_id) {
             RateLimitResult::Allowed => Ok(()),
             RateLimitResult::Limited { retry_after } => {
@@ -48,7 +155,7 @@ impl HarborService {
         endpoint_id: &[u8; 32],
         harbor_id: &[u8; 32],
     ) -> Result<(), HarborError> {
-        let mut limiter = self.rate_limiter.lock().unwrap();
+        let mut limiter = lock_rate_limiter(&self.rate_limiter);
         match limiter.check_store_request(endpoint_id, harbor_id) {
             RateLimitResult::Allowed => Ok(()),
             RateLimitResult::Limited { retry_after } => {
@@ -86,9 +193,21 @@ impl HarborService {
         conn: &mut Connection,
         request: StoreRequest,
     ) -> Result<StoreResponse, HarborError> {
+        let authenticated_node_id = request.sender_id;
+        self.handle_store_authenticated(conn, request, &authenticated_node_id)
+    }
+
+    /// Handle a store request with an authenticated sender identity.
+    pub(crate) fn handle_store_authenticated(
+        &self,
+        conn: &mut Connection,
+        request: StoreRequest,
+        authenticated_node_id: &[u8; 32],
+    ) -> Result<StoreResponse, HarborError> {
         let packet_id_hex = hex::encode(request.packet_id);
         let harbor_id_hex = hex::encode(request.harbor_id);
         let sender_hex = hex::encode(request.sender_id);
+        let auth_hex = hex::encode(authenticated_node_id);
 
         info!(
             packet_id = %packet_id_hex,
@@ -98,6 +217,17 @@ impl HarborService {
             size = request.packet_data.len(),
             "Harbor STORE: received store request"
         );
+
+        // Verify the claimed sender_id matches the authenticated connection identity.
+        if &request.sender_id != authenticated_node_id {
+            warn!(
+                packet_id = %packet_id_hex,
+                claimed = %sender_hex,
+                actual = %auth_hex,
+                "Harbor STORE: UNAUTHORIZED - identity mismatch"
+            );
+            return Err(HarborError::Unauthorized);
+        }
 
         // Verify Proof of Work first (before rate limits so we don't waste limiter state)
         let packet_size = request.packet_data.len() as u64;
@@ -118,7 +248,10 @@ impl HarborService {
                 return Ok(StoreResponse {
                     packet_id: request.packet_id,
                     success: false,
-                    error: Some(format!("insufficient proof of work: {} bits required", required)),
+                    error: Some(format!(
+                        "insufficient proof of work: {} bits required",
+                        required
+                    )),
                     required_difficulty: Some(*required),
                 });
             }
@@ -126,50 +259,7 @@ impl HarborService {
         }
 
         // Check rate limits (both connection and harbor limits)
-        self.check_store_rate_limit(&request.sender_id, &request.harbor_id)?;
-
-        // Check storage limits before accepting
-        let packet_size = request.packet_data.len() as u64;
-        match self.storage_manager.can_store(conn, &request.harbor_id, packet_size) {
-            Ok(StorageCheckResult::Allowed) => {
-                // Storage allowed, continue
-            }
-            Ok(StorageCheckResult::TotalLimitExceeded { current, limit }) => {
-                warn!(
-                    packet_id = %packet_id_hex,
-                    current_bytes = current,
-                    limit_bytes = limit,
-                    "Harbor STORE: rejected - storage full"
-                );
-                return Err(HarborError::StorageFull { current, limit });
-            }
-            Ok(StorageCheckResult::HarborLimitExceeded {
-                harbor_id,
-                current,
-                limit,
-            }) => {
-                warn!(
-                    packet_id = %packet_id_hex,
-                    harbor_id = %hex::encode(harbor_id),
-                    current_bytes = current,
-                    limit_bytes = limit,
-                    "Harbor STORE: rejected - harbor quota exceeded"
-                );
-                return Err(HarborError::HarborQuotaExceeded {
-                    harbor_id,
-                    current,
-                    limit,
-                });
-            }
-            Err(e) => {
-                warn!(
-                    packet_id = %packet_id_hex,
-                    error = %e,
-                    "Harbor STORE: storage check failed"
-                );
-                return Err(HarborError::Database(e));
-            }
-        }
+        self.check_store_rate_limit(authenticated_node_id, &request.harbor_id)?;
 
         // Validate request - basic checks
         if request.packet_data.is_empty() {
@@ -248,6 +338,15 @@ impl HarborService {
                 });
             }
         }
+
+        // Check storage limits only after request validation.
+        // If over limit, attempt eviction and re-check before rejecting.
+        self.ensure_storage_capacity_for_store(
+            conn,
+            &request.harbor_id,
+            packet_size,
+            &packet_id_hex,
+        )?;
 
         // Store the packet (now verified!)
         cache_packet(
@@ -333,7 +432,7 @@ impl HarborService {
         let total_available = packets.len();
 
         // Filter out packets the client already has
-        let already_have: std::collections::HashSet<[u8; 32]> =
+        let already_have: std::collections::HashSet<PacketId> =
             request.already_have.into_iter().collect();
 
         let packets: Vec<PacketInfo> = packets
@@ -398,16 +497,33 @@ impl HarborService {
             return Err(HarborError::Unauthorized);
         }
 
-        mark_delivered(conn, &ack.packet_id, &ack.recipient_id).map_err(HarborError::Database)?;
+        let marked = mark_delivered(conn, &ack.packet_id, &ack.recipient_id)
+            .map_err(HarborError::Database)?;
+
+        if !marked {
+            debug!(
+                packet_id = %packet_id_hex,
+                recipient = %recipient_hex,
+                "Harbor ACK: ignored (already marked or unknown recipient)"
+            );
+            return Ok(());
+        }
 
         // Check if all recipients got the packet
         if all_recipients_delivered(conn, &ack.packet_id).map_err(HarborError::Database)? {
             // Clean up - packet is no longer needed
-            delete_packet(conn, &ack.packet_id).map_err(HarborError::Database)?;
-            info!(
-                packet_id = %packet_id_hex,
-                "Harbor ACK: all recipients received - packet deleted"
-            );
+            let deleted = delete_packet(conn, &ack.packet_id).map_err(HarborError::Database)?;
+            if deleted {
+                info!(
+                    packet_id = %packet_id_hex,
+                    "Harbor ACK: all recipients received - packet deleted"
+                );
+            } else {
+                debug!(
+                    packet_id = %packet_id_hex,
+                    "Harbor ACK: all recipients received - packet already absent"
+                );
+            }
         } else {
             debug!(
                 packet_id = %packet_id_hex,
@@ -446,7 +562,7 @@ impl HarborService {
         let our_packet_count = our_packets.len();
 
         // Find packets they don't have
-        let have_set: std::collections::HashSet<[u8; 32]> =
+        let have_set: std::collections::HashSet<PacketId> =
             request.have_packets.into_iter().collect();
 
         let missing_packets: Vec<PacketInfo> = our_packets
@@ -464,8 +580,11 @@ impl HarborService {
         let mut delivery_updates_applied = 0;
         for update in &request.delivery_updates {
             for recipient in &update.delivered_to {
-                let _ = mark_delivered(conn, &update.packet_id, recipient);
-                delivery_updates_applied += 1;
+                if mark_delivered(conn, &update.packet_id, recipient)
+                    .map_err(HarborError::Database)?
+                {
+                    delivery_updates_applied += 1;
+                }
             }
         }
 
@@ -487,7 +606,7 @@ impl HarborService {
             harbor_id: request.harbor_id,
             missing_packets,
             delivery_updates: our_delivery_updates,
-            members: vec![], // Member tracking removed for Tier 1
+            members: vec![], // Member sync disabled in current Harbor protocol.
         })
     }
 
@@ -519,7 +638,6 @@ impl HarborService {
 
         Ok(updates)
     }
-
 }
 
 #[cfg(test)]
@@ -527,10 +645,11 @@ mod tests {
     use super::*;
     use crate::data::harbor::{cache_packet, get_cached_packet, get_undelivered_recipients};
     use crate::data::schema::{create_harbor_table, create_peer_table};
-    use crate::resilience::ProofOfWork;
+    use crate::resilience::{ProofOfWork, RateLimitConfig, StorageConfig};
     use crate::security::create_key_pair::generate_key_pair;
-    use crate::security::send::packet::{PacketBuilder, generate_packet_id};
+    use crate::security::send::packet::{PacketBuilder, PacketId, generate_packet_id};
     use crate::security::topic_keys::harbor_id_from_topic;
+    use std::sync::Arc;
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -542,6 +661,10 @@ mod tests {
 
     fn test_id(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    fn test_packet_id(seed: u8) -> PacketId {
+        [seed; 16]
     }
 
     /// Create a dummy PoW for tests (difficulty 0 = always passes)
@@ -583,7 +706,11 @@ mod tests {
         };
 
         let response = service.handle_store(&mut conn, request).unwrap();
-        assert!(response.success, "store should succeed: {:?}", response.error);
+        assert!(
+            response.success,
+            "store should succeed: {:?}",
+            response.error
+        );
 
         // Verify packet was stored
         let cached = get_cached_packet(&conn, &packet.packet_id).unwrap();
@@ -597,7 +724,7 @@ mod tests {
 
         let request = StoreRequest {
             packet_data: vec![],
-            packet_id: test_id(10),
+            packet_id: test_packet_id(10),
             harbor_id: test_id(20),
             sender_id: test_id(30),
             recipients: vec![test_id(40)],
@@ -609,6 +736,89 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_store_unauthorized_sender_claim() {
+        let mut conn = setup_db();
+        let service = HarborService::without_rate_limiting(test_id(1));
+
+        let topic_id = test_id(100);
+        let harbor_id = harbor_id_from_topic(&topic_id);
+        let sender_keypair = generate_key_pair();
+
+        let packet = PacketBuilder::new(
+            topic_id,
+            sender_keypair.private_key,
+            sender_keypair.public_key,
+        )
+        .build(b"test message", generate_packet_id())
+        .expect("packet build should succeed");
+
+        let packet_bytes = packet.to_bytes().expect("serialization should succeed");
+        let request = StoreRequest {
+            packet_data: packet_bytes,
+            packet_id: packet.packet_id,
+            harbor_id,
+            sender_id: sender_keypair.public_key,
+            recipients: vec![test_id(40)],
+            pow: test_pow(),
+        };
+
+        let result = service.handle_store_authenticated(&mut conn, request, &test_id(99));
+        assert!(matches!(result, Err(HarborError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_handle_store_invalid_request_does_not_evict_cached_packets() {
+        let mut conn = setup_db();
+
+        let existing_packet = b"already cached packet bytes".to_vec();
+        let existing_packet_id = test_packet_id(5);
+        let harbor_id = test_id(20);
+        cache_packet(
+            &mut conn,
+            &existing_packet_id,
+            &harbor_id,
+            &test_id(30),
+            &existing_packet,
+            &[test_id(40)],
+            false,
+        )
+        .unwrap();
+
+        let service = HarborService::with_full_config(
+            test_id(1),
+            RateLimitConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            StorageConfig {
+                max_total_bytes: existing_packet.len() as u64,
+                max_per_harbor_bytes: u64::MAX,
+                enabled: true,
+            },
+        );
+
+        let request = StoreRequest {
+            packet_data: vec![0u8], // Invalid packet format
+            packet_id: test_packet_id(6),
+            harbor_id,
+            sender_id: test_id(31),
+            recipients: vec![test_id(41)],
+            pow: test_pow(),
+        };
+
+        let response = service
+            .handle_store_authenticated(&mut conn, request, &test_id(31))
+            .unwrap();
+        assert!(!response.success);
+
+        let cached = get_cached_packet(&conn, &existing_packet_id).unwrap();
+        assert!(
+            cached.is_some(),
+            "invalid stores must not evict existing cache"
+        );
+    }
+
+    #[test]
     fn test_handle_pull() {
         let mut conn = setup_db();
         let service = HarborService::without_rate_limiting(test_id(1));
@@ -616,7 +826,7 @@ mod tests {
         // Store some packets
         cache_packet(
             &mut conn,
-            &test_id(10),
+            &test_packet_id(10),
             &test_id(20),
             &test_id(30),
             b"packet 1",
@@ -627,7 +837,7 @@ mod tests {
 
         cache_packet(
             &mut conn,
-            &test_id(11),
+            &test_packet_id(11),
             &test_id(20),
             &test_id(31),
             b"packet 2",
@@ -656,7 +866,7 @@ mod tests {
 
         cache_packet(
             &mut conn,
-            &test_id(10),
+            &test_packet_id(10),
             &test_id(20),
             &test_id(30),
             b"packet",
@@ -685,7 +895,7 @@ mod tests {
 
         cache_packet(
             &mut conn,
-            &test_id(10),
+            &test_packet_id(10),
             &test_id(20),
             &test_id(30),
             b"packet 1",
@@ -696,7 +906,7 @@ mod tests {
 
         cache_packet(
             &mut conn,
-            &test_id(11),
+            &test_packet_id(11),
             &test_id(20),
             &test_id(31),
             b"packet 2",
@@ -709,13 +919,13 @@ mod tests {
             harbor_id: test_id(20),
             recipient_id: test_id(1),
             since_timestamp: 0,
-            already_have: vec![test_id(10)], // Already have packet 10
+            already_have: vec![test_packet_id(10)], // Already have packet 10
             relay_url: None,
         };
 
         let response = service.handle_pull(&conn, request, &test_id(1)).unwrap();
         assert_eq!(response.packets.len(), 1);
-        assert_eq!(response.packets[0].packet_id, test_id(11));
+        assert_eq!(response.packets[0].packet_id, test_packet_id(11));
     }
 
     #[test]
@@ -726,7 +936,7 @@ mod tests {
         // Store a packet with one recipient
         cache_packet(
             &mut conn,
-            &test_id(10),
+            &test_packet_id(10),
             &test_id(20),
             &test_id(30),
             b"packet",
@@ -737,7 +947,7 @@ mod tests {
 
         // Ack it
         let ack = DeliveryAck {
-            packet_id: test_id(10),
+            packet_id: test_packet_id(10),
             recipient_id: test_id(1),
         };
 
@@ -745,7 +955,7 @@ mod tests {
         service.handle_ack(&conn, ack, &test_id(1)).unwrap();
 
         // Packet should be deleted (all recipients received)
-        let cached = get_cached_packet(&conn, &test_id(10)).unwrap();
+        let cached = get_cached_packet(&conn, &test_packet_id(10)).unwrap();
         assert!(cached.is_none());
     }
 
@@ -756,7 +966,7 @@ mod tests {
 
         cache_packet(
             &mut conn,
-            &test_id(10),
+            &test_packet_id(10),
             &test_id(20),
             &test_id(30),
             b"packet",
@@ -766,7 +976,7 @@ mod tests {
         .unwrap();
 
         let ack = DeliveryAck {
-            packet_id: test_id(10),
+            packet_id: test_packet_id(10),
             recipient_id: test_id(1), // Claims to be test_id(1)
         };
 
@@ -783,7 +993,7 @@ mod tests {
         // Store a packet with two recipients
         cache_packet(
             &mut conn,
-            &test_id(10),
+            &test_packet_id(10),
             &test_id(20),
             &test_id(30),
             b"packet",
@@ -794,14 +1004,42 @@ mod tests {
 
         // Ack from only one recipient
         let ack = DeliveryAck {
-            packet_id: test_id(10),
+            packet_id: test_packet_id(10),
             recipient_id: test_id(1),
         };
 
         service.handle_ack(&conn, ack, &test_id(1)).unwrap();
 
         // Packet should still exist (one recipient remaining)
-        let cached = get_cached_packet(&conn, &test_id(10)).unwrap();
+        let cached = get_cached_packet(&conn, &test_packet_id(10)).unwrap();
+        assert!(cached.is_some());
+    }
+
+    #[test]
+    fn test_handle_ack_ignores_unknown_or_duplicate_delivery() {
+        let mut conn = setup_db();
+        let service = HarborService::without_rate_limiting(test_id(1));
+
+        cache_packet(
+            &mut conn,
+            &test_packet_id(10),
+            &test_id(20),
+            &test_id(30),
+            b"packet",
+            &[test_id(1)],
+            false,
+        )
+        .unwrap();
+
+        // Recipient 2 is authenticated but not associated with packet 10.
+        let ack = DeliveryAck {
+            packet_id: test_packet_id(10),
+            recipient_id: test_id(2),
+        };
+
+        service.handle_ack(&conn, ack, &test_id(2)).unwrap();
+
+        let cached = get_cached_packet(&conn, &test_packet_id(10)).unwrap();
         assert!(cached.is_some());
     }
 
@@ -813,7 +1051,7 @@ mod tests {
         // Store a packet on this node
         cache_packet(
             &mut conn,
-            &test_id(10),
+            &test_packet_id(10),
             &test_id(20), // harbor_id
             &test_id(30),
             b"packet data",
@@ -835,7 +1073,7 @@ mod tests {
 
         // They should receive our packet
         assert_eq!(response.missing_packets.len(), 1);
-        assert_eq!(response.missing_packets[0].packet_id, test_id(10));
+        assert_eq!(response.missing_packets[0].packet_id, test_packet_id(10));
     }
 
     #[test]
@@ -846,7 +1084,7 @@ mod tests {
         // Store a packet
         cache_packet(
             &mut conn,
-            &test_id(10),
+            &test_packet_id(10),
             &test_id(20),
             &test_id(30),
             b"packet data",
@@ -859,7 +1097,7 @@ mod tests {
         let peer_id = test_id(99);
         let request = SyncRequest {
             harbor_id: test_id(20),
-            have_packets: vec![test_id(10)], // They already have it
+            have_packets: vec![test_packet_id(10)], // They already have it
             delivery_updates: vec![],
             member_entries: vec![],
         };
@@ -878,7 +1116,7 @@ mod tests {
         // Store a packet with recipients
         cache_packet(
             &mut conn,
-            &test_id(10),
+            &test_packet_id(10),
             &test_id(20),
             &test_id(30),
             b"packet data",
@@ -891,9 +1129,9 @@ mod tests {
         let peer_id = test_id(99);
         let request = SyncRequest {
             harbor_id: test_id(20),
-            have_packets: vec![test_id(10)],
+            have_packets: vec![test_packet_id(10)],
             delivery_updates: vec![DeliveryUpdate {
-                packet_id: test_id(10),
+                packet_id: test_packet_id(10),
                 delivered_to: vec![test_id(40)],
             }],
             member_entries: vec![],
@@ -902,7 +1140,7 @@ mod tests {
         let _response = service.handle_sync(&conn, request, &peer_id).unwrap();
 
         // Check that delivery was marked
-        let undelivered = get_undelivered_recipients(&conn, &test_id(10)).unwrap();
+        let undelivered = get_undelivered_recipients(&conn, &test_packet_id(10)).unwrap();
         assert_eq!(undelivered.len(), 1);
         assert_eq!(undelivered[0], test_id(41)); // Only 41 remaining
     }
@@ -915,7 +1153,7 @@ mod tests {
         // Store a packet with two recipients
         cache_packet(
             &mut conn,
-            &test_id(10),
+            &test_packet_id(10),
             &test_id(20), // harbor_id
             &test_id(30),
             b"packet data",
@@ -929,13 +1167,31 @@ mod tests {
         assert!(updates.is_empty());
 
         // Mark one as delivered
-        mark_delivered(&conn, &test_id(10), &test_id(40)).unwrap();
+        mark_delivered(&conn, &test_packet_id(10), &test_id(40)).unwrap();
 
         // Now we should have a delivery update
         let updates = service.get_delivery_updates(&conn, &test_id(20)).unwrap();
         assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].packet_id, test_id(10));
+        assert_eq!(updates[0].packet_id, test_packet_id(10));
         assert_eq!(updates[0].delivered_to.len(), 1);
         assert!(updates[0].delivered_to.contains(&test_id(40)));
+    }
+
+    #[test]
+    fn test_rate_limiter_lock_recovers_from_poison() {
+        let service = Arc::new(HarborService::with_rate_limit_config(
+            test_id(1),
+            RateLimitConfig::default(),
+        ));
+        let poisoned_ref = Arc::clone(&service);
+
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned_ref.rate_limiter.lock().unwrap();
+            panic!("poison rate limiter mutex");
+        })
+        .join();
+
+        let result = service.check_connection_rate_limit(&test_id(77));
+        assert!(result.is_ok());
     }
 }

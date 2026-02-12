@@ -1,5 +1,7 @@
 //! Public types for topic management and invites.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::ProtocolError;
@@ -54,7 +56,11 @@ pub struct TopicInvite {
 
 impl TopicInvite {
     /// Create a new topic invite with member info (includes relay URLs)
-    pub fn new_with_info(topic_id: [u8; 32], admin_id: [u8; 32], member_info: Vec<MemberInfo>) -> Self {
+    pub fn new_with_info(
+        topic_id: [u8; 32],
+        admin_id: [u8; 32],
+        member_info: Vec<MemberInfo>,
+    ) -> Self {
         let members = member_info.iter().map(|m| m.endpoint_id).collect();
         Self {
             topic_id,
@@ -77,21 +83,44 @@ impl TopicInvite {
 
     /// Get the admin ID (falls back to first member for legacy invites)
     pub fn admin_id(&self) -> Option<[u8; 32]> {
-        self.admin_id.or_else(|| self.member_ids().first().copied())
+        self.admin_id.or_else(|| {
+            self.member_info
+                .first()
+                .map(|m| m.endpoint_id)
+                .or_else(|| self.members.first().copied())
+        })
     }
 
-    /// Get all member endpoint IDs
+    /// Get all member endpoint IDs, deduplicated with stable first-seen order.
     pub fn member_ids(&self) -> Vec<[u8; 32]> {
         if !self.member_info.is_empty() {
-            self.member_info.iter().map(|m| m.endpoint_id).collect()
+            dedupe_member_ids(self.member_info.iter().map(|m| m.endpoint_id))
         } else {
-            self.members.iter().copied().collect()
+            dedupe_member_ids(self.members.iter().copied())
         }
     }
 
-    /// Get member info (with relay URLs if available)
+    /// Get the raw `member_info` entries from the invite payload.
+    ///
+    /// Legacy invites may leave this empty and only populate `members`.
     pub fn get_member_info(&self) -> &[MemberInfo] {
         &self.member_info
+    }
+
+    /// Get member info with legacy fallback and stable deduplication.
+    pub fn effective_member_info(&self) -> Vec<MemberInfo> {
+        if !self.member_info.is_empty() {
+            let mut seen = HashSet::new();
+            let mut deduped = Vec::with_capacity(self.member_info.len());
+            for member in &self.member_info {
+                if seen.insert(member.endpoint_id) {
+                    deduped.push(member.clone());
+                }
+            }
+            deduped
+        } else {
+            self.member_ids().into_iter().map(MemberInfo::new).collect()
+        }
     }
 
     /// Serialize to bytes (for sharing)
@@ -112,10 +141,20 @@ impl TopicInvite {
 
     /// Deserialize from hex
     pub fn from_hex(s: &str) -> Result<Self, ProtocolError> {
-        let bytes =
-            hex::decode(s).map_err(|e| ProtocolError::InvalidInvite(e.to_string()))?;
+        let bytes = hex::decode(s).map_err(|e| ProtocolError::InvalidInvite(e.to_string()))?;
         Self::from_bytes(&bytes)
     }
+}
+
+fn dedupe_member_ids(ids: impl IntoIterator<Item = [u8; 32]>) -> Vec<[u8; 32]> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for id in ids {
+        if seen.insert(id) {
+            deduped.push(id);
+        }
+    }
+    deduped
 }
 
 #[cfg(test)]
@@ -137,7 +176,10 @@ mod tests {
     fn test_member_info_with_relay() {
         let info = MemberInfo::with_relay(test_id(1), "https://relay.example.com".to_string());
         assert_eq!(info.endpoint_id, test_id(1));
-        assert_eq!(info.relay_url, Some("https://relay.example.com".to_string()));
+        assert_eq!(
+            info.relay_url,
+            Some("https://relay.example.com".to_string())
+        );
     }
 
     #[test]
@@ -170,7 +212,11 @@ mod tests {
 
     #[test]
     fn test_topic_invite_serialization() {
-        let invite = TopicInvite::new(test_id(1), test_id(10), vec![test_id(10), test_id(11), test_id(12)]);
+        let invite = TopicInvite::new(
+            test_id(1),
+            test_id(10),
+            vec![test_id(10), test_id(11), test_id(12)],
+        );
 
         // Test bytes serialization
         let bytes = invite.to_bytes().unwrap();
@@ -213,7 +259,11 @@ mod tests {
 
     #[test]
     fn test_topic_invite_hex_roundtrip() {
-        let invite = TopicInvite::new(test_id(42), test_id(1), vec![test_id(1), test_id(2), test_id(3)]);
+        let invite = TopicInvite::new(
+            test_id(42),
+            test_id(1),
+            vec![test_id(1), test_id(2), test_id(3)],
+        );
 
         let hex1 = invite.to_hex().unwrap();
         let restored1 = TopicInvite::from_hex(&hex1).unwrap();
@@ -257,6 +307,17 @@ mod tests {
     }
 
     #[test]
+    fn test_member_ids_deduplicates_legacy_members() {
+        let invite = TopicInvite::new(
+            test_id(1),
+            test_id(10),
+            vec![test_id(10), test_id(11), test_id(10), test_id(11)],
+        );
+        let ids = invite.member_ids();
+        assert_eq!(ids, vec![test_id(10), test_id(11)]);
+    }
+
+    #[test]
     fn test_get_member_info() {
         let member_info = vec![
             MemberInfo::new(test_id(10)),
@@ -268,6 +329,42 @@ mod tests {
         assert_eq!(info.len(), 2);
         assert!(info[0].relay_url.is_none());
         assert!(info[1].relay_url.is_some());
+    }
+
+    #[test]
+    fn test_effective_member_info_legacy_fallback() {
+        let invite = TopicInvite {
+            topic_id: test_id(1),
+            admin_id: None,
+            member_info: vec![],
+            members: vec![test_id(10), test_id(11), test_id(10)],
+        };
+
+        let info = invite.effective_member_info();
+        assert_eq!(info.len(), 2);
+        assert_eq!(info[0].endpoint_id, test_id(10));
+        assert_eq!(info[1].endpoint_id, test_id(11));
+        assert!(info.iter().all(|m| m.relay_url.is_none()));
+    }
+
+    #[test]
+    fn test_effective_member_info_deduplicates_member_info() {
+        let invite = TopicInvite {
+            topic_id: test_id(1),
+            admin_id: Some(test_id(42)),
+            member_info: vec![
+                MemberInfo::with_relay(test_id(10), "https://relay-a".to_string()),
+                MemberInfo::with_relay(test_id(10), "https://relay-b".to_string()),
+                MemberInfo::new(test_id(11)),
+            ],
+            members: vec![test_id(10), test_id(11)],
+        };
+
+        let info = invite.effective_member_info();
+        assert_eq!(info.len(), 2);
+        assert_eq!(info[0].endpoint_id, test_id(10));
+        assert_eq!(info[0].relay_url.as_deref(), Some("https://relay-a"));
+        assert_eq!(info[1].endpoint_id, test_id(11));
     }
 
     #[test]
@@ -284,5 +381,14 @@ mod tests {
             members: vec![test_id(10)],
         };
         assert_eq!(legacy.admin_id(), Some(test_id(10)));
+
+        // Mixed payload shape: member_info has precedence over legacy members.
+        let mixed = TopicInvite {
+            topic_id: test_id(1),
+            admin_id: None,
+            member_info: vec![MemberInfo::new(test_id(55))],
+            members: vec![test_id(10), test_id(11)],
+        };
+        assert_eq!(mixed.admin_id(), Some(test_id(55)));
     }
 }

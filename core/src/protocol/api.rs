@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::data::BlobMetadata;
 
-use super::core::{Protocol, MAX_MESSAGE_SIZE};
+use super::core::{MAX_MESSAGE_SIZE, Protocol};
 use super::error::ProtocolError;
 use super::stats::{DhtBucketInfo, ProtocolStats, TopicDetails, TopicSummary};
 use crate::network::control::TopicInvite;
@@ -133,11 +133,13 @@ impl Protocol {
     ) -> Result<[u8; 32], ProtocolError> {
         self.check_running().await?;
         match target {
-            super::Target::Topic(id) => self.share_service
+            super::Target::Topic(id) => self
+                .share_service
                 .share_and_announce(&id, file_path.as_ref())
                 .await
                 .map_err(|e| ProtocolError::Database(e.to_string())),
-            super::Target::Dm(id) => self.share_service
+            super::Target::Dm(id) => self
+                .share_service
                 .share_dm_file(&id, file_path.as_ref())
                 .await
                 .map_err(|e| ProtocolError::Database(e.to_string())),
@@ -210,10 +212,7 @@ impl Protocol {
     ///
     /// - `Target::Topic(id)` — request from all topic members
     /// - `Target::Dm(id)` — request from a single peer
-    pub async fn request_sync(
-        &self,
-        target: super::Target,
-    ) -> Result<(), ProtocolError> {
+    pub async fn request_sync(&self, target: super::Target) -> Result<(), ProtocolError> {
         self.check_running().await?;
         match target {
             super::Target::Topic(id) => self.sync_service.request_sync(&id).await,
@@ -235,7 +234,11 @@ impl Protocol {
     ) -> Result<(), ProtocolError> {
         self.check_running().await?;
         match target {
-            super::Target::Topic(id) => self.sync_service.respond_sync(&id, requester_id, data).await,
+            super::Target::Topic(id) => {
+                self.sync_service
+                    .respond_sync(&id, requester_id, data)
+                    .await
+            }
             super::Target::Dm(id) => self.sync_service.respond_dm_sync(&id, data).await,
         }
     }
@@ -285,8 +288,9 @@ impl Protocol {
 
     /// Request to stream to a peer in a topic
     ///
-    /// Sends a stream request via signaling. The destination must accept
-    /// before media can flow. Returns the unique request ID.
+    /// Sends stream request signaling. Topic fanout uses one request per recipient
+    /// grouped under a shared broadcast ID.
+    /// Returns request_id for single-target calls, or broadcast_id for fanout.
     pub async fn request_stream(
         &self,
         topic_id: &[u8; 32],
@@ -304,7 +308,7 @@ impl Protocol {
     /// Request a DM stream to a peer (peer-to-peer, no topic)
     ///
     /// Sends a stream request directly via DM. The destination must accept
-    /// before media can flow. Returns the unique request ID.
+    /// before media can flow. Returns the request_id.
     pub async fn dm_stream_request(
         &self,
         peer_id: &[u8; 32],
@@ -373,7 +377,8 @@ impl Protocol {
         broadcast_name: &str,
     ) -> Result<moq_lite::BroadcastProducer, ProtocolError> {
         self.check_running().await?;
-        let session = self.stream_service
+        let session = self
+            .stream_service
             .get_session(request_id)
             .await
             .ok_or_else(|| ProtocolError::NotFound("stream session not found".into()))?;
@@ -392,7 +397,8 @@ impl Protocol {
         broadcast_name: &str,
     ) -> Result<moq_lite::BroadcastConsumer, ProtocolError> {
         self.check_running().await?;
-        let session = self.stream_service
+        let session = self
+            .stream_service
             .get_session(request_id)
             .await
             .ok_or_else(|| ProtocolError::NotFound("stream session not found".into()))?;

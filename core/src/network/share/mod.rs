@@ -27,7 +27,6 @@ pub mod service;
 pub use protocol::{
     BitfieldMessage, CanSeed, ChunkAck, ChunkMapRequest, ChunkMapResponse, ChunkRequest,
     ChunkResponse, DecodeError, FileAnnouncement, InitialRecipient, PeerChunks, PeerSuggestion,
-    ShareMessage, ShareMessageType, SHARE_ALPN,
+    SHARE_ALPN, ShareMessage, ShareMessageType,
 };
-pub use service::{ProcessShareError, ShareConfig, ShareError, ShareService, ShareStatus};
-
+pub use service::{ShareConfig, ShareError, ShareService, ShareStatus};

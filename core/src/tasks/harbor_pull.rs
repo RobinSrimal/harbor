@@ -8,12 +8,12 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
-use crate::data::{get_joined_at, get_topics_for_member, dedup_check_and_mark, DedupResult};
+use crate::data::{DedupResult, dedup_check_and_mark, get_joined_at, get_topics_for_member};
 use crate::network::harbor::HarborService;
 use crate::network::process::ProcessScope;
 use crate::network::stream::StreamService;
 use crate::protocol::Protocol;
-use crate::security::harbor_id_from_topic;
+use crate::security::{PacketId, harbor_id_from_topic};
 
 impl Protocol {
     /// Run the Harbor pull loop
@@ -59,9 +59,9 @@ impl Protocol {
                 // For topics, harbor_id is hash(topic_id)
                 let is_dm = topic_id == our_id;
                 let harbor_id = if is_dm {
-                    topic_id  // DMs use raw endpoint_id as harbor_id
+                    topic_id // DMs use raw endpoint_id as harbor_id
                 } else {
-                    harbor_id_from_topic(&topic_id)  // Topics use hashed harbor_id
+                    harbor_id_from_topic(&topic_id) // Topics use hashed harbor_id
                 };
 
                 // Find Harbor Nodes from cache, fallback to DHT if empty
@@ -72,11 +72,16 @@ impl Protocol {
 
                 // Fallback to DHT lookup if cache is empty (newly subscribed topic)
                 if harbor_nodes.is_empty() {
-                    harbor_nodes = HarborService::find_harbor_nodes_dht(&dht_service, &harbor_id).await;
+                    harbor_nodes =
+                        HarborService::find_harbor_nodes_dht(&dht_service, &harbor_id).await;
                     // Cache the result for next time
                     if !harbor_nodes.is_empty() {
                         let db_lock = db.lock().await;
-                        let _ = crate::data::harbor::replace_harbor_nodes(&db_lock, &harbor_id, &harbor_nodes);
+                        let _ = crate::data::harbor::replace_harbor_nodes(
+                            &db_lock,
+                            &harbor_id,
+                            &harbor_nodes,
+                        );
                     }
                 }
 
@@ -85,7 +90,7 @@ impl Protocol {
                 }
 
                 // Get packet IDs we already have and our join timestamp
-                let (already_have, joined_at): (Vec<[u8; 32]>, i64) = {
+                let (already_have, joined_at): (Vec<PacketId>, i64) = {
                     let db_lock = db.lock().await;
                     let already_have =
                         crate::data::harbor::get_pulled_packet_ids(&db_lock, &topic_id)
@@ -110,7 +115,10 @@ impl Protocol {
                 // Try multiple Harbor Nodes - different nodes may have different packets
                 let mut consecutive_empty = 0;
                 for harbor_node in harbor_nodes.iter().take(pull_max_nodes) {
-                    match harbor_service.send_harbor_pull(harbor_node, &pull_req).await {
+                    match harbor_service
+                        .send_harbor_pull(harbor_node, &pull_req)
+                        .await
+                    {
                         Ok(packets) => {
                             if packets.is_empty() {
                                 consecutive_empty += 1;
@@ -166,7 +174,8 @@ impl Protocol {
                                             packet_id: packet_info.packet_id,
                                             recipient_id: our_id,
                                         };
-                                        let _ = harbor_service.send_harbor_ack(harbor_node, &ack).await;
+                                        let _ =
+                                            harbor_service.send_harbor_ack(harbor_node, &ack).await;
                                     }
                                     Err(e) => {
                                         debug!(

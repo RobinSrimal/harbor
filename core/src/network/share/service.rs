@@ -6,23 +6,21 @@
 //! - `acquire.rs` - File acquisition (pulling)
 //! - `incoming.rs` - Incoming message handlers
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::endpoint::Connection;
 use rusqlite::Connection as DbConnection;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info};
+use tracing::info;
 
 use crate::data::{
-    BlobMetadata, BlobState, BlobStore, LocalIdentity, SectionTrace,
-    get_blob, get_blobs_for_scope, get_section_traces,
+    BlobMetadata, BlobState, BlobStore, LocalIdentity, SectionTrace, get_blob, get_blobs_for_scope,
+    get_section_traces,
 };
+use crate::network::connect::Connector;
 use crate::network::gate::ConnectionGate;
 use crate::network::send::SendService;
-use crate::network::connect::Connector;
 use crate::protocol::MemberInfo;
 
 use super::protocol::BitfieldMessage;
@@ -65,8 +63,6 @@ pub enum ShareError {
     Connection(String),
     /// Protocol error
     Protocol(String),
-    /// All peers busy
-    AllPeersBusy,
 }
 
 impl std::fmt::Display for ShareError {
@@ -85,7 +81,6 @@ impl std::fmt::Display for ShareError {
             ShareError::Database(e) => write!(f, "database error: {}", e),
             ShareError::Connection(e) => write!(f, "connection error: {}", e),
             ShareError::Protocol(e) => write!(f, "protocol error: {}", e),
-            ShareError::AllPeersBusy => write!(f, "all peers are busy"),
         }
     }
 }
@@ -174,41 +169,6 @@ pub struct ShareStatus {
     pub section_traces: Vec<SectionTrace>,
 }
 
-/// Error during incoming share message processing
-#[derive(Debug)]
-pub enum ProcessShareError {
-    /// Database error
-    Database(String),
-    /// Blob not found
-    BlobNotFound,
-    /// IO error (chunk read/write)
-    Io(String),
-}
-
-impl std::fmt::Display for ProcessShareError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ProcessShareError::Database(e) => write!(f, "database error: {}", e),
-            ProcessShareError::BlobNotFound => write!(f, "blob not found"),
-            ProcessShareError::Io(e) => write!(f, "IO error: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for ProcessShareError {}
-
-/// Active transfer state
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(super) struct ActiveTransfer {
-    /// Peer we're transferring to/from
-    pub peer_id: [u8; 32],
-    /// Connection
-    pub connection: Connection,
-    /// Chunks being transferred
-    pub chunks_in_progress: Vec<u32>,
-}
-
 /// Share service for the Harbor protocol
 impl std::fmt::Debug for ShareService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -231,10 +191,6 @@ pub struct ShareService {
     pub(super) send_service: Arc<RwLock<Option<Arc<SendService>>>>,
     /// Connection gate for peer authorization
     pub(super) connection_gate: Option<Arc<ConnectionGate>>,
-    /// Active outgoing transfers
-    pub(super) outgoing_transfers: Arc<RwLock<HashMap<[u8; 32], Vec<ActiveTransfer>>>>,
-    /// Active incoming transfers
-    pub(super) incoming_transfers: Arc<RwLock<HashMap<[u8; 32], Vec<ActiveTransfer>>>>,
 }
 
 impl ShareService {
@@ -256,14 +212,7 @@ impl ShareService {
             config,
             send_service: Arc::new(RwLock::new(send_service)),
             connection_gate,
-            outgoing_transfers: Arc::new(RwLock::new(HashMap::new())),
-            incoming_transfers: Arc::new(RwLock::new(HashMap::new())),
         }
-    }
-
-    /// Set the send service (called after ShareService is created)
-    pub async fn set_send_service(&self, send_service: Arc<SendService>) {
-        *self.send_service.write().await = Some(send_service);
     }
 
     /// Get the connection gate (for handler to check peer authorization)
@@ -304,20 +253,6 @@ impl ShareService {
     /// Check if we have a complete copy of a blob
     pub fn has_complete(&self, hash: &[u8; 32], total_chunks: u32) -> Result<bool, ShareError> {
         Ok(self.blob_store.is_complete(hash, total_chunks)?)
-    }
-
-    /// Get active transfer count for a blob
-    pub async fn active_transfer_count(&self, hash: &[u8; 32]) -> usize {
-        let outgoing = self.outgoing_transfers.read().await;
-        let incoming = self.incoming_transfers.read().await;
-
-        outgoing.get(hash).map(|v| v.len()).unwrap_or(0)
-            + incoming.get(hash).map(|v| v.len()).unwrap_or(0)
-    }
-
-    /// Check if we're at connection capacity
-    pub async fn at_capacity(&self, hash: &[u8; 32]) -> bool {
-        self.active_transfer_count(hash).await >= self.config.max_connections
     }
 
     /// Get the status of a shared file
@@ -362,21 +297,15 @@ impl ShareService {
 
     /// Export a completed blob to a file
     pub fn export_blob(&self, hash: &[u8; 32], dest_path: &Path) -> Result<(), ShareError> {
-        // Check blob is complete (synchronous check via try_lock for simplicity)
-        // In practice, caller should use async version
+        // In sync contexts, fail fast if the async DB mutex is already held.
         let metadata = {
-            // Use blocking lock since we're in a sync context
-            let db_lock = futures::executor::block_on(self.db.lock());
+            let db_lock = try_lock_db_for_sync_export(&self.db)?;
             get_blob(&db_lock, hash)
                 .map_err(|e| ShareError::Database(e.to_string()))?
                 .ok_or(ShareError::BlobNotFound)?
         };
 
-        if metadata.state != BlobState::Complete {
-            return Err(ShareError::Protocol(
-                "Cannot export incomplete blob".to_string(),
-            ));
-        }
+        ensure_blob_complete(metadata.state)?;
 
         self.blob_store.export_file(hash, dest_path)?;
         Ok(())
@@ -395,11 +324,7 @@ impl ShareService {
                 .ok_or(ShareError::BlobNotFound)?
         };
 
-        if metadata.state != BlobState::Complete {
-            return Err(ShareError::Protocol(
-                "Cannot export incomplete blob".to_string(),
-            ));
-        }
+        ensure_blob_complete(metadata.state)?;
 
         let blob_store = self.blob_store.clone();
         let hash_copy = *hash;
@@ -408,7 +333,7 @@ impl ShareService {
 
         tokio::task::spawn_blocking(move || blob_store.export_file(&hash_copy, &dest_path_owned))
             .await
-            .map_err(|e| ShareError::Connection(e.to_string()))??;
+            .map_err(map_export_join_error)??;
 
         info!(
             hash = hex::encode(&hash[..8]),
@@ -420,9 +345,34 @@ impl ShareService {
     }
 }
 
+fn map_export_join_error(e: tokio::task::JoinError) -> ShareError {
+    ShareError::Protocol(format!("export task failed: {}", e))
+}
+
+fn try_lock_db_for_sync_export<'a>(
+    db: &'a Mutex<DbConnection>,
+) -> Result<tokio::sync::MutexGuard<'a, DbConnection>, ShareError> {
+    db.try_lock().map_err(|_| {
+        ShareError::Protocol(
+            "database is busy; use export_blob_async in async contexts".to_string(),
+        )
+    })
+}
+
+fn ensure_blob_complete(state: BlobState) -> Result<(), ShareError> {
+    if state == BlobState::Complete {
+        Ok(())
+    } else {
+        Err(ShareError::Protocol(
+            "Cannot export incomplete blob".to_string(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::start_memory_db;
 
     #[test]
     fn test_share_config_default() {
@@ -438,5 +388,32 @@ mod tests {
 
         let err = ShareError::BlobNotFound;
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_ensure_blob_complete_rejects_partial() {
+        let err = ensure_blob_complete(BlobState::Partial).expect_err("partial blob must fail");
+        assert!(matches!(err, ShareError::Protocol(_)));
+        assert!(err.to_string().contains("incomplete"));
+    }
+
+    #[tokio::test]
+    async fn test_try_lock_db_for_sync_export_busy() {
+        let conn = start_memory_db().expect("memory db");
+        let db = Mutex::new(conn);
+        let _guard = db.lock().await;
+        let err = try_lock_db_for_sync_export(&db).expect_err("busy lock should fail fast");
+        assert!(matches!(err, ShareError::Protocol(_)));
+        assert!(err.to_string().contains("database is busy"));
+    }
+
+    #[tokio::test]
+    async fn test_export_join_error_maps_to_protocol() {
+        let join_err = tokio::task::spawn_blocking(|| panic!("boom"))
+            .await
+            .expect_err("panic should surface as JoinError");
+        let mapped = map_export_join_error(join_err);
+        assert!(matches!(mapped, ShareError::Protocol(_)));
+        assert!(mapped.to_string().contains("export task failed"));
     }
 }

@@ -12,9 +12,9 @@ pub mod service;
 
 // Re-export commonly used items
 pub use protocol::{
-    SyncMessage, SyncMessageType, SyncUpdate, InitialSyncRequest, InitialSyncResponse,
-    DecodeError, SYNC_MESSAGE_PREFIX, SYNC_ALPN,
+    DecodeError, InitialSyncRequest, InitialSyncResponse, SYNC_ALPN, SYNC_MESSAGE_PREFIX,
+    SyncMessage, SyncMessageType, SyncUpdate,
 };
 pub use service::{
-    ProcessSyncError, SyncConfig, SyncService, encode_sync_response, encode_dm_sync_response,
+    ProcessSyncError, SyncConfig, SyncService, encode_dm_sync_response, encode_sync_response,
 };

@@ -6,16 +6,16 @@
 
 use tracing::{info, warn};
 
+use crate::data::membership::get_topic_by_harbor_id;
 use crate::data::{
     add_topic_member, delete_pending_invite, get_current_epoch, get_current_epoch_key,
     get_pending_invite, get_topic, get_topic_admin, get_topic_members, is_topic_admin,
     store_epoch_key, store_pending_invite, subscribe_topic_with_admin,
 };
-use crate::data::membership::get_topic_by_harbor_id;
 use crate::network::membership::{create_membership_proof, verify_membership_proof};
 use crate::protocol::{
-    ProtocolEvent, TopicEpochRotatedEvent, TopicInviteReceivedEvent,
-    TopicMemberJoinedEvent, TopicMemberLeftEvent,
+    ProtocolEvent, TopicEpochRotatedEvent, TopicInviteReceivedEvent, TopicMemberJoinedEvent,
+    TopicMemberLeftEvent,
 };
 use crate::security::harbor_id_from_topic;
 
@@ -24,8 +24,28 @@ use super::protocol::{
     TopicLeave,
 };
 use super::service::{
-    compute_control_pow, generate_id, verify_sender, ControlError, ControlResult, ControlService,
+    ControlError, ControlResult, ControlService, compute_control_pow, generate_id, verify_sender,
 };
+
+fn encode_control_message<T: serde::Serialize>(
+    message: &T,
+    packet_type: ControlPacketType,
+) -> ControlResult<Vec<u8>> {
+    postcard::to_allocvec(message).map_err(|e| {
+        ControlError::Rpc(format!(
+            "failed to encode {:?} control message: {}",
+            packet_type, e
+        ))
+    })
+}
+
+fn is_stale_topic_epoch(current_epoch: Option<u64>, message_epoch: u64) -> bool {
+    matches!(current_epoch, Some(current) if message_epoch < current)
+}
+
+fn is_invalid_remove_member_epoch(current_epoch: Option<u64>, new_epoch: u64) -> bool {
+    matches!(current_epoch, Some(current) if new_epoch <= current)
+}
 
 impl ControlService {
     // =========================================================================
@@ -50,8 +70,8 @@ impl ControlService {
             let admin_id = get_topic_admin(&db, topic_id)
                 .map_err(|e| ControlError::Database(e.to_string()))?
                 .ok_or_else(|| ControlError::Database("topic missing admin".to_string()))?;
-            let members =
-                get_topic_members(&db, topic_id).map_err(|e| ControlError::Database(e.to_string()))?;
+            let members = get_topic_members(&db, topic_id)
+                .map_err(|e| ControlError::Database(e.to_string()))?;
             // Get current epoch key - topics always have at least epoch 0
             let current = get_current_epoch_key(&db, topic_id)
                 .map_err(|e| ControlError::Database(e.to_string()))?
@@ -90,7 +110,7 @@ impl ControlService {
             &message_id,
             peer_id,
             &[*peer_id],
-            &postcard::to_allocvec(&wire_invite).unwrap(),
+            &encode_control_message(&wire_invite, ControlPacketType::TopicInvite)?,
             ControlPacketType::TopicInvite,
         )
         .await?;
@@ -99,10 +119,7 @@ impl ControlService {
     }
 
     /// Accept a topic invite
-    pub async fn accept_topic_invite(
-        &self,
-        message_id: &[u8; 32],
-    ) -> ControlResult<()> {
+    pub async fn accept_topic_invite(&self, message_id: &[u8; 32]) -> ControlResult<()> {
         // Get the pending invite
         let invite = {
             let db = self.db().lock().await;
@@ -118,10 +135,12 @@ impl ControlService {
             subscribe_topic_with_admin(&db, &invite.topic_id, &invite.admin_id)
                 .map_err(|e| ControlError::Database(e.to_string()))?;
             // Add ourselves as a member (required for get_topics_for_member to find this topic)
-            let _ = add_topic_member(&db, &invite.topic_id, &self.local_id());
+            add_topic_member(&db, &invite.topic_id, &self.local_id())
+                .map_err(|e| ControlError::Database(e.to_string()))?;
             // Add other members from the invite
             for member in &invite.members {
-                let _ = add_topic_member(&db, &invite.topic_id, member);
+                add_topic_member(&db, &invite.topic_id, member)
+                    .map_err(|e| ControlError::Database(e.to_string()))?;
             }
             // Store the epoch key from the invite
             store_epoch_key(&db, &invite.topic_id, invite.epoch, &invite.epoch_key)
@@ -130,19 +149,22 @@ impl ControlService {
 
         // Update connection gate with all topic peers
         if let Some(gate) = self.connection_gate() {
-            gate.add_topic_peers(&invite.topic_id, &invite.members).await;
+            gate.add_topic_peers(&invite.topic_id, &invite.members)
+                .await;
         }
 
         // Send TopicJoin to all members
         let join_message_id = generate_id();
-        let our_relay = self.endpoint().addr().relay_urls().next().map(|u| u.to_string());
+        let our_relay = self
+            .endpoint()
+            .addr()
+            .relay_urls()
+            .next()
+            .map(|u| u.to_string());
 
         let harbor_id = harbor_id_from_topic(&invite.topic_id);
-        let membership_proof = create_membership_proof(
-            &invite.topic_id,
-            &harbor_id,
-            &self.local_id(),
-        );
+        let membership_proof =
+            create_membership_proof(&invite.topic_id, &harbor_id, &self.local_id());
         let pow = compute_control_pow(&self.local_id(), ControlPacketType::TopicJoin)?;
 
         let join = TopicJoin {
@@ -170,7 +192,7 @@ impl ControlService {
             &join_message_id,
             &harbor_id,
             &invite.members,
-            &postcard::to_allocvec(&join).unwrap(),
+            &encode_control_message(&join, ControlPacketType::TopicJoin)?,
             ControlPacketType::TopicJoin,
         )
         .await?;
@@ -192,13 +214,11 @@ impl ControlService {
     }
 
     /// Decline a topic invite
-    pub async fn decline_topic_invite(
-        &self,
-        message_id: &[u8; 32],
-    ) -> ControlResult<()> {
+    pub async fn decline_topic_invite(&self, message_id: &[u8; 32]) -> ControlResult<()> {
         // Just delete the pending invite
         let db = self.db().lock().await;
-        delete_pending_invite(&db, message_id).map_err(|e| ControlError::Database(e.to_string()))?;
+        delete_pending_invite(&db, message_id)
+            .map_err(|e| ControlError::Database(e.to_string()))?;
 
         info!(message_id = %hex::encode(&message_id[..8]), "declined topic invite");
         Ok(())
@@ -211,7 +231,8 @@ impl ControlService {
         // Get current members and epoch before leaving
         let (members, epoch) = {
             let db = self.db().lock().await;
-            let members = get_topic_members(&db, topic_id).map_err(|e| ControlError::Database(e.to_string()))?;
+            let members = get_topic_members(&db, topic_id)
+                .map_err(|e| ControlError::Database(e.to_string()))?;
             let epoch = get_current_epoch(&db, topic_id)
                 .map_err(|e| ControlError::Database(e.to_string()))?
                 .unwrap_or(1);
@@ -246,7 +267,7 @@ impl ControlService {
             &message_id,
             &harbor_id,
             &members,
-            &postcard::to_allocvec(&leave).unwrap(),
+            &encode_control_message(&leave, ControlPacketType::TopicLeave)?,
             ControlPacketType::TopicLeave,
         )
         .await?;
@@ -284,11 +305,16 @@ impl ControlService {
 
             // Verify we are the admin
             let our_id = self.local_id();
-            if !is_topic_admin(&db, topic_id, &our_id).map_err(|e| ControlError::Database(e.to_string()))? {
-                return Err(ControlError::NotAuthorized("only admin can remove members".to_string()));
+            if !is_topic_admin(&db, topic_id, &our_id)
+                .map_err(|e| ControlError::Database(e.to_string()))?
+            {
+                return Err(ControlError::NotAuthorized(
+                    "only admin can remove members".to_string(),
+                ));
             }
 
-            let members = get_topic_members(&db, topic_id).map_err(|e| ControlError::Database(e.to_string()))?;
+            let members = get_topic_members(&db, topic_id)
+                .map_err(|e| ControlError::Database(e.to_string()))?;
             let current_epoch = get_current_epoch(&db, topic_id)
                 .map_err(|e| ControlError::Database(e.to_string()))?
                 .unwrap_or(1);
@@ -296,7 +322,9 @@ impl ControlService {
         };
 
         // Generate new epoch key (increment epoch)
-        let new_epoch = current_epoch + 1;
+        let new_epoch = current_epoch
+            .checked_add(1)
+            .ok_or_else(|| ControlError::InvalidState("epoch overflow".to_string()))?;
         let new_epoch_key = generate_id();
 
         // Get remaining members (excluding the removed one)
@@ -314,8 +342,7 @@ impl ControlService {
 
             let msg_id = generate_id();
             let harbor_id = harbor_id_from_topic(topic_id);
-            let membership_proof =
-                create_membership_proof(topic_id, &harbor_id, &self.local_id());
+            let membership_proof = create_membership_proof(topic_id, &harbor_id, &self.local_id());
             let pow = compute_control_pow(&self.local_id(), ControlPacketType::RemoveMember)?;
 
             let remove = RemoveMember {
@@ -340,7 +367,7 @@ impl ControlService {
                 &msg_id,
                 member, // harbor_id = this specific recipient
                 &[*member],
-                &postcard::to_allocvec(&remove).unwrap(),
+                &encode_control_message(&remove, ControlPacketType::RemoveMember)?,
                 ControlPacketType::RemoveMember,
             )
             .await?;
@@ -439,11 +466,7 @@ impl ControlService {
     }
 
     /// Handle an incoming TopicJoin
-    pub async fn handle_topic_join(
-        &self,
-        join: &TopicJoin,
-        sender_id: [u8; 32],
-    ) -> ControlAck {
+    pub async fn handle_topic_join(&self, join: &TopicJoin, sender_id: [u8; 32]) -> ControlAck {
         // Verify PoW first
         if let Err(e) = self.verify_pow(&join.pow, &sender_id, ControlPacketType::TopicJoin) {
             warn!(
@@ -461,10 +484,16 @@ impl ControlService {
         }
 
         // Resolve topic_id from harbor_id
-        let topic_id = {
+        let (topic_id, current_epoch) = {
             let db = self.db().lock().await;
             match get_topic_by_harbor_id(&db, &join.harbor_id) {
-                Ok(Some(topic)) => topic.topic_id,
+                Ok(Some(topic)) => match get_current_epoch(&db, &topic.topic_id) {
+                    Ok(epoch) => (topic.topic_id, epoch),
+                    Err(e) => {
+                        warn!(error = %e, "failed to read topic epoch");
+                        return ControlAck::failure(join.message_id, "internal error");
+                    }
+                },
                 Ok(None) => {
                     warn!(harbor_id = %hex::encode(&join.harbor_id[..8]), "unknown topic for join");
                     return ControlAck::failure(join.message_id, "unknown topic");
@@ -476,8 +505,22 @@ impl ControlService {
             }
         };
 
+        if is_stale_topic_epoch(current_epoch, join.epoch) {
+            warn!(
+                local_epoch = ?current_epoch,
+                incoming_epoch = join.epoch,
+                "topic join rejected: stale epoch"
+            );
+            return ControlAck::failure(join.message_id, "stale epoch");
+        }
+
         // Verify membership proof
-        if !verify_membership_proof(&topic_id, &join.harbor_id, &sender_id, &join.membership_proof) {
+        if !verify_membership_proof(
+            &topic_id,
+            &join.harbor_id,
+            &sender_id,
+            &join.membership_proof,
+        ) {
             warn!("topic join invalid membership proof");
             return ControlAck::failure(join.message_id, "invalid membership proof");
         }
@@ -487,16 +530,18 @@ impl ControlService {
             let db = self.db().lock().await;
             if let Err(e) = add_topic_member(&db, &topic_id, &sender_id) {
                 warn!(error = %e, "failed to add topic member");
-                // Don't fail the ack - member might already exist
+                return ControlAck::failure(join.message_id, "internal error");
             }
             // Store relay URL if provided (for later connections)
             if let Some(ref relay_url) = join.relay_url {
-                let _ = crate::data::dht::update_peer_relay_url(
+                if let Err(e) = crate::data::dht::update_peer_relay_url(
                     &db,
                     &sender_id,
                     relay_url,
                     crate::data::current_timestamp(),
-                );
+                ) {
+                    warn!(error = %e, "failed to store relay URL for joined member");
+                }
             }
         }
 
@@ -524,11 +569,7 @@ impl ControlService {
     }
 
     /// Handle an incoming TopicLeave
-    pub async fn handle_topic_leave(
-        &self,
-        leave: &TopicLeave,
-        sender_id: [u8; 32],
-    ) -> ControlAck {
+    pub async fn handle_topic_leave(&self, leave: &TopicLeave, sender_id: [u8; 32]) -> ControlAck {
         // Verify PoW first
         if let Err(e) = self.verify_pow(&leave.pow, &sender_id, ControlPacketType::TopicLeave) {
             warn!(
@@ -546,10 +587,16 @@ impl ControlService {
         }
 
         // Resolve topic_id from harbor_id
-        let topic_id = {
+        let (topic_id, current_epoch) = {
             let db = self.db().lock().await;
             match get_topic_by_harbor_id(&db, &leave.harbor_id) {
-                Ok(Some(topic)) => topic.topic_id,
+                Ok(Some(topic)) => match get_current_epoch(&db, &topic.topic_id) {
+                    Ok(epoch) => (topic.topic_id, epoch),
+                    Err(e) => {
+                        warn!(error = %e, "failed to read topic epoch");
+                        return ControlAck::failure(leave.message_id, "internal error");
+                    }
+                },
                 Ok(None) => {
                     warn!(harbor_id = %hex::encode(&leave.harbor_id[..8]), "unknown topic for leave");
                     return ControlAck::failure(leave.message_id, "unknown topic");
@@ -561,8 +608,22 @@ impl ControlService {
             }
         };
 
+        if is_stale_topic_epoch(current_epoch, leave.epoch) {
+            warn!(
+                local_epoch = ?current_epoch,
+                incoming_epoch = leave.epoch,
+                "topic leave rejected: stale epoch"
+            );
+            return ControlAck::failure(leave.message_id, "stale epoch");
+        }
+
         // Verify membership proof
-        if !verify_membership_proof(&topic_id, &leave.harbor_id, &sender_id, &leave.membership_proof) {
+        if !verify_membership_proof(
+            &topic_id,
+            &leave.harbor_id,
+            &sender_id,
+            &leave.membership_proof,
+        ) {
             warn!("topic leave invalid membership proof");
             return ControlAck::failure(leave.message_id, "invalid membership proof");
         }
@@ -572,6 +633,7 @@ impl ControlService {
             let db = self.db().lock().await;
             if let Err(e) = crate::data::remove_topic_member(&db, &topic_id, &sender_id) {
                 warn!(error = %e, "failed to remove topic member");
+                return ControlAck::failure(leave.message_id, "internal error");
             }
         }
 
@@ -620,10 +682,16 @@ impl ControlService {
         }
 
         // Resolve topic_id from harbor_id
-        let topic_id = {
+        let (topic_id, current_epoch) = {
             let db = self.db().lock().await;
             match get_topic_by_harbor_id(&db, &remove.harbor_id) {
-                Ok(Some(topic)) => topic.topic_id,
+                Ok(Some(topic)) => match get_current_epoch(&db, &topic.topic_id) {
+                    Ok(epoch) => (topic.topic_id, epoch),
+                    Err(e) => {
+                        warn!(error = %e, "failed to read topic epoch");
+                        return ControlAck::failure(remove.message_id, "internal error");
+                    }
+                },
                 Ok(None) => {
                     warn!(harbor_id = %hex::encode(&remove.harbor_id[..8]), "unknown topic for remove member");
                     return ControlAck::failure(remove.message_id, "unknown topic");
@@ -635,8 +703,22 @@ impl ControlService {
             }
         };
 
+        if is_invalid_remove_member_epoch(current_epoch, remove.new_epoch) {
+            warn!(
+                local_epoch = ?current_epoch,
+                incoming_epoch = remove.new_epoch,
+                "remove member rejected: stale or invalid epoch"
+            );
+            return ControlAck::failure(remove.message_id, "stale epoch");
+        }
+
         // Verify membership proof
-        if !verify_membership_proof(&topic_id, &remove.harbor_id, &sender_id, &remove.membership_proof) {
+        if !verify_membership_proof(
+            &topic_id,
+            &remove.harbor_id,
+            &sender_id,
+            &remove.membership_proof,
+        ) {
             warn!("remove member invalid membership proof");
             return ControlAck::failure(remove.message_id, "invalid membership proof");
         }
@@ -661,25 +743,25 @@ impl ControlService {
             }
         }
 
-        // Remove the member from our local membership
+        // Store the new epoch key and remove the member from local membership.
         {
             let db = self.db().lock().await;
-            if let Err(e) = crate::data::remove_topic_member(&db, &topic_id, &remove.removed_member) {
+            if let Err(e) = store_epoch_key(&db, &topic_id, remove.new_epoch, &remove.new_epoch_key)
+            {
+                warn!(error = %e, "failed to store new epoch key");
+                return ControlAck::failure(remove.message_id, "internal error");
+            }
+            if let Err(e) = crate::data::remove_topic_member(&db, &topic_id, &remove.removed_member)
+            {
                 warn!(error = %e, "failed to remove topic member");
+                return ControlAck::failure(remove.message_id, "internal error");
             }
         }
 
         // Update connection gate
         if let Some(gate) = self.connection_gate() {
-            gate.remove_topic_peer(&remove.removed_member, &topic_id).await;
-        }
-
-        // Store the new epoch key
-        {
-            let db = self.db().lock().await;
-            if let Err(e) = store_epoch_key(&db, &topic_id, remove.new_epoch, &remove.new_epoch_key) {
-                warn!(error = %e, "failed to store new epoch key");
-            }
+            gate.remove_topic_peer(&remove.removed_member, &topic_id)
+                .await;
         }
 
         info!(
@@ -699,5 +781,59 @@ impl ControlService {
         let _ = self.event_tx().send(event).await;
 
         ControlAck::success(remove.message_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::ser::{Error as _, Serializer};
+
+    struct FailingSerialize;
+
+    impl serde::Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            Err(S::Error::custom("serialize failed"))
+        }
+    }
+
+    #[test]
+    fn test_encode_control_message_success() {
+        let ack = ControlAck::success([1u8; 32]);
+        let encoded = encode_control_message(&ack, ControlPacketType::TopicInvite).unwrap();
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn test_encode_control_message_maps_errors() {
+        let err = encode_control_message(&FailingSerialize, ControlPacketType::TopicJoin)
+            .expect_err("encoding should fail");
+
+        match err {
+            ControlError::Rpc(message) => {
+                assert!(message.contains("TopicJoin"));
+                assert!(message.contains("failed to encode"));
+            }
+            other => panic!("unexpected error variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stale_topic_epoch_detection() {
+        assert!(!is_stale_topic_epoch(None, 0));
+        assert!(!is_stale_topic_epoch(Some(3), 3));
+        assert!(!is_stale_topic_epoch(Some(3), 4));
+        assert!(is_stale_topic_epoch(Some(3), 2));
+    }
+
+    #[test]
+    fn test_remove_member_epoch_validation() {
+        assert!(!is_invalid_remove_member_epoch(None, 1));
+        assert!(!is_invalid_remove_member_epoch(Some(5), 6));
+        assert!(is_invalid_remove_member_epoch(Some(5), 5));
+        assert!(is_invalid_remove_member_epoch(Some(5), 4));
     }
 }

@@ -103,6 +103,7 @@ fn hash_packet_data(endpoint_id: &[u8], nonce: &[u8; 12], ciphertext: &[u8]) -> 
 mod tests {
     use super::*;
     use crate::security::create_key_pair::generate_key_pair;
+    use ed25519_dalek::VerifyingKey;
 
     #[test]
     fn test_sign_and_verify_packet() {
@@ -259,20 +260,20 @@ mod tests {
 
         let signature = sign_packet(&kp.private_key, endpoint_id, &nonce, ciphertext);
 
-        // Invalid public key (all zeros is not on the curve)
-        let invalid_pubkey: [u8; 32] = [0u8; 32];
+        // Find a guaranteed-invalid compressed Ed25519 point.
+        let mut invalid_pubkey = None;
+        let mut candidate = [0u8; 32];
+        for byte in 0u8..=u8::MAX {
+            candidate[0] = byte;
+            if VerifyingKey::from_bytes(&candidate).is_err() {
+                invalid_pubkey = Some(candidate);
+                break;
+            }
+        }
+        let invalid_pubkey = invalid_pubkey.expect("failed to find invalid public-key test vector");
+
         assert!(!verify_packet(
             &invalid_pubkey,
-            endpoint_id,
-            &nonce,
-            ciphertext,
-            &signature
-        ));
-
-        // Random bytes are also likely invalid
-        let random_pubkey: [u8; 32] = [0xFF; 32];
-        assert!(!verify_packet(
-            &random_pubkey,
             endpoint_id,
             &nonce,
             ciphertext,
@@ -358,5 +359,27 @@ mod tests {
             &ciphertext,
             &signature
         ));
+    }
+
+    #[test]
+    fn test_sign_packet_known_vector() {
+        let private_key: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        let endpoint_id = b"node-12345";
+        let nonce: [u8; 12] = [0x42; 12];
+        let ciphertext = b"encrypted_data";
+
+        let signature = sign_packet(&private_key, endpoint_id, &nonce, ciphertext);
+        let expected_signature: [u8; 64] = [
+            99, 62, 145, 255, 126, 215, 173, 66, 252, 34, 176, 128, 173, 145, 62, 254, 209, 235,
+            186, 62, 44, 75, 209, 225, 16, 249, 147, 152, 71, 79, 175, 94, 121, 89, 28, 146, 52,
+            127, 128, 59, 189, 6, 0, 181, 13, 176, 144, 207, 39, 46, 125, 129, 87, 184, 4, 241,
+            165, 74, 48, 97, 235, 249, 177, 10,
+        ];
+
+        assert_eq!(signature, expected_signature);
     }
 }
